@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 const MAX_INLINE_SCRIPT_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_SCRIPT_BYTES: usize = 256 * 1024;
@@ -24,6 +25,16 @@ const MAX_LOOP_ITERATIONS: u64 = 100_000;
 const MAX_RECURSION_DEPTH: usize = 128;
 const MAX_STACK_SIZE: usize = 4096;
 const MAX_TREE_DEPTH: usize = 256;
+/// Presupuesto total de tiempo de JS por página. Boa no permite interrumpir
+/// un `eval` en curso, así que el límite se aplica entre scripts: una vez
+/// agotado, los scripts restantes se omiten con un warning. El peor caso de
+/// sobrepaso es un único script, ya acotado por los límites de iteraciones,
+/// recursión y pila de `RuntimeLimits`. En debug Boa es mucho más lento, así
+/// que el presupuesto se amplía para no cortar tests y desarrollo.
+#[cfg(not(debug_assertions))]
+const MAX_SCRIPT_EXECUTION_TIME: Duration = Duration::from_millis(120);
+#[cfg(debug_assertions)]
+const MAX_SCRIPT_EXECUTION_TIME: Duration = Duration::from_secs(3);
 const MAX_SCRIPT_WARNINGS: usize = 8;
 const SCRIPT_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 
@@ -659,7 +670,25 @@ fn evaluate_scripts(
         return Ok((None, warnings));
     }
 
+    // El presupuesto empieza tras inicializar el runtime DOM: ese eval es
+    // infraestructura de Wisp, no script de la página.
+    let deadline = Instant::now() + MAX_SCRIPT_EXECUTION_TIME;
+    let mut time_budget_exhausted = false;
+
     for (label, source) in scripts {
+        if Instant::now() >= deadline {
+            if !time_budget_exhausted {
+                time_budget_exhausted = true;
+                push_warning(
+                    &mut warnings,
+                    format!(
+                        "Se omitieron scripts por el límite de {} ms de JavaScript de Wisp.",
+                        MAX_SCRIPT_EXECUTION_TIME.as_millis()
+                    ),
+                );
+            }
+            continue;
+        }
         if let Err(error) = context.eval(Source::from_bytes(&source)) {
             push_warning(
                 &mut warnings,
@@ -678,6 +707,19 @@ fn evaluate_scripts(
     }
 
     for module in modules {
+        if Instant::now() >= deadline {
+            if !time_budget_exhausted {
+                time_budget_exhausted = true;
+                push_warning(
+                    &mut warnings,
+                    format!(
+                        "Se omitieron módulos por el límite de {} ms de JavaScript de Wisp.",
+                        MAX_SCRIPT_EXECUTION_TIME.as_millis()
+                    ),
+                );
+            }
+            continue;
+        }
         let path = PathBuf::from(&module.url);
         let parsed = match Module::parse(
             Source::from_bytes(module.source.as_str()).with_path(&path),
