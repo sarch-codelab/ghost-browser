@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Wisp</title>
+  </head>
+  <body>
+    <main style="background-color: #f0f4ff; padding: 18px">
+      <h1 style="color: #273469">Wisp Engine</h1>
+      <p>HTML5 parsing, block layout, inline JavaScript, and paint commands.</p>
+      <div style="background-color: #dce6ff; padding: 12px">
+        <p id="message">Static text shown before JavaScript runs.</p>
+      </div>
+    </main>
+    <script>
+      document.getElementById("message").textContent =
+        "Updated by bounded inline JavaScript.";
+    </script>
+  </body>
+</html>

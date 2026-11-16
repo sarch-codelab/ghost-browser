@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Wisp DOM demo</title>
+  <style>
+    body { margin: 12px; }
+    h1 { color: #16324f; }
+    .card { background-color: #e8f0ff; padding: 6px; color: #1f4e79; }
+    .done { color: #1a7f37; }
+  </style>
+</head>
+<body>
+  <h1>DOM mutable</h1>
+  <button id="add">Añadir</button>
+  <ul id="list"></ul>
+  <script>
+    const list = document.getElementById("list");
+    let count = 0;
+
+    function addItem(label) {
+      const item = document.createElement("li");
+      item.className = "card";
+      item.textContent = label;
+      list.appendChild(item);
+    }
+
+    document.getElementById("add").addEventListener("click", () => {
+      addItem("Elemento " + (++count));
+    });
+
+    addItem("Primero");
+    document.getElementById("add").click();
+    setTimeout(() => addItem("Temporizador"), 0);
+  </script>
+</body>
+</html>
