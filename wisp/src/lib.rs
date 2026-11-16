@@ -486,6 +486,8 @@ pub fn url_suits_wisp(url: &str) -> bool {
         return true;
     }
     let path = url.path().to_ascii_lowercase();
+    // Solo rutas con pinta documental inequívoca: `/p/`, `/news/` y `/app/`
+    // son patrones típicos de SPAs (React/Next) que pertenecen a WebView2.
     [
         "/wiki/",
         "/docs/",
@@ -493,11 +495,9 @@ pub fn url_suits_wisp(url: &str) -> bool {
         "/blog",
         "/article",
         "/post/",
-        "/news/",
         "/stories/",
         "/read/",
         ".md",
-        "/p/",
     ]
     .iter()
     .any(|marker| path.contains(marker))
@@ -6623,6 +6623,8 @@ mod tests {
             "https://github.com/rust-lang/rust",
             "https://www.youtube.com/watch?v=x",
             "https://app.mi-banco.com/cuenta",
+            "https://example.com/p/12345",
+            "https://example.com/news/ultima-hora",
             "not a url",
         ] {
             assert!(!url_suits_wisp(url), "{url}");

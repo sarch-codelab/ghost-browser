@@ -281,7 +281,18 @@ fn draw_wisp_page(ui: &mut Ui, app: &mut Browser, p: &Palette) {
                 Sense::hover(),
             );
             let painter = ui.painter().with_clip_rect(page_rect);
+            // Viewport culling: el documento puede tener miles de comandos;
+            // solo se envían a la GPU los que intersectan la franja visible.
+            // Las coordenadas de los comandos son relativas al documento y
+            // `page_rect.min.y` es el origen en pantalla del documento.
+            let view = ui.clip_rect();
+            let view_top = view.min.y - page_rect.min.y;
+            let view_bottom = view.max.y - page_rect.min.y;
             for command in &document.commands {
+                let (top, bottom) = command_vspan(command);
+                if bottom < view_top || top > view_bottom {
+                    continue;
+                }
                 match command {
                     wisp_engine::PaintCommand::FillRect {
                         rect,
@@ -476,6 +487,20 @@ fn draw_wisp_page(ui: &mut Ui, app: &mut Browser, p: &Palette) {
     }
     if open_in_webview {
         app.set_tab_engine(tab_id, BrowserEngine::WebView2);
+    }
+}
+
+/// Extensión vertical de un comando en coordenadas del documento, para el
+/// viewport culling del scroll de Wisp.
+fn command_vspan(command: &wisp_engine::PaintCommand) -> (f32, f32) {
+    match command {
+        wisp_engine::PaintCommand::Text { y, font_size, .. } => {
+            (*y, *y + wisp_engine::text_line_height(*font_size))
+        }
+        wisp_engine::PaintCommand::FillRect { rect, .. }
+        | wisp_engine::PaintCommand::StrokeRect { rect, .. }
+        | wisp_engine::PaintCommand::Image { rect, .. }
+        | wisp_engine::PaintCommand::BackgroundImage { rect, .. } => (rect.y, rect.y + rect.height),
     }
 }
 
