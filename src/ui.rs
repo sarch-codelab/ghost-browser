@@ -326,13 +326,11 @@ fn draw_wisp_page(ui: &mut Ui, app: &mut Browser, p: &Palette) {
                         } else {
                             FontId::proportional(*font_size)
                         };
-                        painter.text(
-                            text_position,
-                            Align2::LEFT_TOP,
-                            content,
-                            font_id,
-                            color32(*color),
-                        );
+                        // `:hover`/`:active` de enlaces: la respuesta de egui se
+                        // crea antes de pintar para poder cambiar color y
+                        // subrayar sin recalcular el layout.
+                        let mut link_response = None;
+                        let mut paint_color = color32(*color);
                         if let Some(href) = href {
                             let link_rect = Rect::from_min_size(
                                 text_position,
@@ -361,6 +359,35 @@ fn draw_wisp_page(ui: &mut Ui, app: &mut Browser, p: &Palette) {
                                 ui.output_mut(|output| {
                                     output.cursor_icon = egui::CursorIcon::PointingHand;
                                 });
+                                paint_color = p.accent;
+                            }
+                            if response.is_pointer_button_down_on() {
+                                paint_color = p.accent;
+                            }
+                            link_response = Some((response, href));
+                        }
+                        painter.text(
+                            text_position,
+                            Align2::LEFT_TOP,
+                            content,
+                            font_id,
+                            paint_color,
+                        );
+                        if let Some((response, href)) = link_response {
+                            if response.is_pointer_button_down_on() {
+                                let link_width = wisp_engine::text_width_weighted(
+                                    content,
+                                    *font_size,
+                                    *font_weight >= 600,
+                                );
+                                let underline_y = text_position.y + *font_size * 0.82;
+                                painter.line_segment(
+                                    [
+                                        pos2(text_position.x, underline_y),
+                                        pos2(text_position.x + link_width, underline_y),
+                                    ],
+                                    Stroke::new(1.0, paint_color),
+                                );
                             }
                             if response.clicked()
                                 && let Ok(base) = url::Url::parse(&active_url)

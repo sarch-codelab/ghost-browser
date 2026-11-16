@@ -463,6 +463,27 @@ impl Browser {
         self.save_session_immediate();
     }
 
+    /// Conmutación automática a WebView2 cuando Wisp no puede cargar la
+    /// página (fetch fallido o layout inválido): el usuario nunca ve una
+    /// pantalla de error. No marca `engine_manual` — el smart engine puede
+    /// volver a probar Wisp en la próxima navegación.
+    fn fallback_to_webview(&mut self, tab_id: u64) {
+        let Some(tab) = self.tab_by_id(tab_id) else {
+            return;
+        };
+        if tab.engine != BrowserEngine::Wisp {
+            return;
+        }
+        if webview::is_newtab_url(&tab.url) {
+            return;
+        }
+        self.reset_tab_for_engine(tab_id, BrowserEngine::WebView2);
+        self.queue_restore(tab_id);
+        self.needs_bounds_sync = true;
+        self.dirty = true;
+        self.save_session_immediate();
+    }
+
     /// Alterna el motor de la pestaña activa (botón de la barra, Ctrl+Shift+W).
     pub fn toggle_engine_active(&mut self) {
         let Some(tab) = self.active_tab() else {
@@ -889,6 +910,7 @@ impl Browser {
         if tab.engine != BrowserEngine::Wisp || tab.wisp_html.is_none() {
             return;
         }
+        let failed = result.is_err();
         match result {
             Ok(layout) => {
                 tab.wisp_layout = Some(layout);
@@ -901,6 +923,9 @@ impl Browser {
                 tab.wisp_reader = None;
                 tab.loading = false;
             }
+        }
+        if failed && !self.tab_by_id(tab_id).is_some_and(|t| t.engine_manual) {
+            self.fallback_to_webview(tab_id);
         }
         if (pending.desired_width - pending.width).abs() > 0.5 {
             self.request_wisp_layout(tab_id, pending.desired_width);
@@ -959,17 +984,26 @@ impl Browser {
             }
             Err(error) => {
                 self.pending_history_index.remove(&tab_id);
+                let mut manual = false;
                 if let Some(tab) = self.tab_by_id_mut(tab_id) {
                     if tab.engine != BrowserEngine::Wisp {
                         return;
                     }
+                    manual = tab.engine_manual;
                     tab.loading = false;
                     tab.wisp_error = Some(error.clone());
                     tab.wisp_html = None;
                     tab.wisp_layout = None;
                     tab.wisp_layout_width = None;
                 }
-                self.set_status(format!("Wisp Beta: {error}"));
+                if manual {
+                    self.set_status(format!("Wisp Beta: {error}"));
+                } else {
+                    self.fallback_to_webview(tab_id);
+                    self.set_status(format!(
+                        "Wisp no pudo cargar la página; usando WebView2 ({error})"
+                    ));
+                }
             }
         }
         self.sync_addr_text();
@@ -1972,6 +2006,46 @@ mod tests {
             browser.store.settings.default_engine,
             BrowserEngine::WebView2
         );
+    }
+
+    #[test]
+    fn un_error_de_wisp_conmuta_a_webview2_sin_marcar_motor_manual() {
+        let (mut browser, _tx) = Browser::from_store(Store::default());
+        let tab_id = browser.active_tab().unwrap().id;
+        {
+            let t = browser.tab_by_id_mut(tab_id).unwrap();
+            t.engine = BrowserEngine::Wisp;
+            t.url = "https://example.com/".into();
+        }
+        browser.start_wisp_load(tab_id, "https://example.com/".into());
+        let request_id = browser.pending_wisp_requests[&tab_id];
+
+        browser.handle_wisp_page_loaded(tab_id, request_id, Err("boom".into()));
+
+        let t = browser.tab_by_id(tab_id).unwrap();
+        assert_eq!(t.engine, BrowserEngine::WebView2);
+        assert!(!t.engine_manual);
+        assert!(browser.pending_restore.contains(&tab_id));
+    }
+
+    #[test]
+    fn un_error_de_wisp_en_pestana_manual_no_conmuta() {
+        let (mut browser, _tx) = Browser::from_store(Store::default());
+        let tab_id = browser.active_tab().unwrap().id;
+        {
+            let t = browser.tab_by_id_mut(tab_id).unwrap();
+            t.engine = BrowserEngine::Wisp;
+            t.engine_manual = true;
+            t.url = "https://example.com/".into();
+        }
+        browser.start_wisp_load(tab_id, "https://example.com/".into());
+        let request_id = browser.pending_wisp_requests[&tab_id];
+
+        browser.handle_wisp_page_loaded(tab_id, request_id, Err("boom".into()));
+
+        let t = browser.tab_by_id(tab_id).unwrap();
+        assert_eq!(t.engine, BrowserEngine::Wisp);
+        assert!(t.wisp_error.is_some());
     }
 
     #[test]
