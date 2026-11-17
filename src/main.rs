@@ -4,6 +4,7 @@
 mod browser;
 mod logo;
 mod perf;
+mod remote;
 mod store;
 mod ui;
 mod webview;
@@ -138,6 +139,9 @@ struct App {
     /// El cursor actual pertenece a una zona de redimensionado y hay que
     /// devolverlo a la normalidad al salir, no dejarlo pegado en toda la UI.
     resize_cursor_active: bool,
+    /// Canal de la API de control remoto (localhost). `None` si el puerto
+    /// estaba ocupado al arrancar.
+    remote_rx: Option<std::sync::mpsc::Receiver<remote::RemoteCommand>>,
 }
 
 impl App {
@@ -180,6 +184,7 @@ impl App {
             startup_webviews_pending: true,
             window_hidden: true,
             resize_cursor_active: false,
+            remote_rx: remote::start(),
         }
     }
 
@@ -990,6 +995,12 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Comandos de la API remota (localhost): navegación, eval, etc.
+        if let Some(rx) = &self.remote_rx {
+            while let Ok(command) = rx.try_recv() {
+                self.browser.handle_remote_command(command);
+            }
+        }
         // Drena eventos de los webviews y materializa pestañas pendientes.
         let changed = self.browser.drain_events();
         let had_pending =

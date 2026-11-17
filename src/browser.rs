@@ -129,6 +129,31 @@ fn is_web_url(url: &str) -> bool {
     url::Url::parse(url).is_ok_and(|parsed| matches!(parsed.scheme(), "http" | "https"))
 }
 
+/// Envuelve JS de un `eval` remoto para que el resultado vuelva por
+/// `window.ipc` como mensaje `remote_eval` con el `eval_id` dado.
+/// Soporta valores directos y promesas (`then`/`catch`).
+fn remote_eval_script(eval_id: u64, js: &str) -> String {
+    let source = serde_json::to_string(js).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        "(function(){{\
+         var __send=function(o){{try{{window.ipc.postMessage(JSON.stringify(o))}}catch(e){{}}}};\
+         var __src={source};\
+         var __id={eval_id};\
+         try{{\
+           var __r=eval(__src);\
+           if(__r&&typeof __r.then==='function'){{\
+             __r.then(function(v){{__send({{type:'remote_eval',id:__id,ok:true,result:String(v)}})}})\
+                .catch(function(e){{__send({{type:'remote_eval',id:__id,ok:false,error:String(e&&e.message||e)}})}});\
+           }}else{{\
+             __send({{type:'remote_eval',id:__id,ok:true,result:(typeof __r==='string'?__r:String(__r))}});\
+           }}\
+         }}catch(__e){{\
+           __send({{type:'remote_eval',id:__id,ok:false,error:String(__e&&__e.message||__e)}});\
+         }}\
+         }})();"
+    )
+}
+
 fn normalized_navigation_history(
     history: &[String],
     history_index: usize,
@@ -236,6 +261,9 @@ pub struct Browser {
     /// Motor forzado desde la línea de comandos (`--wisp`/`--webview2`), si lo hay.
     pub cli_engine: Option<BrowserEngine>,
     dirty: bool,
+    /// `eval` remotos pendientes de que la página devuelva el resultado por IPC.
+    pending_remote_evals: HashMap<u64, Sender<serde_json::Value>>,
+    next_remote_eval_id: u64,
 }
 
 impl Browser {
@@ -394,6 +422,8 @@ impl Browser {
             cli_engine: None,
             dirty: false,
             closed_tabs,
+            pending_remote_evals: HashMap::new(),
+            next_remote_eval_id: 0,
         };
         (browser, tx)
     }
@@ -1057,8 +1087,32 @@ impl Browser {
                 let url = normalize_tab_url(source_url);
                 self.record_navigation(tab_id, &url, navigation);
                 self.sync_addr_text();
+                // NO save_session_immediate: las SPAs (YouTube, Gmail) disparan
+                // pushState/replaceState constantemente y persistir el perfil
+                // completo por cada evento satura el hilo de UI con I/O de
+                // disco, congelando el webview. `dirty` basta: el flush
+                // periódico y el cierre ya guardan la sesión.
                 self.dirty = true;
-                self.save_session_immediate();
+            }
+            "remote_eval" => {
+                if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {
+                    let ok = v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false);
+                    let payload = if ok {
+                        serde_json::json!({
+                            "ok": true,
+                            "result": v.get("result").cloned().unwrap_or(serde_json::Value::Null),
+                        })
+                    } else {
+                        serde_json::json!({
+                            "ok": false,
+                            "error": v
+                                .get("error")
+                                .and_then(|e| e.as_str())
+                                .unwrap_or("error en la página"),
+                        })
+                    };
+                    self.complete_remote_eval(id, payload);
+                }
             }
             _ => {}
         }
@@ -1401,6 +1455,224 @@ impl Browser {
     /// Pestañas suspendidas que hay que recrear.
     pub fn drain_pending_restore(&mut self) -> Vec<u64> {
         self.pending_restore.drain(..).collect()
+    }
+
+    // ---- API de control remoto (localhost) ---------------------------------
+
+    /// Punto de entrada para comandos que llegan del servidor HTTP local.
+    /// Debe llamarse desde el hilo de UI (donde vive `Browser`).
+    pub fn handle_remote_command(&mut self, command: crate::remote::RemoteCommand) {
+        match command {
+            crate::remote::RemoteCommand::Sync { request, reply } => {
+                // `None` = la respuesta queda diferida: el resultado llegará
+                // por IPC de la página (p. ej. innerText de WebView2).
+                if let Some(value) = self.handle_remote(&request, &reply) {
+                    let _ = reply.send(value);
+                }
+            }
+            crate::remote::RemoteCommand::Eval { tab_id, js, done } => {
+                self.start_remote_eval(tab_id, &js, done);
+            }
+        }
+    }
+
+    /// Enruta una petición HTTP ya parseada. `None` difiere la respuesta:
+    /// el sender de `reply` queda guardado en `pending_remote_evals` hasta
+    /// que la página devuelva el resultado por IPC.
+    fn handle_remote(
+        &mut self,
+        request: &crate::remote::Request,
+        reply: &Sender<serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        use serde_json::json;
+        let segments: Vec<&str> = request
+            .path
+            .split('?')
+            .next()
+            .unwrap_or("/")
+            .trim_matches('/')
+            .split('/')
+            .collect();
+        Some(match (request.method.as_str(), segments.as_slice()) {
+            ("GET", ["tabs"]) => {
+                let active_id = self.active_tab().map(|t| t.id);
+                let tabs: Vec<serde_json::Value> = self
+                    .tabs
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "id": t.id,
+                            "title": t.title,
+                            "url": t.url,
+                            "engine": format!("{:?}", t.engine),
+                            "active": Some(t.id) == active_id,
+                            "loading": t.loading,
+                            "suspended": !t.is_live() && !t.is_newtab(),
+                        })
+                    })
+                    .collect();
+                json!({"ok": true, "tabs": tabs})
+            }
+            ("POST", ["tabs"]) => {
+                let url = request.body.get("url").and_then(|u| u.as_str());
+                match url {
+                    Some(url) if is_web_url(url) => {
+                        self.pending_new_tabs.push_back(Some(url.to_string()));
+                        json!({"ok": true})
+                    }
+                    _ => json!({"ok": false, "error": "falta una 'url' http(s) válida"}),
+                }
+            }
+            ("POST", ["tabs", id, "navigate"]) => {
+                let Ok(tab_id) = id.parse::<u64>() else {
+                    return Some(json!({"ok": false, "error": "id de pestaña inválido"}));
+                };
+                let Some(url) = request.body.get("url").and_then(|u| u.as_str()) else {
+                    return Some(json!({"ok": false, "error": "falta 'url'"}));
+                };
+                self.navigate_tab_by_id(tab_id, url);
+                json!({"ok": true})
+            }
+            (
+                "POST",
+                [
+                    "tabs",
+                    id,
+                    action @ ("back" | "forward" | "reload" | "close" | "activate" | "text"),
+                ],
+            ) => {
+                let Ok(tab_id) = id.parse::<u64>() else {
+                    return Some(json!({"ok": false, "error": "id de pestaña inválido"}));
+                };
+                match *action {
+                    "back" => {
+                        self.navigate_history_for_tab(tab_id, -1);
+                        json!({"ok": true})
+                    }
+                    "forward" => {
+                        self.navigate_history_for_tab(tab_id, 1);
+                        json!({"ok": true})
+                    }
+                    "reload" => {
+                        self.reload_tab_by_id(tab_id);
+                        json!({"ok": true})
+                    }
+                    "close" => {
+                        if let Some(index) = self.tab_index_of(tab_id) {
+                            self.close_tab(index);
+                        }
+                        json!({"ok": true})
+                    }
+                    "activate" => {
+                        if let Some(index) = self.tab_index_of(tab_id) {
+                            self.active = index;
+                            if let Some(t) = self.tabs.get_mut(index) {
+                                t.last_active = Instant::now();
+                            }
+                            self.needs_bounds_sync = true;
+                            self.dirty = true;
+                        }
+                        json!({"ok": true})
+                    }
+                    "text" => match self.remote_tab_text(tab_id, reply.clone()) {
+                        Some(value) => value,
+                        None => return None,
+                    },
+                    _ => unreachable!(),
+                }
+            }
+            _ => json!({"ok": false, "error": "ruta desconocida"}),
+        })
+    }
+
+    /// Recarga una pestaña concreta (WebView2 o Wisp), no solo la activa.
+    fn reload_tab_by_id(&mut self, tab_id: u64) {
+        let Some(tab) = self.tab_by_id(tab_id) else {
+            return;
+        };
+        if tab.is_newtab() {
+            return;
+        }
+        if tab.engine == BrowserEngine::Wisp {
+            let url = tab.url.clone();
+            self.start_wisp_load(tab_id, url);
+        } else if let Some(webview) = &tab.webview {
+            let _ = webview.reload();
+        }
+    }
+
+    /// Texto legible de una pestaña: reader_text en Wisp, innerText vía eval
+    /// en WebView2. En WebView2 devuelve `None` y deja `reply` pendiente en
+    /// `pending_remote_evals` hasta que la página responda por IPC.
+    fn remote_tab_text(
+        &mut self,
+        tab_id: u64,
+        reply: Sender<serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        use serde_json::json;
+        let Some(tab) = self.tab_by_id(tab_id) else {
+            return Some(json!({"ok": false, "error": "pestaña no encontrada"}));
+        };
+        if tab.engine == BrowserEngine::Wisp {
+            if let Some(page) = tab.wisp_html.as_ref() {
+                return Some(json!({"ok": true, "result": page.reader_text().unwrap_or_default()}));
+            }
+            return Some(json!({"ok": false, "error": "la pestaña Wisp aún no tiene página"}));
+        }
+        if tab.webview.is_none() {
+            return Some(
+                json!({"ok": false, "error": "pestaña sin motor activo (suspendida o nueva)"}),
+            );
+        }
+        let eval_id = self.next_remote_eval_id;
+        self.next_remote_eval_id += 1;
+        let js = "document.body ? document.body.innerText.slice(0, 200000) : ''".to_string();
+        let wrapped = remote_eval_script(eval_id, &js);
+        let delivered = self
+            .tab_by_id(tab_id)
+            .and_then(|t| t.webview.as_ref())
+            .is_some_and(|webview| webview.evaluate_script(&wrapped).is_ok());
+        if delivered {
+            self.pending_remote_evals.insert(eval_id, reply);
+            None
+        } else {
+            Some(json!({"ok": false, "error": "no se pudo evaluar en la página"}))
+        }
+    }
+
+    /// Evalúa JS en una pestaña WebView2 y devuelve el resultado por `done`.
+    fn start_remote_eval(&mut self, tab_id: u64, js: &str, done: Sender<serde_json::Value>) {
+        use serde_json::json;
+        let Some(tab) = self.tab_by_id(tab_id) else {
+            let _ = done.send(json!({"ok": false, "error": "pestaña no encontrada"}));
+            return;
+        };
+        if tab.engine != BrowserEngine::WebView2 || tab.webview.is_none() {
+            let _ = done.send(json!({
+                "ok": false,
+                "error": "eval solo está disponible en pestañas WebView2; usa /text para Wisp"
+            }));
+            return;
+        }
+        let eval_id = self.next_remote_eval_id;
+        self.next_remote_eval_id += 1;
+        let wrapped = remote_eval_script(eval_id, js);
+        let delivered = self
+            .tab_by_id(tab_id)
+            .and_then(|t| t.webview.as_ref())
+            .is_some_and(|webview| webview.evaluate_script(&wrapped).is_ok());
+        if delivered {
+            self.pending_remote_evals.insert(eval_id, done);
+        } else {
+            let _ = done.send(json!({"ok": false, "error": "no se pudo evaluar en la página"}));
+        }
+    }
+
+    /// Entrega el resultado de un eval remoto que la página devolvió por IPC.
+    fn complete_remote_eval(&mut self, eval_id: u64, result: serde_json::Value) {
+        if let Some(done) = self.pending_remote_evals.remove(&eval_id) {
+            let _ = done.send(result);
+        }
     }
 
     pub fn close_tab(&mut self, index: usize) {
@@ -2464,5 +2736,45 @@ mod tests {
         assert_eq!(browser.tabs.len(), 1);
         assert_eq!(browser.tabs[0].url, "https://google.com");
         assert_eq!(browser.tabs[0].zoom, 1.1);
+    }
+
+    #[test]
+    fn remote_api_lists_tabs_and_rejects_bad_routes() {
+        let (mut browser, _) = Browser::for_tests();
+
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        browser.handle_remote_command(crate::remote::RemoteCommand::Sync {
+            request: crate::remote::Request {
+                method: "GET".into(),
+                path: "/tabs".into(),
+                body: serde_json::Value::Null,
+            },
+            reply: reply_tx,
+        });
+        let response = reply_rx.recv().unwrap();
+        assert_eq!(response["ok"], true);
+        assert!(response["tabs"].as_array().unwrap().len() >= 1);
+
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        browser.handle_remote_command(crate::remote::RemoteCommand::Sync {
+            request: crate::remote::Request {
+                method: "GET".into(),
+                path: "/nope".into(),
+                body: serde_json::Value::Null,
+            },
+            reply: reply_tx,
+        });
+        assert_eq!(reply_rx.recv().unwrap()["ok"], false);
+
+        // Eval en una pestaña sin WebView2 vivo debe fallar con mensaje claro.
+        let tab_id = browser.tabs[0].id;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        browser.handle_remote_command(crate::remote::RemoteCommand::Eval {
+            tab_id,
+            js: "1+1".into(),
+            done: done_tx,
+        });
+        let response = done_rx.recv().unwrap();
+        assert_eq!(response["ok"], false);
     }
 }
