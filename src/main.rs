@@ -1068,7 +1068,11 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { .. } => {
+                // Al cruzar a otro monitor/DPI Windows puede restaurar el
+                // marco nativo: hay que quitar el caption otra vez y
+                // reevalorar esquinas/borde DWM, no solo en Resized.
                 remove_hidden_caption(&window);
+                style_window_frame(&window, self.title_dark);
                 self.browser.needs_bounds_sync = true;
                 window.request_redraw();
             }
