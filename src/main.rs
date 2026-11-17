@@ -48,6 +48,70 @@ fn apply_viewport_commands(
     }
 }
 
+/// Tamaño del área cliente en píxeles físicos leído del SO. En Windows,
+/// `window.inner_size()` de winit puede reportar un valor duplicado tras un
+/// cambio de DPI entre monitores (el backend multiplica dos veces); la
+/// geometría real del webview y de la superficie egui debe salir de aquí.
+#[cfg(windows)]
+fn client_size_physical(window: &Window) -> Option<winit::dpi::PhysicalSize<u32>> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::Win32(win) = handle.as_raw() else {
+        return None;
+    };
+    let hwnd = win.hwnd.get();
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetClientRect(hwnd: isize, rect: *mut Rect) -> i32;
+        fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
+    }
+    let mut rect = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
+        return None;
+    }
+    let mut win = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if unsafe { GetWindowRect(hwnd, &mut win) } != 0 {
+        // Durante un cambio de DPI entre monitores Windows puede dejar el
+        // client rect duplicado (mayor que la propia ventana). Es imposible
+        // físicamente: si pasa, el client está corrupto y manda la ventana.
+        let client_w = rect.right - rect.left;
+        let client_h = rect.bottom - rect.top;
+        let win_w = win.right - win.left;
+        let win_h = win.bottom - win.top;
+        if client_w > win_w || client_h > win_h {
+            rect.right = win_w;
+            rect.bottom = win_h;
+        }
+    }
+    Some(winit::dpi::PhysicalSize::new(
+        (rect.right - rect.left).max(0) as u32,
+        (rect.bottom - rect.top).max(0) as u32,
+    ))
+}
+
+#[cfg(not(windows))]
+fn client_size_physical(window: &Window) -> Option<winit::dpi::PhysicalSize<u32>> {
+    let _ = window;
+    None
+}
+
 fn resize_direction(
     size: winit::dpi::PhysicalSize<u32>,
     position: PhysicalPosition<f64>,
@@ -143,6 +207,13 @@ struct App {
     /// Canal de la API de control remoto (localhost). `None` si el puerto
     /// estaba ocupado al arrancar.
     remote_rx: Option<std::sync::mpsc::Receiver<remote::RemoteCommand>>,
+    /// Verificación periódica de bounds: al mover la ventana entre monitores
+    /// con DPI distinto, Windows entrega WM_SIZE/WM_DPICHANGED en ráfaga y
+    /// el client rect puede quedar duplicado durante la transición sin que
+    /// llegue ningún eventocorrector; se re-verifica cada ~500 ms.
+    bounds_verify_at: Instant,
+    /// Firma del último content_rect aplicado a las webviews.
+    applied_content_sig: Option<String>,
 }
 
 impl App {
@@ -186,6 +257,8 @@ impl App {
             window_hidden: true,
             resize_cursor_active: false,
             remote_rx: remote::start(),
+            bounds_verify_at: Instant::now(),
+            applied_content_sig: None,
         }
     }
 
@@ -194,7 +267,7 @@ impl App {
             return wry::Rect::default();
         };
         content_bounds(
-            window.inner_size(),
+            client_size_physical(window).unwrap_or_else(|| window.inner_size()),
             window.scale_factor(),
             self.browser.chrome_height as f64,
             self.browser.status_height as f64,
@@ -383,6 +456,7 @@ impl App {
             return;
         }
         let rect = self.content_rect();
+        self.applied_content_sig = Some(format!("{:?}", rect));
         let active = self.browser.active;
         let panel_open = self.browser.panel != browser::Panel::None;
         let active_id = self.browser.active_tab().map(|t| t.id);
@@ -811,7 +885,7 @@ impl ApplicationHandler for App {
             let min_w = usable_w.min(320.0).max(1.0);
             let min_h = usable_h.min(240.0).max(1.0);
             window.set_min_inner_size(Some(LogicalSize::new(min_w, min_h)));
-            let current = window.inner_size();
+            let current = client_size_physical(&window).unwrap_or_else(|| window.inner_size());
             let cur_w = current.width as f64 / scale;
             let cur_h = current.height as f64 / scale;
             let want_w = cur_w.min(usable_w).max(min_w);
@@ -935,9 +1009,11 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position = Some(position);
                 if !window.is_maximized() {
-                    if let Some(direction) =
-                        resize_direction(window.inner_size(), position, window.scale_factor())
-                    {
+                    if let Some(direction) = resize_direction(
+                        client_size_physical(&window).unwrap_or_else(|| window.inner_size()),
+                        position,
+                        window.scale_factor(),
+                    ) {
                         window.set_cursor(resize_cursor(direction));
                         self.resize_cursor_active = true;
                     } else if self.resize_cursor_active {
@@ -962,13 +1038,19 @@ impl ApplicationHandler for App {
                 ..
             } if !window.is_maximized() => {
                 if let Some(position) = self.cursor_position
-                    && let Some(direction) =
-                        resize_direction(window.inner_size(), position, window.scale_factor())
+                    && let Some(direction) = resize_direction(
+                        client_size_physical(&window).unwrap_or_else(|| window.inner_size()),
+                        position,
+                        window.scale_factor(),
+                    )
                 {
                     let _ = window.drag_resize_window(direction);
                 }
             }
-            WindowEvent::Resized(size) => {
+            WindowEvent::Resized(reported) => {
+                // winit puede duplicar el tamaño físico tras un cambio de
+                // DPI entre monitores; el tamaño real siempre es GetClientRect.
+                let size = client_size_physical(&window).unwrap_or(reported);
                 if let Some(p) = &mut self.painter {
                     if let (Some(w), Some(h)) = (
                         std::num::NonZeroU32::new(size.width),
@@ -1017,6 +1099,18 @@ impl ApplicationHandler for App {
             self.materialize_webviews();
         }
         let restores_timed_out = self.browser.tick_restores(Instant::now());
+        // Verificación periódica de bounds: si el content_rect esperado ya
+        // no coincide con el último aplicado (p. ej. el client rect se
+        // asentó tarde tras un cambio de DPI), se fuerza un re-sync.
+        if Instant::now() >= self.bounds_verify_at {
+            self.bounds_verify_at = Instant::now() + std::time::Duration::from_millis(500);
+            if self.window.is_some() {
+                let sig = format!("{:?}", self.content_rect());
+                if self.applied_content_sig.as_deref() != Some(sig.as_str()) {
+                    self.browser.needs_bounds_sync = true;
+                }
+            }
+        }
         // Sondas SPA: detectan páginas que quedaron en esqueleto y recargan.
         self.browser.tick_spa_probes(Instant::now());
         // Al terminar el splash hay que hacer visible la pestaña de inicio.
@@ -1065,11 +1159,15 @@ impl ApplicationHandler for App {
         }
 
         // Duerme hasta la próxima suspensión (o hasta que haya eventos).
-        match self.browser.next_wakeup() {
-            Some(delay) => {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + delay))
+        // La verificación periódica de bounds también es un deadline.
+        let verify_delay = self
+            .bounds_verify_at
+            .saturating_duration_since(Instant::now());
+        match (self.browser.next_wakeup(), verify_delay) {
+            (Some(a), b) => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + a.min(b)))
             }
-            None => event_loop.set_control_flow(ControlFlow::Wait),
+            (None, b) => event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + b)),
         }
     }
 }
