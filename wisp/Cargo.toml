@@ -3,7 +3,7 @@ name = "wisp-engine"
 version = "0.1.0"
 edition = "2024"
 description = "Wisp, an experimental HTML layout and paint-list engine."
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [dependencies]
 ab_glyph = "0.2.32"

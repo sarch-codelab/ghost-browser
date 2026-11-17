@@ -2,6 +2,11 @@
   <img src="ghost-mark.png" alt="Logotipo de Ghost" width="128">
   <h1>Ghost Browser</h1>
   <p>Un navegador de escritorio ligero, hecho con Rust y WebView2.</p>
+  <p>
+    <a href="https://github.com/sarch-codelab/ghost-browser/releases/latest"><img src="https://img.shields.io/github/v/release/sarch-codelab/ghost-browser" alt="Última release"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-blue" alt="Licencia MIT"></a>
+    <a href="https://github.com/sarch-codelab/ghost-browser/actions/workflows/release.yml"><img src="https://github.com/sarch-codelab/ghost-browser/actions/workflows/release.yml/badge.svg" alt="Build"></a>
+  </p>
 </div>
 
 Ghost combina una interfaz propia con dos motores: **Wisp**, un motor web
@@ -81,6 +86,62 @@ entorno `RC` con la ruta completa al compilador de recursos.
 | `F12` | Abrir herramientas de desarrollo |
 | `Ctrl+Shift+W` | Cambiar el motor de la pestaña (Wisp ↔ WebView2) |
 
+## Control programático y agentes de IA
+
+Ghost expone una **API HTTP local** para que otras herramientas y agentes de
+IA conduzcan el navegador. Escucha solo en `127.0.0.1` (ningún equipo externo
+puede conectarse) en el puerto `47820`, configurable con la variable de
+entorno `GHOST_REMOTE_PORT`.
+
+| Método y ruta | Acción |
+| --- | --- |
+| `GET /health` | Comprueba que la API responde |
+| `GET /tabs` | Lista pestañas: id, título, url, motor, estado |
+| `POST /tabs` | `{"url": "..."}` abre una pestaña nueva |
+| `POST /tabs/{id}/navigate` | `{"url": "..."}` navega la pestaña |
+| `POST /tabs/{id}/back` `/forward` `/reload` `/close` `/activate` | Acciones de historial y gestión |
+| `POST /tabs/{id}/eval` | `{"js": "..."}` ejecuta JS en WebView2 y devuelve el resultado |
+| `POST /tabs/{id}/text` | Texto legible de la página (reader en Wisp, `innerText` en WebView2) |
+
+Ejemplo:
+
+```powershell
+curl http://127.0.0.1:47820/tabs
+curl -X POST http://127.0.0.1:47820/tabs/3/eval -d '{\"js\":\"document.title\"}'
+```
+
+### `ghost-mcp`: Ghost como herramienta MCP
+
+El paquete incluye un segundo binario, `ghost-mcp`, que habla
+[Model Context Protocol](https://modelcontextprotocol.io) por stdio
+(JSON-RPC 2.0). Cualquier cliente MCP — Claude Desktop, Cursor, Devin,
+scripts propios — puede usar Ghost como herramienta nativa sin tocar la API
+HTTP directamente:
+
+```powershell
+cargo build --release --bin ghost-mcp
+```
+
+Configuración MCP de ejemplo:
+
+```json
+{
+  "mcpServers": {
+    "ghost": {
+      "command": "C:/ruta/a/ghost-mcp.exe"
+    }
+  }
+}
+```
+
+Herramientas expuestas: `ghost_health`, `ghost_tabs`, `ghost_open_tab`,
+`ghost_navigate`, `ghost_tab_action` (back/forward/reload/close/activate/
+text) y `ghost_eval`.
+
+> **Aviso de seguridad**: la API no tiene autenticación porque solo escucha
+> en loopback, pero cualquier proceso local de tu equipo puede controlar el
+> navegador mientras Ghost esté abierto. No la expongas a la red.
+
 ## Privacidad y datos
 
 El bloqueador integrado utiliza una lista limitada de patrones de dominios
@@ -100,11 +161,18 @@ Para comprobar el formato y ejecutar las pruebas:
 
 ```powershell
 cargo fmt --all -- --check
+cargo check --all-targets
 cargo test --bin ghost
+cargo test -p wisp-engine
 ```
 
-El código principal está en `src/`. `build.rs`, `ghost.rc` y `ghost.ico`
-configuran el recurso de Windows.
+El código principal está en `src/` (`browser.rs`, `webview.rs`, `ui.rs`,
+`remote.rs`) y el motor experimental en `wisp/`. `build.rs`, `ghost.rc` y
+`ghost.ico` configuran el recurso de Windows.
+
+Para contribuir, lee [CONTRIBUTING.md](CONTRIBUTING.md). Para reportar una
+vulnerabilidad de seguridad, sigue [SECURITY.md](SECURITY.md) — no abras un
+issue público. El historial de versiones está en [CHANGELOG.md](CHANGELOG.md).
 
 ## Rendimiento y memoria
 
@@ -157,3 +225,9 @@ WebView2 en sus áreas compatibles; el benchmark anterior es la primera
 medición reproducible y habrá que ampliarlo a más tipos de página.
 
 El motor y el prototipo CLI están documentados en [`wisp/`](wisp/README.md).
+
+## Licencia
+
+Ghost Browser se distribuye bajo la licencia [MIT](LICENSE). Eres libre de
+usarlo, modificarlo y redistribuirlo — incluso en productos comerciales —
+conservando el aviso de copyright.
