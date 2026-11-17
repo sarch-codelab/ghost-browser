@@ -1179,6 +1179,13 @@ impl ApplicationHandler for App {
                 // monitor (p. ej. se maximiza a mitad del cruce de DPI y
                 // MonitorFromWindow aún reporta el monitor viejo), Windows
                 // no siempre lo corrige solo: se re-maximiza aquí.
+                // Se compara el rect EXTERIOR con umbral amplio: Windows da a
+                // toda ventana redimensionable maximizada un overhang
+                // invisible de ~8 px por lado (~16 px en tamaño), así que un
+                // umbral de 8 px entraría en loop de re-maximize; la
+                // corrupción real son cientos de px. No vale comparar el
+                // client area: nuestro WM_NCCALCSIZE siempre lo fuerza al work
+                // area y enmascararía el estado corrupto.
                 if window.is_maximized() {
                     if let (Some((wl, wt, wr, wb)), Ok(pos)) =
                         (monitor_work_area(window), window.outer_position())
@@ -1188,7 +1195,7 @@ impl ApplicationHandler for App {
                         let dy = (pos.y - wt).abs();
                         let dw = (size.width as i32 - (wr - wl)).abs();
                         let dh = (size.height as i32 - (wb - wt)).abs();
-                        if dx.max(dy).max(dw).max(dh) > 8 {
+                        if dx.max(dy).max(dw).max(dh) > 32 {
                             window.set_maximized(false);
                             window.set_maximized(true);
                         }
