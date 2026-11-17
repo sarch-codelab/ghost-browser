@@ -129,9 +129,6 @@ struct App {
     cursor_position: Option<PhysicalPosition<f64>>,
     /// Alturas medidas del chrome y de la barra de estado en el último frame.
     chrome_metrics: (f32, f32),
-    /// La ventana no se está viendo (minimizada u oculta): baja la memoria de
-    /// todos los webviews, incluido el activo, sin descartarlos.
-    occluded: bool,
     /// El primer frame pinta el splash antes de crear ningún WebView2. Así no
     /// aparece la superficie blanca inicial de WebView2 al arrancar.
     startup_webviews_pending: bool,
@@ -180,7 +177,6 @@ impl App {
             title_dark: true,
             cursor_position: None,
             chrome_metrics: (browser::UI_HEIGHT, browser::STATUS_HEIGHT),
-            occluded: false,
             startup_webviews_pending: true,
             window_hidden: true,
             resize_cursor_active: false,
@@ -395,7 +391,11 @@ impl App {
                     && !self.browser.splash
                     && !self.browser.is_restoring(tab.id),
             );
-            webview::set_low_memory(webview, i != active || self.occluded);
+            // La pestaña activa SIEMPRE queda en memoria normal: WebView2 en
+            // nivel Low estrangula timers/rAF y páginas con lazy-load (YouTube,
+            // SPAs) se quedan "cargando" para siempre. El ahorro real está en
+            // las pestañas de fondo; la activa ya se autogestiona al ocultarse.
+            webview::set_low_memory(webview, i != active);
         }
         // Al cambiar de pestaña el foco del teclado debe seguir a la nueva
         // (si no, se escribe en la pestaña que quedó oculta).
@@ -642,8 +642,12 @@ fn install_frame_subclass(hwnd: isize) {
                     result
                 }
                 WM_GETMINMAXINFO => {
+                    // SIN gate de IsZoomed: este mensaje llega ANTES de
+                    // maximizar, precisamente para definir el tamaño máximo.
+                    // Sus campos ptMax* solo importan al hacer zoom, así que
+                    // fijarlos siempre al área de trabajo es lo correcto.
                     let result = CallWindowProcW(original, hwnd, msg, wparam, lparam);
-                    if IsZoomed(hwnd) != 0 {
+                    {
                         let mut info = MonitorInfo {
                             size: size_of::<MonitorInfo>() as u32,
                             ..Default::default()
@@ -707,8 +711,10 @@ fn style_window_frame(window: &Window, dark: bool) {
     let hwnd = win32.hwnd.get() as isize;
     // DWMWA_USE_IMMERSIVE_DARK_MODE = 20
     let dark_mode: i32 = if dark { 1 } else { 0 };
-    // DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2
-    let corner: i32 = 2;
+    // DWMWA_WINDOW_CORNER_PREFERENCE = 33: redondeadas en ventana normal,
+    // cuadradas al maximizar — forzar ROUND maximizada dibuja artefactos en
+    // los bordes de la pantalla (el "marco raro" reportado por usuarios).
+    let corner: i32 = if window.is_maximized() { 1 } else { 2 };
     // DWMWA_BORDER_COLOR = 34 (COLORREF 0x00BBGGRR)
     let border: u32 = if dark { 0x0000_0000 } else { 0x00FF_FFFF };
     unsafe {
@@ -959,8 +965,10 @@ impl ApplicationHandler for App {
                     }
                 }
                 // Al maximizar/restaurar winit vuelve a aplicar los estilos
-                // nativos; hay que quitar otra vez el título oculto.
+                // nativos; hay que quitar otra vez el título oculto y
+                // reevalorar las esquinas DWM (redondas ↔ cuadradas).
                 remove_hidden_caption(&window);
+                style_window_frame(&window, self.title_dark);
                 self.browser.needs_bounds_sync = true;
                 window.request_redraw();
             }
@@ -969,12 +977,7 @@ impl ApplicationHandler for App {
                 self.browser.needs_bounds_sync = true;
                 window.request_redraw();
             }
-            WindowEvent::Occluded(occluded) => {
-                if self.occluded != occluded {
-                    self.occluded = occluded;
-                    self.browser.needs_bounds_sync = true;
-                }
-            }
+            WindowEvent::Occluded(_) => {}
             WindowEvent::CloseRequested => {
                 // Guarda las pestañas abiertas y el estado antes de salir.
                 self.browser.capture_session();
