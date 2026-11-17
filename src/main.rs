@@ -112,6 +112,68 @@ fn client_size_physical(window: &Window) -> Option<winit::dpi::PhysicalSize<u32>
     None
 }
 
+/// Área de trabajo del monitor bajo la ventana en píxeles físicos
+/// (left, top, right, bottom). winit 0.30 no expone `work_area`, así que en
+/// Windows se consulta con GetMonitorInfoW; en otras plataformas se usa el
+/// tamaño completo del monitor como aproximación.
+#[cfg(windows)]
+fn monitor_work_area(window: &Window) -> Option<(i32, i32, i32, i32)> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::Win32(win) = handle.as_raw() else {
+        return None;
+    };
+    let hwnd = win.hwnd.get() as isize;
+    #[repr(C)]
+    #[derive(Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct MonitorInfo {
+        size: u32,
+        monitor: Rect,
+        work: Rect,
+        flags: u32,
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
+        fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+    }
+    let monitor = unsafe { MonitorFromWindow(hwnd, 2) };
+    let mut info = MonitorInfo {
+        size: size_of::<MonitorInfo>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+        return None;
+    }
+    Some((
+        info.work.left,
+        info.work.top,
+        info.work.right,
+        info.work.bottom,
+    ))
+}
+
+#[cfg(not(windows))]
+fn monitor_work_area(window: &Window) -> Option<(i32, i32, i32, i32)> {
+    let monitor = window.current_monitor()?;
+    let pos = monitor.position();
+    let size = monitor.size();
+    Some((
+        pos.x,
+        pos.y,
+        pos.x + size.width as i32,
+        pos.y + size.height as i32,
+    ))
+}
+
 fn resize_direction(
     size: winit::dpi::PhysicalSize<u32>,
     position: PhysicalPosition<f64>,
@@ -1108,10 +1170,29 @@ impl ApplicationHandler for App {
         // asentó tarde tras un cambio de DPI), se fuerza un re-sync.
         if Instant::now() >= self.bounds_verify_at {
             self.bounds_verify_at = Instant::now() + std::time::Duration::from_millis(500);
-            if self.window.is_some() {
+            if let Some(window) = &self.window {
                 let sig = format!("{:?}", self.content_rect());
                 if self.applied_content_sig.as_deref() != Some(sig.as_str()) {
                     self.browser.needs_bounds_sync = true;
+                }
+                // Si la ventana quedó maximizada con el work area de OTRO
+                // monitor (p. ej. se maximiza a mitad del cruce de DPI y
+                // MonitorFromWindow aún reporta el monitor viejo), Windows
+                // no siempre lo corrige solo: se re-maximiza aquí.
+                if window.is_maximized() {
+                    if let (Some((wl, wt, wr, wb)), Ok(pos)) =
+                        (monitor_work_area(window), window.outer_position())
+                    {
+                        let size = window.outer_size();
+                        let dx = (pos.x - wl).abs();
+                        let dy = (pos.y - wt).abs();
+                        let dw = (size.width as i32 - (wr - wl)).abs();
+                        let dh = (size.height as i32 - (wb - wt)).abs();
+                        if dx.max(dy).max(dw).max(dh) > 8 {
+                            window.set_maximized(false);
+                            window.set_maximized(true);
+                        }
+                    }
                 }
             }
         }
