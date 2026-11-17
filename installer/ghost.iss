@@ -3,7 +3,7 @@
 ; El binario release debe existir en target\release\ghost.exe.
 
 #define MyAppName "Ghost Browser"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.3"
 #define MyAppPublisher "sarch-codelab"
 #define MyAppExeName "ghost.exe"
 
@@ -52,11 +52,34 @@ begin
   Result := WebView2ResultCode <> 0;
 end;
 
+procedure KillGhostProcesses;
+var
+  ResultCode: Integer;
+  Params: String;
+begin
+  // Los procesos msedgewebview2.exe son del runtime de Microsoft, no del
+  // desinstalador: sin esto quedan huérfanos reproduciendo audio/vídeo tras
+  // cerrar Ghost (bug reportado: un video de YouTube seguía sonando). Se
+  // filtra por la línea de comandos: solo los que llevan 'ghost.exe' (el
+  // --webview-exe-name y el --user-data-dir del perfil de Ghost).
+  Exec('taskkill', '/F /IM ghost.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Params := '-NoProfile -ExecutionPolicy Bypass -EncodedCommand RwBlAHQALQBDAGkAbQBJAG4AcwB0AGEAbgBjAGUAIABXAGkAbgAzADIAXwBQAHIAbwBjAGUAcwBzACAALQBGAGkAbAB0AGUAcgAgACIATgBhAG0AZQA9ACcAbQBzAGUAZABnAGUAdwBlAGIAdgBpAGUAdwAyAC4AZQB4AGUAJwAiACAAfAAgAFcAaABlAHIAZQAtAE8AYgBqAGUAYwB0ACAAewAgACQAXwAuAEMAbwBtAG0AYQBuAGQATABpAG4AZQAgAC0AbQBhAHQAYwBoACAAJwBnAGgAbwBzAHQAXAAuAGUAeABlACcAIAB9ACAAfAAgAEYAbwByAEUAYQBjAGgALQBPAGIAagBlAGMAdAAgAHsAIABTAHQAbwBwAC0AUAByAG8AYwBlAHMAcwAgAC0ASQBkACAAJABfAC4AUAByAG8AYwBlAHMAcwBJAGQAIAAtAEYAbwByAGMAZQAgAC0ARQByAHIAbwByAEEAYwB0AGkAbwBuACAAUwBpAGwAZQBuAHQAbAB5AEMAbwBuAHQAaQBuAHUAZQAgAH0A';
+  Exec('powershell', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
+  if CurStep = ssInstall then
+    KillGhostProcesses;
   if CurStep = ssPostInstall then
     if WebView2NotInstalled then
       MsgBox('Ghost Browser necesita Microsoft Edge WebView2 Runtime para las páginas complejas. Parece que no está instalado: descárgalo gratis en https://developer.microsoft.com/microsoft-edge/webview2/', mbInformation, MB_OK);
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    KillGhostProcesses;
 end;
 
 [UninstallDelete]
