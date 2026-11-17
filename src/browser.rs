@@ -136,6 +136,40 @@ fn is_web_url(url: &str) -> bool {
 /// Envuelve JS de un `eval` remoto para que el resultado vuelva por
 /// `window.ipc` como mensaje `remote_eval` con el `eval_id` dado.
 /// Soporta valores directos y promesas (`then`/`catch`).
+/// Parámetros CDP de `Input.dispatchKeyEvent` para teclas comunes.
+/// Devuelve (key, code, windowsVirtualKeyCode, text).
+fn remote_key_params(key: &str) -> Option<(&'static str, &'static str, u32, &'static str)> {
+    Some(match key.to_ascii_lowercase().as_str() {
+        "enter" | "return" => ("Enter", "Enter", 13, "\r"),
+        "tab" => ("Tab", "Tab", 9, "\t"),
+        "escape" | "esc" => ("Escape", "Escape", 27, ""),
+        "backspace" => ("Backspace", "Backspace", 8, ""),
+        "delete" | "del" => ("Delete", "Delete", 46, ""),
+        " " | "space" | "spacebar" => (" ", "Space", 32, " "),
+        "arrowleft" | "left" => ("ArrowLeft", "ArrowLeft", 37, ""),
+        "arrowup" | "up" => ("ArrowUp", "ArrowUp", 38, ""),
+        "arrowright" | "right" => ("ArrowRight", "ArrowRight", 39, ""),
+        "arrowdown" | "down" => ("ArrowDown", "ArrowDown", 40, ""),
+        "home" => ("Home", "Home", 36, ""),
+        "end" => ("End", "End", 35, ""),
+        "pageup" => ("PageUp", "PageUp", 33, ""),
+        "pagedown" => ("PageDown", "PageDown", 34, ""),
+        "insert" => ("Insert", "Insert", 45, ""),
+        _ => return None,
+    })
+}
+
+/// Ruta por defecto para screenshots remotos: `%TEMP%/ghost_shots/`.
+fn default_shot_path(tab_id: u64) -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    std::env::temp_dir()
+        .join("ghost_shots")
+        .join(format!("ghost_tab{tab_id}_{millis}.png"))
+}
+
 fn remote_eval_script(eval_id: u64, js: &str) -> String {
     let source = serde_json::to_string(js).unwrap_or_else(|_| "\"\"".into());
     format!(
@@ -1520,6 +1554,15 @@ impl Browser {
             crate::remote::RemoteCommand::Eval { tab_id, js, done } => {
                 self.start_remote_eval(tab_id, &js, done);
             }
+            crate::remote::RemoteCommand::Cdp {
+                tab_id,
+                method,
+                params,
+                done,
+            } => self.start_remote_cdp(tab_id, &method, &params, done),
+            crate::remote::RemoteCommand::Shot { tab_id, path, done } => {
+                self.start_remote_shot(tab_id, path, done)
+            }
         }
     }
 
@@ -1628,6 +1671,19 @@ impl Browser {
                     _ => unreachable!(),
                 }
             }
+            (
+                "POST",
+                [
+                    "tabs",
+                    id,
+                    action @ ("click" | "type" | "press" | "scroll" | "move"),
+                ],
+            ) => {
+                let Ok(tab_id) = id.parse::<u64>() else {
+                    return Some(json!({"ok": false, "error": "id de pestaña inválido"}));
+                };
+                self.remote_input(tab_id, action, &request.body)
+            }
             _ => json!({"ok": false, "error": "ruta desconocida"}),
         })
     }
@@ -1719,6 +1775,191 @@ impl Browser {
     fn complete_remote_eval(&mut self, eval_id: u64, result: serde_json::Value) {
         if let Some(done) = self.pending_remote_evals.remove(&eval_id) {
             let _ = done.send(result);
+        }
+    }
+
+    /// WebView2 vivo de una pestaña (no suspendida, no nueva, motor correcto).
+    fn remote_webview(&self, tab_id: u64) -> Option<&wry::WebView> {
+        let tab = self.tab_by_id(tab_id)?;
+        if tab.engine != BrowserEngine::WebView2 {
+            return None;
+        }
+        tab.webview.as_ref()
+    }
+
+    /// Eventos de entrada remotos (click/tecleo/scroll) vía CDP `Input.*`.
+    /// Se disparan sin esperar resultado: la API responde `ok` al encolarlos
+    /// y el agente verifica el efecto con `/screenshot` o `/eval`.
+    fn remote_input(
+        &self,
+        tab_id: u64,
+        action: &str,
+        body: &serde_json::Value,
+    ) -> serde_json::Value {
+        use serde_json::json;
+        let Some(webview) = self.remote_webview(tab_id) else {
+            return json!({
+                "ok": false,
+                "error": "la entrada sólo funciona en pestañas WebView2 con página cargada"
+            });
+        };
+        let num = |key: &str| body.get(key).and_then(|v| v.as_f64());
+        let events: Vec<(String, String)> = match action {
+            "click" => {
+                let (Some(x), Some(y)) = (num("x"), num("y")) else {
+                    return json!({"ok": false, "error": "click necesita 'x' e 'y'"});
+                };
+                let button = body
+                    .get("button")
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("left");
+                if !matches!(button, "left" | "middle" | "right") {
+                    return json!({"ok": false, "error": "button debe ser left|middle|right"});
+                }
+                let clicks = body
+                    .get("clicks")
+                    .and_then(|c| c.as_u64())
+                    .unwrap_or(1)
+                    .clamp(1, 3);
+                let pressed = json!({
+                    "type": "mousePressed", "x": x, "y": y,
+                    "button": button, "clickCount": clicks,
+                    "buttons": match button {
+                        "left" => 1,
+                        "right" => 2,
+                        _ => 4,
+                    }
+                });
+                let mut released = pressed.clone();
+                released["type"] = json!("mouseReleased");
+                released["buttons"] = json!(0);
+                vec![
+                    (
+                        "Input.dispatchMouseEvent".into(),
+                        json!({"type": "mouseMoved", "x": x, "y": y}).to_string(),
+                    ),
+                    ("Input.dispatchMouseEvent".into(), pressed.to_string()),
+                    ("Input.dispatchMouseEvent".into(), released.to_string()),
+                ]
+            }
+            "type" => {
+                let Some(text) = body.get("text").and_then(|t| t.as_str()) else {
+                    return json!({"ok": false, "error": "type necesita 'text'"});
+                };
+                if text.is_empty() {
+                    return json!({"ok": false, "error": "'text' vacío"});
+                }
+                vec![("Input.insertText".into(), json!({"text": text}).to_string())]
+            }
+            "press" => {
+                let Some(key) = body.get("key").and_then(|k| k.as_str()) else {
+                    return json!({"ok": false, "error": "press necesita 'key'"});
+                };
+                let Some((name, code, vk, text)) = remote_key_params(key) else {
+                    return json!({
+                        "ok": false,
+                        "error": "key no soportada; usa /cdp con Input.dispatchKeyEvent para casos complejos"
+                    });
+                };
+                let mut down = json!({
+                    "type": "keyDown", "key": name, "code": code,
+                    "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk
+                });
+                if !text.is_empty() {
+                    down["text"] = json!(text);
+                }
+                let up = json!({
+                    "type": "keyUp", "key": name, "code": code,
+                    "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk
+                });
+                vec![
+                    ("Input.dispatchKeyEvent".into(), down.to_string()),
+                    ("Input.dispatchKeyEvent".into(), up.to_string()),
+                ]
+            }
+            "scroll" => {
+                let dx = num("deltaX").unwrap_or(0.0);
+                let dy = num("deltaY").unwrap_or(0.0);
+                if dx == 0.0 && dy == 0.0 {
+                    return json!({"ok": false, "error": "scroll necesita deltaX o deltaY"});
+                }
+                let mut wheel = json!({"type": "mouseWheel", "deltaX": dx, "deltaY": dy});
+                if let Some(x) = num("x") {
+                    wheel["x"] = json!(x);
+                }
+                if let Some(y) = num("y") {
+                    wheel["y"] = json!(y);
+                }
+                vec![("Input.dispatchMouseEvent".into(), wheel.to_string())]
+            }
+            "move" => {
+                let (Some(x), Some(y)) = (num("x"), num("y")) else {
+                    return json!({"ok": false, "error": "move necesita 'x' e 'y'"});
+                };
+                vec![(
+                    "Input.dispatchMouseEvent".into(),
+                    json!({"type": "mouseMoved", "x": x, "y": y}).to_string(),
+                )]
+            }
+            _ => return json!({"ok": false, "error": "acción de entrada desconocida"}),
+        };
+        for (method, params) in &events {
+            if let Err(e) = crate::cdp::fire(webview, method, params) {
+                return json!({"ok": false, "error": e});
+            }
+        }
+        json!({"ok": true, "events": events.len()})
+    }
+
+    /// CDP crudo con resultado diferido (el handler de WebView2 responde).
+    fn start_remote_cdp(
+        &mut self,
+        tab_id: u64,
+        method: &str,
+        params: &str,
+        done: Sender<serde_json::Value>,
+    ) {
+        use serde_json::json;
+        let Some(webview) = self.remote_webview(tab_id) else {
+            let _ = done.send(
+                json!({"ok": false, "error": "CDP sólo funciona en pestañas WebView2 con página cargada"}),
+            );
+            return;
+        };
+        let fallback = done.clone();
+        if let Err(e) = crate::cdp::call(webview, method, params, done) {
+            let _ = fallback.send(json!({"ok": false, "error": e}));
+        }
+    }
+
+    /// Captura PNG de una pestaña WebView2; guarda el archivo y responde
+    /// con su ruta (el binario no cabe en una respuesta JSON).
+    fn start_remote_shot(
+        &mut self,
+        tab_id: u64,
+        path: Option<String>,
+        done: Sender<serde_json::Value>,
+    ) {
+        use serde_json::json;
+        let Some(webview) = self.remote_webview(tab_id) else {
+            let _ = done.send(
+                json!({"ok": false, "error": "la captura sólo funciona en pestañas WebView2"}),
+            );
+            return;
+        };
+        let path = path
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| default_shot_path(tab_id));
+        let path = if path.is_absolute() {
+            path
+        } else {
+            std::env::temp_dir()
+                .join("ghost_shots")
+                .join(path.file_name().unwrap_or_default())
+        };
+        let fallback = done.clone();
+        if let Err(e) = crate::cdp::screenshot(webview, &path, done) {
+            let _ = fallback.send(json!({"ok": false, "error": e}));
         }
     }
 

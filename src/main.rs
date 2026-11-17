@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod browser;
+mod cdp;
 mod logo;
 mod perf;
 mod remote;

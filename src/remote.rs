@@ -10,6 +10,13 @@
 //!   POST /tabs/{id}/eval         {"js": "..."}          -> resultado del JS
 //!   POST /tabs/{id}/text                             -> texto legible
 //!   POST /tabs/{id}/activate                          -> trae la pestaña al frente
+//!   POST /tabs/{id}/click         {"x","y","button"?,"clicks"?}
+//!   POST /tabs/{id}/type          {"text": "..."}       -> inserta texto
+//!   POST /tabs/{id}/press         {"key": "Enter"}      -> tecla (enter/tab/esc/...)
+//!   POST /tabs/{id}/scroll        {"deltaX","deltaY","x"?,"y"?}
+//!   POST /tabs/{id}/move          {"x","y"}             -> mueve el ratón
+//!   POST /tabs/{id}/cdp           {"method","params"}  -> Chrome DevTools Protocol
+//!   POST /tabs/{id}/screenshot    {"path"?}             -> PNG en disco, devuelve ruta
 //!
 //! Puerto: 127.0.0.1:47820 (configurable con GHOST_REMOTE_PORT).
 
@@ -31,6 +38,21 @@ pub enum RemoteCommand {
     Eval {
         tab_id: u64,
         js: String,
+        done: Sender<Value>,
+    },
+    /// Método crudo del Chrome DevTools Protocol: la respuesta llega por el
+    /// handler `CallDevToolsProtocolMethodCompleted` de WebView2.
+    Cdp {
+        tab_id: u64,
+        method: String,
+        params: String,
+        done: Sender<Value>,
+    },
+    /// Captura de pantalla PNG vía `CapturePreview`; el resultado (con la
+    /// ruta del archivo) llega por el handler de finalización.
+    Shot {
+        tab_id: u64,
+        path: Option<String>,
         done: Sender<Value>,
     },
 }
@@ -160,6 +182,72 @@ fn route(request: &Request, tx: &Sender<RemoteCommand>) -> Value {
         return done_rx
             .recv_timeout(std::time::Duration::from_secs(15))
             .unwrap_or_else(|_| json!({"ok": false, "error": "timeout esperando la página"}));
+    }
+
+    // CDP crudo: POST /tabs/{id}/cdp {"method": "...", "params": {...}}
+    if request.method == "POST"
+        && segments.len() == 3
+        && segments[0] == "tabs"
+        && segments[2] == "cdp"
+        && let Ok(tab_id) = segments[1].parse::<u64>()
+    {
+        let method = request
+            .body
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if method.is_empty() {
+            return json!({"ok": false, "error": "falta 'method'"});
+        }
+        let params = match request.body.get("params") {
+            Some(Value::String(s)) => s.clone(),
+            Some(v) if !v.is_null() => v.to_string(),
+            _ => "{}".to_string(),
+        };
+        let (done_tx, done_rx) = channel::<Value>();
+        if tx
+            .send(RemoteCommand::Cdp {
+                tab_id,
+                method: method.to_string(),
+                params,
+                done: done_tx,
+            })
+            .is_err()
+        {
+            return json!({"ok": false, "error": "Ghost no está procesando comandos"});
+        }
+        return done_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .unwrap_or_else(|_| json!({"ok": false, "error": "timeout esperando CDP"}));
+    }
+
+    // Screenshot: POST /tabs/{id}/screenshot {"path": "..."?}
+    // Devuelve la ruta del PNG guardado (el contenido es binario, no JSON).
+    if request.method == "POST"
+        && segments.len() == 3
+        && segments[0] == "tabs"
+        && segments[2] == "screenshot"
+        && let Ok(tab_id) = segments[1].parse::<u64>()
+    {
+        let path = request
+            .body
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let (done_tx, done_rx) = channel::<Value>();
+        if tx
+            .send(RemoteCommand::Shot {
+                tab_id,
+                path,
+                done: done_tx,
+            })
+            .is_err()
+        {
+            return json!({"ok": false, "error": "Ghost no está procesando comandos"});
+        }
+        return done_rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .unwrap_or_else(|_| json!({"ok": false, "error": "timeout capturando pantalla"}));
     }
 
     let (reply_tx, reply_rx) = channel::<Value>();

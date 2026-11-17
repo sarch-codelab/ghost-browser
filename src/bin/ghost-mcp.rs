@@ -83,6 +83,29 @@ fn call_tool(name: &str, args: &Value) -> Value {
                 Some(&json!({"js": js}).to_string()),
             )
         }
+        "ghost_click" | "ghost_type" | "ghost_press" | "ghost_scroll" | "ghost_move"
+        | "ghost_screenshot" | "ghost_cdp" => {
+            let id = args.get("tab_id").and_then(Value::as_u64).unwrap_or(0);
+            let endpoint = name.trim_start_matches("ghost_");
+            let body = json!({
+                "x": args.get("x"),
+                "y": args.get("y"),
+                "button": args.get("button"),
+                "clicks": args.get("clicks"),
+                "text": args.get("text"),
+                "key": args.get("key"),
+                "deltaX": args.get("delta_x"),
+                "deltaY": args.get("delta_y"),
+                "path": args.get("path"),
+                "method": args.get("method"),
+                "params": args.get("params"),
+            });
+            http(
+                "POST",
+                &format!("/tabs/{id}/{endpoint}"),
+                Some(&body.to_string()),
+            )
+        }
         _ => {
             return tool_result(
                 json!({"ok": false, "error": format!("herramienta desconocida: {name}")}),
@@ -150,6 +173,98 @@ fn tool_definitions() -> Value {
                     "js": {"type": "string"}
                 },
                 "required": ["tab_id", "js"]
+            }
+        },
+        {
+            "name": "ghost_click",
+            "description": "Clic de ratón real (CDP Input.dispatchMouseEvent) en coordenadas CSS de la página. button: left|middle|right, clicks: 1-3.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab_id": {"type": "integer"},
+                    "x": {"type": "number"},
+                    "y": {"type": "number"},
+                    "button": {"type": "string", "enum": ["left", "middle", "right"]},
+                    "clicks": {"type": "integer"}
+                },
+                "required": ["tab_id", "x", "y"]
+            }
+        },
+        {
+            "name": "ghost_type",
+            "description": "Inserta texto en el elemento con foco de la página (CDP Input.insertText). Enfoca antes con ghost_click si hace falta.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab_id": {"type": "integer"},
+                    "text": {"type": "string"}
+                },
+                "required": ["tab_id", "text"]
+            }
+        },
+        {
+            "name": "ghost_press",
+            "description": "Pulsa una tecla: enter, tab, escape/esc, backspace, delete, space, arrowleft/up/right/down (o left/up/right/down), home, end, pageup, pagedown, insert.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab_id": {"type": "integer"},
+                    "key": {"type": "string"}
+                },
+                "required": ["tab_id", "key"]
+            }
+        },
+        {
+            "name": "ghost_scroll",
+            "description": "Rueda del ratón (CDP mouseWheel). deltaY positivo baja, negativo sube; deltaX para horizontal. x/y opcionales fijan la posición.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab_id": {"type": "integer"},
+                    "delta_x": {"type": "number"},
+                    "delta_y": {"type": "number"},
+                    "x": {"type": "number"},
+                    "y": {"type": "number"}
+                },
+                "required": ["tab_id", "delta_y"]
+            }
+        },
+        {
+            "name": "ghost_move",
+            "description": "Mueve el cursor del ratón a coordenadas CSS de la página (sin clicar).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab_id": {"type": "integer"},
+                    "x": {"type": "number"},
+                    "y": {"type": "number"}
+                },
+                "required": ["tab_id", "x", "y"]
+            }
+        },
+        {
+            "name": "ghost_screenshot",
+            "description": "Captura la pestaña como PNG (WebView2 CapturePreview) y devuelve la ruta del archivo guardado. Lee el PNG para ver la página.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab_id": {"type": "integer"},
+                    "path": {"type": "string", "description": "Ruta opcional del PNG; por defecto %TEMP%/ghost_shots/"}
+                },
+                "required": ["tab_id"]
+            }
+        },
+        {
+            "name": "ghost_cdp",
+            "description": "Llama cualquier método del Chrome DevTools Protocol (p. ej. Runtime.evaluate, DOM.getContentQuads, Page.captureScreenshot) y devuelve el resultado JSON.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tab_id": {"type": "integer"},
+                    "method": {"type": "string"},
+                    "params": {"type": "object"}
+                },
+                "required": ["tab_id", "method"]
             }
         }
     ])

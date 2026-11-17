@@ -102,12 +102,27 @@ entorno `GHOST_REMOTE_PORT`.
 | `POST /tabs/{id}/back` `/forward` `/reload` `/close` `/activate` | Acciones de historial y gestión |
 | `POST /tabs/{id}/eval` | `{"js": "..."}` ejecuta JS en WebView2 y devuelve el resultado |
 | `POST /tabs/{id}/text` | Texto legible de la página (reader en Wisp, `innerText` en WebView2) |
+| `POST /tabs/{id}/click` | `{"x","y","button"?,"clicks"?}` clic real vía CDP `Input.dispatchMouseEvent` |
+| `POST /tabs/{id}/type` | `{"text": "..."}` inserta texto en el foco (`Input.insertText`) |
+| `POST /tabs/{id}/press` | `{"key": "enter"}` pulsa una tecla (enter, tab, esc, flechas, etc.) |
+| `POST /tabs/{id}/scroll` | `{"deltaX","deltaY","x"?,"y"?}` rueda del ratón |
+| `POST /tabs/{id}/move` | `{"x","y"}` mueve el cursor sin clicar |
+| `POST /tabs/{id}/cdp` | `{"method","params"}` llama cualquier método del Chrome DevTools Protocol y devuelve el resultado |
+| `POST /tabs/{id}/screenshot` | `{"path"?}` captura la pestaña en PNG (`CapturePreview`) y devuelve la ruta del archivo |
+
+Las acciones de entrada (`click`/`type`/`press`/`scroll`/`move`), `cdp` y
+`screenshot` usan el Chrome DevTools Protocol y `CapturePreview` de
+WebView2: coordenadas en píxeles CSS del viewport de la página. Combinadas
+con `eval` y `text`, un agente puede ver la pantalla, hacer clic, escribir
+y leer el resultado — control total del navegador.
 
 Ejemplo:
 
 ```powershell
 curl http://127.0.0.1:47820/tabs
 curl -X POST http://127.0.0.1:47820/tabs/3/eval -d '{\"js\":\"document.title\"}'
+curl -X POST http://127.0.0.1:47820/tabs/3/click -d '{\"x\":400,\"y\":300}'
+curl -X POST http://127.0.0.1:47820/tabs/3/screenshot -d '{}'
 ```
 
 ### `ghost-mcp`: Ghost como herramienta MCP
@@ -136,7 +151,9 @@ Configuración MCP de ejemplo:
 
 Herramientas expuestas: `ghost_health`, `ghost_tabs`, `ghost_open_tab`,
 `ghost_navigate`, `ghost_tab_action` (back/forward/reload/close/activate/
-text) y `ghost_eval`.
+text), `ghost_eval`, `ghost_click`, `ghost_type`, `ghost_press`,
+`ghost_scroll`, `ghost_move`, `ghost_screenshot` y `ghost_cdp` (acceso
+crudo al Chrome DevTools Protocol).
 
 > **Aviso de seguridad**: la API no tiene autenticación porque solo escucha
 > en loopback, pero cualquier proceso local de tu equipo puede controlar el
