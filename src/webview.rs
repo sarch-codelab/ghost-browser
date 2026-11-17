@@ -403,7 +403,11 @@ pub fn create_webview<W: HasWindowHandle>(
     download_dir: Arc<RwLock<PathBuf>>,
 ) -> Result<WebView> {
     let dark = settings.dark_mode;
-    let script = init_script(settings.block_ads, settings.freeze_background_media);
+    let script = if std::env::var_os("GHOST_NO_INIT_SCRIPT").is_some() {
+        String::new()
+    } else {
+        init_script(settings.block_ads, settings.freeze_background_media)
+    };
     let tx_ipc = tx.clone();
     let tx_load = tx.clone();
     let tx_title = tx.clone();

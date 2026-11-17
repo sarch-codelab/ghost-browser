@@ -1009,6 +1009,8 @@ impl ApplicationHandler for App {
             self.materialize_webviews();
         }
         let restores_timed_out = self.browser.tick_restores(Instant::now());
+        // Sondas SPA: detectan páginas que quedaron en esqueleto y recargan.
+        self.browser.tick_spa_probes(Instant::now());
         // Al terminar el splash hay que hacer visible la pestaña de inicio.
         let splash_done = self.browser.tick_splash(Instant::now());
         if !self.startup_webviews_pending {

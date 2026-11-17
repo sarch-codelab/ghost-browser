@@ -5,7 +5,6 @@ edition = "2024"
 description = "A lightweight Rust desktop browser with WebView2, privacy controls, and automatic tab suspension."
 license = "MIT"
 repository = "https://github.com/sarch-codelab/ghost-browser"
-homepage = "https://github.com/sarch-codelab/ghost-browser"
 
 [dependencies]
 anyhow = "1.0.104"

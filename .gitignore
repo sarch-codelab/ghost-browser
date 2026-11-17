@@ -1,3 +1,4 @@
 target/
 *.msix
 installer/output/
+.tmp_eval/

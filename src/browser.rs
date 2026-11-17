@@ -17,6 +17,10 @@ pub const STATUS_HEIGHT: f32 = 24.0;
 /// pocos bytes de metadatos; el resto de la sesión se conserva en disco.
 pub const MAX_RESTORED_TABS: usize = 200;
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Espera antes de sondear si una navegación SPA terminó de renderizar.
+const SPA_PROBE_DELAY: Duration = Duration::from_secs(6);
+/// Mide texto visible y tamaño del DOM; responde por IPC como `spa_probe`.
+const SPA_PROBE_JS: &str = "try{var b=document.body,t=b?b.innerText.length:0,h=document.documentElement?document.documentElement.innerHTML.length:0;window.ipc.postMessage(JSON.stringify({type:'spa_probe',len:t,html:h}))}catch(e){}";
 
 /// Layout de Wisp en curso: ancho calculándose y último ancho pedido (por si
 /// el usuario sigue redimensionando mientras el hilo trabaja).
@@ -233,6 +237,9 @@ pub struct Browser {
     /// Inicio de una restauración, para medirla y aplicar su timeout.
     restore_started: HashMap<u64, Instant>,
     pending_history_index: HashMap<u64, usize>,
+    /// Sonda de salud tras navegaciones SPA: si la página queda con DOM
+    /// grande pero casi sin texto visible, se fuerza una recarga completa.
+    spa_probe_at: HashMap<u64, Instant>,
     /// Pestañas cuyo webview se mantiene oculto mientras se restaura.
     restoring_tabs: HashSet<u64>,
     /// Indica que hay que resincronizar los límites de los webviews.
@@ -407,6 +414,7 @@ impl Browser {
             unloaded_session,
             restore_started: HashMap::new(),
             pending_history_index: HashMap::new(),
+            spa_probe_at: HashMap::new(),
             restoring_tabs: HashSet::new(),
             needs_bounds_sync: true,
             chrome_height: UI_HEIGHT,
@@ -730,6 +738,23 @@ impl Browser {
             return true;
         }
         false
+    }
+
+    /// Dispara las sondas SPA vencidas: evalúa un probe en cada webview
+    /// pendiente; la página responde por IPC (`spa_probe`) con sus métricas.
+    pub fn tick_spa_probes(&mut self, now: Instant) {
+        let due: Vec<u64> = self
+            .spa_probe_at
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for tab_id in due {
+            self.spa_probe_at.remove(&tab_id);
+            if let Some(webview) = self.tab_by_id(tab_id).and_then(|tab| tab.webview.as_ref()) {
+                let _ = webview.evaluate_script(SPA_PROBE_JS);
+            }
+        }
     }
 
     pub fn tab_index_of(&self, id: u64) -> Option<usize> {
@@ -1093,6 +1118,26 @@ impl Browser {
                 // disco, congelando el webview. `dirty` basta: el flush
                 // periódico y el cierre ya guardan la sesión.
                 self.dirty = true;
+                // Algunas SPAs se quedan con el esqueleto cargado y sin datos
+                // (visto en YouTube). Se arma una sonda: si la página sigue
+                // "vacía" en unos segundos, se fuerza una carga completa.
+                self.spa_probe_at
+                    .insert(tab_id, Instant::now() + SPA_PROBE_DELAY);
+            }
+            "spa_probe" => {
+                let len = v.get("len").and_then(|n| n.as_u64()).unwrap_or(0);
+                let html = v.get("html").and_then(|n| n.as_u64()).unwrap_or(0);
+                // Esqueleto SPA atascado: DOM grande pero casi nada visible.
+                // Las páginas de error/simple tienen HTML pequeño y no aplican.
+                if len < 200 && html > 50_000 {
+                    if let Some(webview) =
+                        self.tab_by_id(tab_id).and_then(|tab| tab.webview.as_ref())
+                    {
+                        log::info!("SPA atascada en pestaña {tab_id} ({len} chars): recargando");
+                        let _ = webview.reload();
+                        self.set_status("La página no terminó de cargar; recargando…".into());
+                    }
+                }
             }
             "remote_eval" => {
                 if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {
@@ -1209,6 +1254,8 @@ impl Browser {
     }
 
     pub fn navigate_tab_by_id(&mut self, tab_id: u64, input: &str) {
+        // Navegación completa: cualquier sonda SPA pendiente queda obsoleta.
+        self.spa_probe_at.remove(&tab_id);
         let (mut engine, engine_manual) = {
             let Some(t) = self.tab_by_id(tab_id) else {
                 return;
@@ -1681,6 +1728,7 @@ impl Browser {
         }
         let t = self.tabs.remove(index);
         self.pending_history_index.remove(&t.id);
+        self.spa_probe_at.remove(&t.id);
         self.pending_wisp_requests.remove(&t.id);
         self.pending_wisp_layouts.remove(&t.id);
         self.restore_started.remove(&t.id);
