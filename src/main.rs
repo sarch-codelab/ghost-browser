@@ -612,6 +612,8 @@ fn install_frame_subclass(hwnd: isize) {
         pt_max_position: Point,
         pt_min_track_size: Point,
         pt_max_track_size: Point,
+        rc_max_position: Rect,
+        rc_min_track_size: Rect,
     }
     #[repr(C)]
     #[derive(Default)]
@@ -660,9 +662,14 @@ fn install_frame_subclass(hwnd: isize) {
                         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
                         if GetMonitorInfoW(monitor, &mut info) != 0 {
                             let mmi = &mut *(lparam as *mut MinMaxInfo);
+                            // ptMaxPosition es RELATIVO al origen del
+                            // monitor (Windows suma monitor.left/top): si se
+                            // pasa la coordenada absoluta, la ventana
+                            // maximizada salta a monitor.left*2 — el bug de
+                            // "Ghost desaparece al maximizar" en DISPLAY2.
                             mmi.pt_max_position = Point {
-                                x: info.work.left,
-                                y: info.work.top,
+                                x: info.work.left - info.monitor.left,
+                                y: info.work.top - info.monitor.top,
                             };
                             mmi.pt_max_size = Point {
                                 x: info.work.right - info.work.left,

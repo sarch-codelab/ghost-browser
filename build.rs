@@ -6,6 +6,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=ghost.rc");
     println!("cargo:rerun-if-changed=ghost.ico");
+    println!("cargo:rerun-if-changed=ghost.manifest");
     println!("cargo:rerun-if-env-changed=RC");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
