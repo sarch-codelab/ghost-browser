@@ -2074,7 +2074,93 @@ fn draw_panels(ctx: &egui::Context, app: &mut Browser, p: &Palette) {
                     changed = true;
                 }
                 ui.add_space(6.0);
+                ui.label(RichText::new("Zoom por defecto").size(12.0).color(p.text));
+                let mut zoom_f = s.default_zoom * 100.0;
+                let response = ui.add(egui::Slider::new(&mut zoom_f, 25.0..=500.0).suffix("%"));
+                if response.changed() {
+                    s.default_zoom = (zoom_f / 100.0).clamp(0.25, 5.0);
+                    changed = true;
+                }
+                ui.add_space(6.0);
                 ui.label(RichText::new("Página de inicio").size(12.0).color(p.text));
+
+                section(ui, p, "Descargas");
+                if ui.checkbox(&mut s.ask_download_location, "Preguntar siempre dónde guardar").changed() {
+                    changed = true;
+                }
+                if ui.checkbox(&mut s.auto_open_downloads, "Auto-abrir archivos descargados").changed() {
+                    changed = true;
+                }
+
+                section(ui, p, "Seguridad");
+                if ui.checkbox(&mut s.block_popups, "Bloquear pop-ups no solicitados").changed() {
+                    changed = true;
+                }
+
+                section(ui, p, "Modo lectura");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Tamaño de fuente").size(12.0).color(p.text));
+                    let mut size = s.reader_font_size as f64;
+                    let response = ui.add(egui::Slider::new(&mut size, 8.0..=32.0));
+                    if response.changed() {
+                        s.reader_font_size = size as u8;
+                        changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Tipo de fuente").size(12.0).color(p.text));
+                    egui::ComboBox::from_id_salt("reader_font_family")
+                        .selected_text(&s.reader_font_family)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut s.reader_font_family, "sans".to_string(), "Sans-serif");
+                            ui.selectable_value(&mut s.reader_font_family, "serif".to_string(), "Serif");
+                            ui.selectable_value(&mut s.reader_font_family, "mono".to_string(), "Monospace");
+                        });
+                    changed = true;
+                });
+
+                section(ui, p, "Perfil");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Nombre del perfil").size(12.0).color(p.text));
+                    if ui.text_edit_singleline(&mut s.profile_name).changed() {
+                        changed = true;
+                    }
+                });
+                ui.label(
+                    RichText::new("Los datos del perfil (marcadores, historial, ajustes) se guardan en %LOCALAPPDATA%\\Ghost\\ghost.json")
+                        .size(11.0)
+                        .color(p.muted),
+                );
+
+                section(ui, p, "Datos");
+                ui.label(RichText::new("Gestión de datos y caché").size(12.0).color(p.text));
+                if ui.button("Ver tamaño de caché").clicked() {
+                    // TODO: Implementar cálculo de tamaño de caché
+                }
+                if ui.button("Borrar caché del sitio actual").clicked() {
+                    // TODO: Implementar borrado de caché por sitio
+                }
+                if ui.button("Ver cookies del sitio actual").clicked() {
+                    // TODO: Implementar visor de cookies
+                }
+                if ui.button("Borrar cookies del sitio actual").clicked() {
+                    // TODO: Implementar borrado de cookies por sitio
+                }
+
+                section(ui, p, "Historial");
+                ui.label(RichText::new("Gestión del historial de navegación").size(12.0).color(p.text));
+                ui.horizontal(|ui| {
+                    if ui.button("Borrar últimas 24h").clicked() {
+                        // TODO: Implementar borrado por período
+                    }
+                    if ui.button("Borrar últimas 7 días").clicked() {
+                        // TODO: Implementar borrado por período
+                    }
+                    if ui.button("Borrar todo el historial").clicked() {
+                        app.store.clear_history();
+                        changed = true;
+                    }
+                });
                 if ui
                     .add(
                         egui::TextEdit::singleline(&mut s.home_page)

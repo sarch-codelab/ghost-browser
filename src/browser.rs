@@ -432,7 +432,7 @@ impl Browser {
                 // La nueva pestaña es nativa (egui): no hay nada que restaurar
                 // ni proceso que crear para ella.
                 loading: !webview::is_newtab_url(&home_url),
-                zoom: 1.0,
+                zoom: store.settings.default_zoom.clamp(0.25, 5.0),
                 navigation_history: vec![home_url.clone()],
                 history_index: 0,
                 last_active: now,
@@ -2745,7 +2745,7 @@ mod tests {
                 url: "https://rust-lang.org/".into(),
                 engine: BrowserEngine::WebView2,
                 title: "Rust".into(),
-                zoom: 1.0,
+                zoom: store.settings.default_zoom.clamp(0.25, 5.0),
                 navigation_history: vec!["https://rust-lang.org/".into()],
                 history_index: 0,
             },
@@ -2753,7 +2753,7 @@ mod tests {
                 url: "https://gemini.google.com/app".into(),
                 engine: BrowserEngine::WebView2,
                 title: "Gemini".into(),
-                zoom: 1.0,
+                zoom: store.settings.default_zoom.clamp(0.25, 5.0),
                 navigation_history: vec!["https://gemini.google.com/app".into()],
                 history_index: 0,
             },
@@ -2889,7 +2889,7 @@ mod tests {
                 url: format!("https://example{index}.com/"),
                 engine: BrowserEngine::WebView2,
                 title: format!("Pestaña {index}"),
-                zoom: 1.0,
+                zoom: store.settings.default_zoom.clamp(0.25, 5.0),
                 navigation_history: Vec::new(),
                 history_index: 0,
             })

@@ -88,6 +88,24 @@ pub struct Settings {
     /// el resto en WebView2. Solo aplica a pestañas donde el usuario no haya
     /// elegido motor a mano.
     pub auto_engine: bool,
+    /// Nivel de zoom por defecto para nuevas pestañas (0.25 a 5.0).
+    pub default_zoom: f64,
+    /// Bloquear pop-ups no solicitados.
+    pub block_popups: bool,
+    /// Preguntar siempre dónde guardar descargas.
+    pub ask_download_location: bool,
+    /// Auto-abrir archivos descargados.
+    pub auto_open_downloads: bool,
+    /// Modo lectura: tamaño de fuente (8 a 32).
+    pub reader_font_size: u8,
+    /// Modo lectura: tipo de fuente (sans, serif, mono).
+    pub reader_font_family: String,
+    /// Modo lectura: color de texto (hex RGB).
+    pub reader_text_color: String,
+    /// Modo lectura: color de fondo (hex RGB).
+    pub reader_bg_color: String,
+    /// Nombre del perfil actual.
+    pub profile_name: String,
 }
 
 impl Default for Settings {
@@ -98,13 +116,20 @@ impl Default for Settings {
             home_page: "ghost://newtab".to_string(),
             download_dir: None,
             memory_saver: true,
-            // Perfil orientado a RAM: solo 3 webviews vivos y el resto se
-            // descarta; las pestañas de fondo se restauran al pulsarlas.
             suspend_after_secs: 60,
             max_live_tabs: 3,
             block_ads: true,
             freeze_background_media: true,
             auto_engine: false,
+            default_zoom: 1.0,
+            block_popups: true,
+            ask_download_location: false,
+            auto_open_downloads: false,
+            reader_font_size: 16,
+            reader_font_family: "sans".to_string(),
+            reader_text_color: "#F5F5F5".to_string(),
+            reader_bg_color: "#0B0B0B".to_string(),
+            profile_name: "Default".to_string(),
         }
     }
 }
