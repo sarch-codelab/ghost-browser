@@ -9,6 +9,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 use wry::WebView;
 
+/// Máximo de texturas de imágenes Wisp en caché con LRU suave.
+pub const MAX_WISP_TEXTURES: usize = 256;
+/// Límites para HashMaps pendientes para evitar crecimiento indefinido.
+const MAX_PENDING_WISP_REQUESTS: usize = 50;
+const MAX_PENDING_WISP_LAYOUTS: usize = 50;
+const MAX_RESTORE_STARTED: usize = 50;
+const MAX_SPA_PROBE_AT: usize = 50;
+const MAX_PENDING_HISTORY_INDEX: usize = 50;
+const MAX_PENDING_REMOTE_EVALS: usize = 20;
+
 /// Altura total de la franja superior: banda de redimensionado (6) + fila de pestañas/controles (32) + separación (4) + barra de direcciones (32).
 pub const UI_HEIGHT: f32 = 80.0;
 pub const CHROME_TOP_INSET: f32 = 6.0;
@@ -16,6 +26,9 @@ pub const STATUS_HEIGHT: f32 = 24.0;
 /// Pestañas que se restauran al arrancar. Las suspendidas solo ocupan unos
 /// pocos bytes de metadatos; el resto de la sesión se conserva en disco.
 pub const MAX_RESTORED_TABS: usize = 200;
+/// Máximo de entradas en el historial de navegación por pestaña para evitar
+/// crecimiento indefinido de memoria en sesiones largas.
+const MAX_HISTORY_PER_TAB: usize = 50;
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Espera antes de sondear si una navegación SPA terminó de renderizar.
 const SPA_PROBE_DELAY: Duration = Duration::from_secs(6);
@@ -79,7 +92,7 @@ impl Tab {
 
     pub fn display_title(&self) -> String {
         if !self.title.is_empty() {
-            self.title.clone()
+            self.title.to_string()
         } else {
             host_or_url(&self.url)
         }
@@ -89,7 +102,7 @@ impl Tab {
         if self.url.is_empty() || webview::is_newtab_url(&self.url) {
             String::new()
         } else {
-            self.url.clone()
+            self.url.to_string()
         }
     }
 
@@ -218,6 +231,14 @@ fn normalized_navigation_history(
             index = history.len() - 1;
         }
     }
+
+    // Limitar el historial al cargar desde disco
+    if history.len() > MAX_HISTORY_PER_TAB {
+        let excess = history.len() - MAX_HISTORY_PER_TAB;
+        history.drain(..excess);
+        index = index.saturating_sub(excess);
+    }
+
     (history, index)
 }
 
@@ -228,6 +249,13 @@ fn push_navigation(history: &mut Vec<String>, index: &mut usize, url: String) {
     history.truncate(index.saturating_add(1));
     history.push(url);
     *index = history.len() - 1;
+
+    // Limitar el tamaño del historial para evitar crecimiento indefinido
+    if history.len() > MAX_HISTORY_PER_TAB {
+        let excess = history.len() - MAX_HISTORY_PER_TAB;
+        history.drain(..excess);
+        *index = index.saturating_sub(excess);
+    }
 }
 
 pub struct Browser {
@@ -297,6 +325,8 @@ pub struct Browser {
     pub logo_tex: Option<egui::TextureHandle>,
     /// Caché de imágenes decodificadas de páginas Wisp, por URL resuelta.
     pub wisp_textures: HashMap<String, egui::TextureHandle>,
+    /// Orden de uso reciente de texturas Wisp para LRU suave.
+    pub wisp_texture_order: VecDeque<String>,
     /// Cuántas pestañas se han suspendido en esta sesión (dato informativo).
     pub suspended_this_session: usize,
     /// Motor forzado desde la línea de comandos (`--wisp`/`--webview2`), si lo hay.
@@ -460,6 +490,7 @@ impl Browser {
             splash_until,
             logo_tex: None,
             wisp_textures: HashMap::new(),
+            wisp_texture_order: VecDeque::new(),
             suspended_this_session: 0,
             cli_engine: None,
             dirty: false,
@@ -498,6 +529,31 @@ impl Browser {
         self.pending_history_index.remove(&tab_id);
         self.pending_restore.retain(|pending| *pending != tab_id);
         self.cancel_restore(tab_id);
+        // Limpiar texturas Wisp asociadas a esta pestaña si se descarga
+        self.cleanup_wisp_textures_for_tab(tab_id);
+    }
+
+    /// Limpia texturas Wisp de una pestaña específica cuando se descarga o cambia de motor.
+    fn cleanup_wisp_textures_for_tab(&mut self, tab_id: u64) {
+        let urls_to_remove: Vec<String> = self
+            .tab_by_id(tab_id)
+            .and_then(|tab| tab.wisp_html.as_ref())
+            .map(|html| html.images.keys().cloned().collect())
+            .unwrap_or_default();
+
+        for url in urls_to_remove {
+            self.wisp_textures.remove(&url);
+            self.wisp_texture_order.retain(|x| x != &url);
+        }
+    }
+
+    /// Inserta en pending_history_index con límite de tamaño.
+    fn set_pending_history_index(&mut self, tab_id: u64, index: usize) {
+        if self.pending_history_index.len() >= MAX_PENDING_HISTORY_INDEX {
+            log::warn!("Límite de índices de historial pendientes alcanzado, limpiando");
+            self.pending_history_index.clear();
+        }
+        self.pending_history_index.insert(tab_id, index);
     }
 
     /// Cambio de motor iniciado por el usuario (botón, ajustes o atajo):
@@ -603,6 +659,12 @@ impl Browser {
 
         self.next_wisp_request_id = self.next_wisp_request_id.wrapping_add(1).max(1);
         let request_id = self.next_wisp_request_id;
+
+        // Limitar tamaño del HashMap
+        if self.pending_wisp_requests.len() >= MAX_PENDING_WISP_REQUESTS {
+            log::warn!("Límite de requests Wisp pendientes alcanzado, limpiando");
+            self.pending_wisp_requests.clear();
+        }
         self.pending_wisp_requests.insert(tab_id, request_id);
         if let Some(tab) = self.tab_by_id_mut(tab_id) {
             tab.url = url.clone();
@@ -945,6 +1007,12 @@ impl Browser {
         };
         self.next_wisp_layout_id = self.next_wisp_layout_id.wrapping_add(1).max(1);
         let request_id = self.next_wisp_layout_id;
+
+        // Limitar tamaño del HashMap
+        if self.pending_wisp_layouts.len() >= MAX_PENDING_WISP_LAYOUTS {
+            log::warn!("Límite de layouts Wisp pendientes alcanzado, limpiando");
+            self.pending_wisp_layouts.clear();
+        }
         self.pending_wisp_layouts.insert(
             tab_id,
             PendingWispLayout {
@@ -1155,6 +1223,10 @@ impl Browser {
                 // Algunas SPAs se quedan con el esqueleto cargado y sin datos
                 // (visto en YouTube). Se arma una sonda: si la página sigue
                 // "vacía" en unos segundos, se fuerza una carga completa.
+                if self.spa_probe_at.len() >= MAX_SPA_PROBE_AT {
+                    log::warn!("Límite de sondas SPA alcanzado, limpiando");
+                    self.spa_probe_at.clear();
+                }
                 self.spa_probe_at
                     .insert(tab_id, Instant::now() + SPA_PROBE_DELAY);
             }
@@ -1406,6 +1478,12 @@ impl Browser {
             // oculta esperando a PageFinished.
             if !self.splash {
                 self.restoring_tabs.insert(tab_id);
+
+                // Limitar tamaño del HashMap
+                if self.restore_started.len() >= MAX_RESTORE_STARTED {
+                    log::warn!("Límite de restauraciones iniciadas alcanzado, limpiando");
+                    self.restore_started.clear();
+                }
                 self.restore_started
                     .entry(tab_id)
                     .or_insert_with(Instant::now);
@@ -1468,16 +1546,16 @@ impl Browser {
         let url = tab.navigation_history[next_index].clone();
         // Volver a la nueva pestaña no crea procesos: es nativa.
         if webview::is_newtab_url(&url) {
-            self.pending_history_index.insert(id, next_index);
+            self.set_pending_history_index(id, next_index);
             self.navigate_to_newtab(id);
             return;
         }
         if tab.engine == BrowserEngine::Wisp {
-            self.pending_history_index.insert(id, next_index);
+            self.set_pending_history_index(id, next_index);
             self.navigate_wisp_tab(id, url);
             return;
         }
-        self.pending_history_index.insert(id, next_index);
+        self.set_pending_history_index(id, next_index);
         if let Some(tab) = self.tab_by_id_mut(id) {
             tab.loading = true;
         }
@@ -1736,6 +1814,10 @@ impl Browser {
             .and_then(|t| t.webview.as_ref())
             .is_some_and(|webview| webview.evaluate_script(&wrapped).is_ok());
         if delivered {
+            if self.pending_remote_evals.len() >= MAX_PENDING_REMOTE_EVALS {
+                log::warn!("Límite de evals remotos pendientes alcanzado, limpiando");
+                self.pending_remote_evals.clear();
+            }
             self.pending_remote_evals.insert(eval_id, reply);
             None
         } else {
@@ -1765,6 +1847,10 @@ impl Browser {
             .and_then(|t| t.webview.as_ref())
             .is_some_and(|webview| webview.evaluate_script(&wrapped).is_ok());
         if delivered {
+            if self.pending_remote_evals.len() >= MAX_PENDING_REMOTE_EVALS {
+                log::warn!("Límite de evals remotos pendientes alcanzado, limpiando");
+                self.pending_remote_evals.clear();
+            }
             self.pending_remote_evals.insert(eval_id, done);
         } else {
             let _ = done.send(json!({"ok": false, "error": "no se pudo evaluar en la página"}));
@@ -1975,6 +2061,8 @@ impl Browser {
         self.restore_started.remove(&t.id);
         self.restoring_tabs.remove(&t.id);
         self.pending_restore.retain(|tab_id| *tab_id != t.id);
+        // Limpiar texturas Wisp de la pestaña cerrada
+        self.cleanup_wisp_textures_for_tab(t.id);
         // Guardar en la pila de pestañas cerradas (para Ctrl+Shift+T).
         self.closed_tabs.push(ClosedTab {
             url: if t.url.trim().is_empty() {

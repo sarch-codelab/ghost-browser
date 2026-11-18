@@ -25,6 +25,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorIcon, ResizeDirection, Theme, Window, WindowId};
 
+/// Constantes para Strings frecuentes para evitar allocations repetidos.
+const NEWTAB_URL: &str = "ghost://newtab";
+
 fn apply_viewport_commands(
     event_loop: &ActiveEventLoop,
     window: &Window,
@@ -373,10 +376,10 @@ impl App {
                     wisp_reader: None,
                     engine_manual: false,
                     title: String::new(),
-                    url: "ghost://newtab".to_string(),
+                    url: NEWTAB_URL.to_string(),
                     loading: false,
                     zoom: 1.0,
-                    navigation_history: vec!["ghost://newtab".to_string()],
+                    navigation_history: vec![NEWTAB_URL.to_string()],
                     history_index: 0,
                     last_active: Instant::now(),
                     pending_url: None,
@@ -459,7 +462,7 @@ impl App {
             // Defensa: una pestaña nueva nunca debe materializar un webview.
             if webview::is_newtab_url(&target) {
                 if let Some(tab) = self.browser.tab_by_id_mut(id) {
-                    tab.url = "ghost://newtab".to_string();
+                    tab.url = NEWTAB_URL.to_string();
                     tab.pending_url = None;
                     tab.loading = false;
                 }
@@ -1232,6 +1235,11 @@ impl ApplicationHandler for App {
         let suspended = self.browser.maintain(Instant::now());
         let dirty = self.browser.is_dirty();
         self.browser.clear_dirty();
+
+        // Reportar uso de memoria periódicamente si está habilitado
+        if suspended || dirty {
+            perf::report_memory_usage();
+        }
 
         if let Some(window) = &self.window {
             let egui_wants = self

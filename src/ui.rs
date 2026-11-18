@@ -847,6 +847,11 @@ fn wisp_image_texture(
     url: &str,
 ) -> Option<egui::TextureHandle> {
     if let Some(texture) = app.wisp_textures.get(url) {
+        // Mover al final del orden (LRU: más reciente)
+        if let Some(pos) = app.wisp_texture_order.iter().position(|x| x == url) {
+            app.wisp_texture_order.remove(pos);
+        }
+        app.wisp_texture_order.push_back(url.to_string());
         return Some(texture.clone());
     }
     let bytes = app
@@ -861,9 +866,14 @@ fn wisp_image_texture(
     let size = [decoded.width() as usize, decoded.height() as usize];
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &decoded.into_raw());
     let texture = ctx.load_texture(url, color_image, egui::TextureOptions::LINEAR);
-    if app.wisp_textures.len() >= 512 {
-        app.wisp_textures.clear();
+
+    // LRU suave: eliminar solo la más antigua si excede el límite
+    if app.wisp_textures.len() >= crate::browser::MAX_WISP_TEXTURES {
+        if let Some(old_url) = app.wisp_texture_order.pop_front() {
+            app.wisp_textures.remove(&old_url);
+        }
     }
+    app.wisp_texture_order.push_back(url.to_owned());
     app.wisp_textures.insert(url.to_owned(), texture.clone());
     Some(texture)
 }

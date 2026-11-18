@@ -193,6 +193,17 @@ issue público. El historial de versiones está en [CHANGELOG.md](CHANGELOG.md).
 
 ## Rendimiento y memoria
 
+Ghost implementa múltiples estrategias de economía de recursos para minimizar el uso de RAM:
+
+- **Suspensión agresiva de pestañas**: Máximo 3 webviews vivos simultáneos, pestañas inactivas se suspenden tras 60s (configurable).
+- **Motor Wisp (Rust puro)**: Renderiza sin procesos de Chromium — todo en un solo proceso.
+- **Límites de recursos**: Historial por pestaña (50 URLs), texturas Wisp (256 con LRU), marcadores (200), historial global (1000).
+- **Límites en HashMaps pendientes**: Operaciones pendientes limitadas a 20-50 entradas para prevenir memory leaks.
+- **Página de inicio nativa**: Sin WebView2 hasta navegar a una URL real.
+- **Restauración bajo demanda**: Solo 200 pestañas visibles al inicio, resto en disco.
+
+### Benchmark
+
 Medición reproducible con `ram_bench.ps1` (Windows, build `--release`):
 Ghost con N pestañas de artículos de Wikipedia frente a Edge y a Ghost con
 WebView2 forzado. Se mide el Working Set (WS) y los Private Bytes (PB) del
@@ -215,6 +226,17 @@ La comparación es deliberadamente conservadora: Wikipedia son páginas
 textuales medias. En webs con mucho JavaScript o video, la diferencia crece
 porque Chromium debe ejecutar todo ese trabajo mientras Wisp solo renderiza
 lo que soporta.
+
+### Monitoreo de memoria
+
+Para monitorear el uso de memoria en tiempo de ejecución, establece la variable de entorno `GHOST_TIMING_LOG` con la ruta de un archivo de log:
+
+```powershell
+$env:GHOST_TIMING_LOG = "C:\temp\ghost_memory.log"
+cargo run --release
+```
+
+Ghost reportará periódicamente el Working Set y Private Bytes cuando suspenda pestañas o guarde cambios.
 
 ## Wisp experimental
 
