@@ -961,6 +961,22 @@ fn logo_texture(ctx: &egui::Context, app: &mut Browser) -> Option<egui::TextureH
     app.logo_tex.clone()
 }
 
+fn background_texture(ctx: &egui::Context, app: &mut Browser) -> Option<egui::TextureHandle> {
+    // Usar el mismo identificador que se usa en wisp_textures para la imagen de fondo
+    const BG_URL: &str = "ghost://black.webp";
+    if let Some(tex) = app.wisp_textures.get(BG_URL) {
+        return Some(tex.clone());
+    }
+    // Cargar la imagen de fondo incrustada
+    let bytes = include_bytes!("../black.webp");
+    let decoded = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let size = [decoded.width() as usize, decoded.height() as usize];
+    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &decoded.into_raw());
+    let texture = ctx.load_texture(BG_URL, color_image, egui::TextureOptions::LINEAR);
+    app.wisp_textures.insert(BG_URL.to_string(), texture.clone());
+    Some(texture)
+}
+
 fn paint_logo(ui: &mut Ui, rect: Rect, app: &mut Browser) {
     if let Some(tex) = logo_texture(ui.ctx(), app) {
         let target = Rect::from_center_size(rect.center(), rect.size());
@@ -2194,6 +2210,29 @@ fn draw_newtab_page(ui: &mut Ui, app: &mut Browser, p: &Palette) {
     let search_width = (area.width() * 0.86).clamp(280.0, 560.0);
     let mut query = std::mem::take(&mut app.newtab_query);
     let mut navigate: Option<String> = None;
+
+    // Dibujar imagen de fondo
+    let painter = ui.painter();
+    if !p.dark {
+        // Modo claro: fondo sólido
+        painter.rect_filled(area, 0.0, Color32::from_rgb(250, 250, 250));
+    } else {
+        // Modo oscuro: imagen de fondo con overlay
+        if let Some(bg_tex) = background_texture(ui.ctx(), app) {
+            painter.image(
+                bg_tex.id(),
+                area,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        // Overlay oscuro semitransparente
+        painter.rect_filled(
+            area,
+            0.0,
+            Color32::from_rgba_premultiplied(0, 0, 0, 158),
+        );
+    }
 
     ui.centered_and_justified(|ui| {
         ui.add_space(6.0);
