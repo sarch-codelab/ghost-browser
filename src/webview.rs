@@ -723,6 +723,81 @@ mod newtab_tests {
     }
 
     #[test]
+    fn los_popups_de_login_solo_se_permiten_en_su_host() {
+        use super::is_auth_url;
+
+        assert!(is_auth_url(
+            "https://accounts.google.com/o/oauth2/auth?client_id=x"
+        ));
+        assert!(is_auth_url("https://accounts.youtube.com/signin"));
+        assert!(is_auth_url(
+            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+        ));
+        assert!(is_auth_url("https://github.com/login/oauth/authorize"));
+
+        // Solo el login de GitHub, no cualquier página de github.com.
+        assert!(!is_auth_url("https://github.com/settings/profile"));
+        // Antes bastaba con que la URL contuviera "auth." en cualquier parte.
+        assert!(!is_auth_url("https://evil.example/auth.tracker"));
+        assert!(!is_auth_url("https://myauth.example/popup"));
+        assert!(!is_auth_url("https://accounts.google.com.evil.example/"));
+        assert!(!is_auth_url("no es una url"));
+    }
+
+    #[test]
+    fn el_buscador_elegido_construye_su_url() {
+        use super::search_url;
+
+        assert_eq!(
+            search_url("google", "rust lang"),
+            "https://www.google.com/search?q=rust+lang"
+        );
+        assert_eq!(
+            search_url("Bing", "rust lang"),
+            "https://www.bing.com/search?q=rust+lang"
+        );
+        assert_eq!(
+            search_url("brave", "a&b"),
+            "https://search.brave.com/search?q=a%26b"
+        );
+        assert_eq!(
+            search_url("startpage", "rust"),
+            "https://www.startpage.com/sp/search?query=rust"
+        );
+        assert_eq!(
+            search_url("ecosia", "rust"),
+            "https://www.ecosia.org/search?q=rust"
+        );
+        // Motor desconocido o vacío: DuckDuckGo.
+        assert_eq!(search_url("", "rust"), "https://duckduckgo.com/?q=rust");
+        assert_eq!(
+            search_url("motor-inventado", "rust"),
+            "https://duckduckgo.com/?q=rust"
+        );
+    }
+
+    #[test]
+    fn normalize_url_usa_el_buscador_configurado() {
+        use super::normalize_url;
+
+        // Un texto suelto va al buscador de Ajustes, no siempre a DuckDuckGo.
+        assert_eq!(
+            normalize_url("rust lang", "ghost://newtab", "google"),
+            "https://www.google.com/search?q=rust+lang"
+        );
+        // Un dominio sigue siendo una URL, no una búsqueda.
+        assert_eq!(
+            normalize_url("example.com", "ghost://newtab", "ecosia"),
+            "https://example.com"
+        );
+        // Una URL con esquema se respeta tal cual.
+        assert_eq!(
+            normalize_url("https://example.com/a?b=1", "ghost://newtab", "google"),
+            "https://example.com/a?b=1"
+        );
+    }
+
+    #[test]
     fn test_ad_domain_blocker() {
         use super::is_ad_domain;
         assert!(is_ad_domain("https://adservice.google.com/ads?id=123"));

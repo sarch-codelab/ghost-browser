@@ -382,7 +382,57 @@ mod tests {
         let store =
             Store::parse(&format!("\u{feff}{json}")).expect("el BOM no debe invalidar el perfil");
         assert_eq!(store.settings.home_page, "ghost://newtab");
-        assert_eq!(store.settings.dark_mode, true);
+        assert!(store.settings.dark_mode);
+    }
+
+    #[test]
+    fn clear_history_since_conserva_solo_lo_anterior_al_periodo() {
+        let now = now_secs();
+        let day = 24 * 60 * 60;
+        let mut store = Store {
+            history: vec![
+                HistoryEntry {
+                    url: "https://antigua.example".into(),
+                    title: "Antigua".into(),
+                    timestamp: now - 8 * day,
+                },
+                HistoryEntry {
+                    url: "https://ayer.example".into(),
+                    title: "Ayer".into(),
+                    timestamp: now - day + 60,
+                },
+                HistoryEntry {
+                    url: "https://ahora.example".into(),
+                    title: "Ahora".into(),
+                    timestamp: now,
+                },
+            ],
+            ..Default::default()
+        };
+
+        // «Últimos 7 días»: borra lo de ayer y lo de ahora, conserva la antigua.
+        store.clear_history_since(7 * day);
+        let urls: Vec<&str> = store.history.iter().map(|e| e.url.as_str()).collect();
+        assert_eq!(urls, vec!["https://antigua.example"]);
+
+        // «Últimas 24 h» sobre lo que queda: la entrada de hace 8 días sigue.
+        store.clear_history_since(day);
+        assert_eq!(store.history.len(), 1);
+
+        // Un período mayor que la entrada más antigua lo borra todo.
+        store.clear_history_since(30 * day);
+        assert!(store.history.is_empty());
+    }
+
+    #[test]
+    fn el_buscador_por_defecto_es_duckduckgo() {
+        assert_eq!(Settings::default().search_engine, "duckduckgo");
+        // Los perfiles antiguos (sin el campo) también caen al valor por defecto.
+        let json = serde_json::to_string(&Store::default()).unwrap();
+        let old_profile = json.replace("\"search_engine\":\"duckduckgo\",", "");
+        assert!(!old_profile.contains("search_engine"));
+        let store = Store::parse(&old_profile).unwrap();
+        assert_eq!(store.settings.search_engine, "duckduckgo");
     }
 
     #[test]
