@@ -305,7 +305,11 @@ impl App {
             browser.store.settings.max_live_tabs = usize::MAX;
         }
         for url in cli.urls {
-            let url = webview::normalize_url(&url, &browser.store.settings.home_page);
+            let url = webview::normalize_url(
+                &url,
+                &browser.store.settings.home_page,
+                &browser.store.settings.search_engine,
+            );
             browser.pending_new_tabs.push_back(Some(url));
         }
         Self {

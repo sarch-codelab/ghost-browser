@@ -60,6 +60,10 @@ fn default_zoom() -> f64 {
     1.0
 }
 
+fn default_search_engine() -> String {
+    "duckduckgo".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub url: String,
@@ -82,6 +86,10 @@ pub struct Settings {
     pub max_live_tabs: usize,
     /// Bloquea anuncios y rastreadores conocidos antes de cargarlos.
     pub block_ads: bool,
+    /// Buscador usado por la barra de direcciones y la página de inicio:
+    /// `duckduckgo`, `google`, `bing`, `brave`, `startpage` o `ecosia`.
+    #[serde(default = "default_search_engine")]
+    pub search_engine: String,
     /// Pausa la reproducción de medios en pestañas de fondo (excepto YouTube Music).
     pub freeze_background_media: bool,
     /// Elige el motor por URL: artículos/docs/wiki abren en Wisp (liviano),
@@ -119,6 +127,7 @@ impl Default for Settings {
             suspend_after_secs: 60,
             max_live_tabs: 3,
             block_ads: true,
+            search_engine: default_search_engine(),
             freeze_background_media: true,
             auto_engine: false,
             default_zoom: 1.0,

@@ -2084,14 +2084,39 @@ fn draw_panels(ctx: &egui::Context, app: &mut Browser, p: &Palette) {
                 }
                 ui.add_space(6.0);
                 ui.label(RichText::new("Página de inicio").size(12.0).color(p.text));
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut s.home_page)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("ghost://newtab"),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
 
-                section(ui, p, "Descargas");
-                if ui.checkbox(&mut s.ask_download_location, "Preguntar siempre dónde guardar").changed() {
+                section(ui, p, "Búsqueda");
+                let engine_label = SEARCH_ENGINES
+                    .iter()
+                    .find(|(id, _)| *id == s.search_engine)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("DuckDuckGo");
+                let previous_engine = s.search_engine.clone();
+                egui::ComboBox::from_id_salt("search_engine")
+                    .selected_text(engine_label)
+                    .show_ui(ui, |ui| {
+                        for (id, label) in SEARCH_ENGINES {
+                            ui.selectable_value(&mut s.search_engine, (*id).to_string(), *label);
+                        }
+                    });
+                if s.search_engine != previous_engine {
                     changed = true;
                 }
-                if ui.checkbox(&mut s.auto_open_downloads, "Auto-abrir archivos descargados").changed() {
-                    changed = true;
-                }
+                ui.label(
+                    RichText::new("Se usa en la barra de direcciones y en la página de inicio.")
+                        .size(11.0)
+                        .color(p.muted),
+                );
 
                 section(ui, p, "Seguridad");
                 if ui.checkbox(&mut s.block_popups, "Bloquear pop-ups no solicitados").changed() {
@@ -2279,6 +2304,35 @@ fn draw_status_bar(painter: &egui::Painter, screen: Rect, app: &Browser, p: &Pal
     }
 }
 
+/// Convierte lo escrito en la página de inicio igual que la barra de
+/// direcciones. Antes duplicaba la lógica (y buscaba siempre en DuckDuckGo,
+/// ignorando el buscador de Ajustes); ahora comparte `normalize_url`.
+fn resolve_newtab_query(q: &str, search_engine: &str) -> String {
+    crate::webview::normalize_url(q, "ghost://newtab", search_engine)
+}
+
+/// Color `#RRGGBB` de los ajustes del modo lectura.
+fn parse_hex_color(hex: &str) -> Option<Color32> {
+    let h = hex.trim().trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some(Color32::from_rgb(r, g, b))
+}
+
+/// Buscadores disponibles en Ajustes → Búsqueda.
+const SEARCH_ENGINES: &[(&str, &str)] = &[
+    ("duckduckgo", "DuckDuckGo"),
+    ("google", "Google"),
+    ("bing", "Bing"),
+    ("brave", "Brave Search"),
+    ("startpage", "Startpage"),
+    ("ecosia", "Ecosia"),
+];
+
 /// Accesos rápidos de la nueva pestaña nativa (los mismos que servía la
 /// antigua página `ghost://` dentro de WebView2).
 const QUICK_LINKS: &[(&str, &str)] = &[
@@ -2332,38 +2386,60 @@ fn draw_newtab_page(ui: &mut Ui, app: &mut Browser, p: &Palette) {
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.set_width(search_width - 26.0);
-                ui.add(
-                    egui::TextEdit::singleline(&mut query)
-                        .hint_text("Buscar en la web o escribir una dirección")
-                        .desired_width(f32::INFINITY)
-                        .frame(egui::Frame::NONE),
-                )
+                ui.horizontal(|ui| {
+                    // Icono de búsqueda (SVG del newtab original)
+                    ui.add_space(2.0);
+                    let icon_rect = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover()).0;
+                    let cx = icon_rect.center().x;
+                    let cy = icon_rect.center().y;
+                    let painter = ui.painter();
+                    painter.circle_stroke(pos2(cx, cy), 7.0, Stroke::new(1.8, p.muted));
+                    painter.line_segment(
+                        [pos2(cx + 5.5, cy + 5.5), pos2(cx + 9.0, cy + 9.0)],
+                        Stroke::new(1.8, p.muted),
+                    );
+                    ui.add_space(10.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut query)
+                            .hint_text("Buscar en la web o escribir una dirección")
+                            .desired_width(f32::INFINITY)
+                            .frame(egui::Frame::NONE),
+                    )
+                })
             })
             .inner;
         if ui.memory(|m| m.focused().is_none()) {
-            response.request_focus();
+            response.response.request_focus();
         }
-        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if response.response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             let q = query.trim();
             if !q.is_empty() {
-                navigate = Some(q.to_string());
+                navigate = Some(resolve_newtab_query(q, &app.store.settings.search_engine));
             }
         }
         ui.add_space(16.0);
 
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            for (label, url) in QUICK_LINKS {
-                let tile =
-                    egui::Button::new(RichText::new(*label).size(13.0).color(p.muted_strong))
+        // Centrar los botones horizontalmente con wrap - forzar ancho completo
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), 40.0),
+                egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    for (label, url) in QUICK_LINKS {
+                        let tile = egui::Button::new(
+                            RichText::new(*label).size(13.0).color(p.muted_strong),
+                        )
                         .fill(Color32::TRANSPARENT)
                         .stroke(Stroke::new(1.0, p.border))
                         .corner_radius(egui::CornerRadius::same(9))
                         .min_size(vec2(0.0, 34.0));
-                if ui.add(tile).on_hover_text(*url).clicked() {
-                    navigate = Some((*url).to_string());
-                }
-            }
+                        if ui.add(tile).on_hover_text(*url).clicked() {
+                            navigate = Some((*url).to_string());
+                        }
+                    }
+                },
+            );
         });
     });
 

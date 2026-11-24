@@ -413,7 +413,11 @@ impl Browser {
             if raw.is_empty() {
                 "ghost://newtab".to_string()
             } else {
-                normalize_tab_url(&webview::normalize_url(raw, "ghost://newtab"))
+                normalize_tab_url(&webview::normalize_url(
+                    raw,
+                    "ghost://newtab",
+                    &store.settings.search_engine,
+                ))
             }
         };
         let home_id = next_id;
@@ -1375,6 +1379,7 @@ impl Browser {
         let url = normalize_tab_url(&webview::normalize_url(
             input,
             &self.store.settings.home_page,
+            &self.store.settings.search_engine,
         ));
         // La nueva pestaña es nativa: destruir cualquier webview/Wisp y no
         // crear procesos. WebView2 queda 100% perezoso hasta una URL real.

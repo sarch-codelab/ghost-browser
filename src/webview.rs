@@ -233,8 +233,21 @@ pub fn is_newtab_url(url: &str) -> bool {
     false
 }
 
+/// URL de resultados del buscador elegido en Ajustes.
+pub fn search_url(engine: &str, query: &str) -> String {
+    let base = match engine.trim().to_ascii_lowercase().as_str() {
+        "google" => "https://www.google.com/search?q=",
+        "bing" => "https://www.bing.com/search?q=",
+        "brave" => "https://search.brave.com/search?q=",
+        "startpage" => "https://www.startpage.com/sp/search?query=",
+        "ecosia" => "https://www.ecosia.org/search?q=",
+        _ => "https://duckduckgo.com/?q=",
+    };
+    format!("{base}{}", percent_encode(query))
+}
+
 /// Convierte lo que escribe el usuario en una URL navegable.
-pub fn normalize_url(input: &str, home_page: &str) -> String {
+pub fn normalize_url(input: &str, home_page: &str, search_engine: &str) -> String {
     let t = input.trim();
     if t.is_empty() {
         return home_page.to_string();
@@ -264,7 +277,7 @@ pub fn normalize_url(input: &str, home_page: &str) -> String {
         return format!("https://{t}");
     }
     // Búsqueda
-    format!("https://duckduckgo.com/?q={}", percent_encode(t))
+    search_url(search_engine, t)
 }
 
 fn percent_encode(s: &str) -> String {
