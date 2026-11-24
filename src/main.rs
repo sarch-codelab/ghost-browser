@@ -1197,21 +1197,55 @@ impl ApplicationHandler for App {
                 // corrupción real son cientos de px. No vale comparar el
                 // client area: nuestro WM_NCCALCSIZE siempre lo fuerza al work
                 // area y enmascararía el estado corrupto.
-                if window.is_maximized() {
-                    if let (Some((wl, wt, wr, wb)), Ok(pos)) =
+                if window.is_maximized()
+                    && let (Some((wl, wt, wr, wb)), Ok(pos)) =
                         (monitor_work_area(window), window.outer_position())
-                    {
-                        let size = window.outer_size();
-                        let dx = (pos.x - wl).abs();
-                        let dy = (pos.y - wt).abs();
-                        let dw = (size.width as i32 - (wr - wl)).abs();
-                        let dh = (size.height as i32 - (wb - wt)).abs();
-                        if dx.max(dy).max(dw).max(dh) > 32 {
-                            window.set_maximized(false);
-                            window.set_maximized(true);
-                        }
+                {
+                    let size = window.outer_size();
+                    let dx = (pos.x - wl).abs();
+                    let dy = (pos.y - wt).abs();
+                    let dw = (size.width as i32 - (wr - wl)).abs();
+                    let dh = (size.height as i32 - (wb - wt)).abs();
+                    if dx.max(dy).max(dw).max(dh) > 32 {
+                        window.set_maximized(false);
+                        window.set_maximized(true);
                     }
                 }
+            }
+        }
+        // Detectar cambio de monitor y recalcular tamaño/posición.
+        if let Some(window) = &self.window
+            && let Some(current_monitor) = window.current_monitor()
+        {
+            let monitor_changed = !self
+                .last_monitor
+                .as_ref()
+                .map(|m| m.name() == current_monitor.name())
+                .unwrap_or(false);
+            if monitor_changed {
+                self.last_monitor = Some(current_monitor.clone());
+                let scale = window.scale_factor().max(0.5);
+                let size = current_monitor.size();
+                let usable_w = (size.width as f64 / scale) * 0.88;
+                let usable_h = (size.height as f64 / scale) * 0.88;
+                let min_w = usable_w.clamp(1.0, 320.0);
+                let min_h = usable_h.clamp(1.0, 240.0);
+                window.set_min_inner_size(Some(LogicalSize::new(min_w, min_h)));
+
+                let current = client_size_physical(window).unwrap_or_else(|| window.inner_size());
+                let cur_w = current.width as f64 / scale;
+                let cur_h = current.height as f64 / scale;
+                if cur_w > usable_w || cur_h > usable_h {
+                    // `clamp` entra en pánico si el área usable es menor que el
+                    // mínimo; aquí basta con no pasar del área usable.
+                    let want_w = cur_w.min(usable_w).max(1.0);
+                    let want_h = cur_h.min(usable_h).max(1.0);
+                    let _ = window.request_inner_size(LogicalSize::new(want_w, want_h));
+                }
+                // No forzar re-centrado: el usuario puede haber movido la ventana a propósito.
+                // Solo sincronizar bounds de las webviews.
+                self.browser.needs_bounds_sync = true;
+                window.request_redraw();
             }
         }
         // Sondas SPA: detectan páginas que quedaron en esqueleto y recargan.
