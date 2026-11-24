@@ -410,6 +410,26 @@ pub fn is_ad_domain(url: &str) -> bool {
     })
 }
 
+/// Ventanas emergentes de autenticación que hay que dejar abrir. Se compara
+/// el host exacto (o su subdominio) y nunca una subcadena de la URL: si no,
+/// cualquier sitio podría abrir popups llamándose `auth.algo.example`.
+fn is_auth_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str().map(|h| h.to_ascii_lowercase()) else {
+        return false;
+    };
+    let path = parsed.path();
+    match host.as_str() {
+        "accounts.google.com" | "accounts.youtube.com" => true,
+        "login.microsoftonline.com" | "login.live.com" => true,
+        "appleid.apple.com" => true,
+        "github.com" => path.starts_with("/login"),
+        _ => false,
+    }
+}
+
 fn available_download_path(dir: &std::path::Path, url: &str) -> Option<PathBuf> {
     let base = download_filename(url);
     let (stem, extension) = match base.rsplit_once('.') {
@@ -455,13 +475,15 @@ pub fn create_webview<W: HasWindowHandle>(
     let tx_title = tx.clone();
     let tx_dl_start = tx.clone();
     let tx_dl_done = tx.clone();
+    let block_popups = settings.block_popups;
 
     let webview = WebViewBuilder::new()
         .with_bounds(bounds)
         .with_url(url)
         .with_visible(visible)
+        // Fondo neutro en vez de negro puro para evitar pantalla negra durante redirects OAuth
         .with_background_color(if dark {
-            (0, 0, 0, 255)
+            (0x1E, 0x1E, 0x1E, 255) // gris oscuro #1E1E1E
         } else {
             (255, 255, 255, 255)
         })
@@ -510,7 +532,16 @@ pub fn create_webview<W: HasWindowHandle>(
         .with_download_completed_handler(move |url, path, ok| {
             let _ = tx_dl_done.send(TabEvent::DownloadFinished { url, path, ok });
         })
-        .with_new_window_req_handler(|_url, _features| NewWindowResponse::Deny)
+        .with_new_window_req_handler(move |url, _features| {
+            // Los popups de inicio de sesión (Google, Microsoft, GitHub) sí se
+            // permiten: sin ellos no se puede completar el OAuth. El resto se
+            // bloquea salvo que el usuario desactive el bloqueo en Ajustes.
+            if !block_popups || is_auth_url(&url) {
+                NewWindowResponse::Allow
+            } else {
+                NewWindowResponse::Deny
+            }
+        })
         .with_custom_protocol("ghost".to_string(), |_id, req| {
             if req.uri().path() == "/logo.png" {
                 return Response::builder()
