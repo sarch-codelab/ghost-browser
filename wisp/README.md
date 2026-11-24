@@ -35,9 +35,15 @@ a production renderer.
 - CSS units: `px`, `em`, `rem`, `pt`, `pc`, `%` and `calc()` expressions that
   mix percentages with absolute units, plus `%`/`em` font sizes, so typography
   can scale from `:root`.
+- CSS math functions: `min()`, `max()` and `clamp()` over longitudes,
+  percentages and nested functions, resolved against the container at layout
+  time for `width`, `height`, `min`/`max-*`, `margin`, `padding`, `gap`,
+  `border-radius` and `flex-basis`.
 - Box constraints: `min-width`/`max-width`/`min-height`/`max-height` and
   horizontal `margin: auto` (the classic centered column) take part in layout,
   including flex and grid items.
+- `aspect-ratio` (`16 / 9`, `1.5`) sizes the missing axis from the defined
+  one, honouring `box-sizing`, and works for block, flex and grid items.
 - `list-style`/`list-style-type` (`disc`, `circle`, `square`, `none`,
   `decimal`, `lower`/`upper-alpha`, `lower`/`upper-roman`),
   `visibility: hidden` (keeps its space without painting) and
@@ -50,7 +56,10 @@ a production renderer.
   hard `<br>` breaks.
 - Ghost fetches HTTP/HTTPS HTML, linked CSS, `<img>` images (including base64
   `data:` URIs) and scripts/modules with per-request, count, and
-  aggregate-size limits; the CLI accepts local HTML files only.
+  aggregate-size limits; the CLI accepts local HTML files only. The whole page
+  shares an 8 s network budget: once it is spent, remaining resources are
+  skipped and Ghost reports how many were not downloaded instead of chaining
+  per-request timeouts.
 - `<img>` elements participate in inline layout like replaced elements:
   CSS `width`/`height` win over the `width`/`height` attributes, which win
   over the intrinsic size read from the image header. Images inside links
@@ -62,25 +71,39 @@ a production renderer.
   timers, microtasks and animation frames; `location`, `history`,
   `localStorage`/`sessionStorage`, `matchMedia`, and small `navigator`/
   `performance`/`console` surfaces.
-- After scripts run, Wisp serializes the mutated document and re-parses it so
-  the CSS cascade applies to elements created by JavaScript. Documents that
-  scripts did not change keep the original parse.
+- Basic Web Components: `customElements.define()`/`get()`/`whenDefined()`/
+  `upgrade()` and the `connectedCallback`, `disconnectedCallback` and
+  `attributeChangedCallback` (with `observedAttributes`) lifecycle hooks, both
+  for elements already in the document and for ones created later. `attachShadow`
+  falls back to the element's own children so the component still lays out.
 - The script stage runs once per page while CSS collection, media-query
   selection and DOM conversion are cached per viewport width, so resizing a
   tab re-evaluates responsive rules without re-running JavaScript.
+- `fetch()` and `XMLHttpRequest` are available to page scripts: the request is
+  performed by Rust (Boa has no I/O) with the engine's usual limits — HTTP(S)
+  only, no embedded credentials, GET/HEAD, 512 KiB per response, 24 requests
+  per page, 6 s of total network time and 5 s per request — and cross-origin
+  reads require `Access-Control-Allow-Origin`, like a browser. When CORS or a
+  limit blocks a request, `fetch()` rejects with the reason (not a silent
+  failure) and Ghost lists it with the page warnings.
+  Responses expose `text()`, `json()`, `status`, `ok`, `url` and
+  `headers.get()`.
 - JavaScript limits: 64 KiB per inline script, 256 KiB of inline script source
   per page, 32 scripts, 100,000 loop iterations, recursion depth 128, 20,000 DOM
   nodes, 100 timer callbacks, 9 interval repeats, 10 animation frames, 8 runtime
-  warnings, and an 8 MiB snapshot limit. Wisp does not define `fetch`, XHR,
-  WebSocket, or unrestricted network/system APIs.
+  warnings, and an 8 MiB snapshot limit. Wisp does not define WebSocket or
+  unrestricted network/system APIs.
 - External classic scripts and ES modules (including relative imports from a
   pre-fetched module graph) run inside Boa's bounded runtime.
 - Flexbox and CSS Grid run through Taffy: `display: flex|grid`,
   `flex-direction`, `flex-wrap`, `justify-content`, `align-items`, `gap`,
-  `flex-grow`/`flex-shrink`/`flex-basis` on items, and basic
-  `grid-template-columns`/`grid-template-rows` (`px`, `%`, `fr`, `auto`,
-  `repeat(N, ...)`). Grid item placement is automatic only; percentages and
-  `minmax()`/`auto-fill` are not supported yet.
+  `flex-grow`/`flex-shrink`/`flex-basis` on items, and
+  `grid-template-columns`/`grid-template-rows` with `px`, `%`, `fr`, `auto`,
+  `minmax()`, `repeat(N, ...)`, `repeat(auto-fill, ...)` and
+  `repeat(auto-fit, ...)`. Every child of a grid container is a grid item
+  (inline children are blockified) and `grid-column`/`grid-row` accept lines
+  and spans (`2`, `1 / 3`, `span 2`, `2 / span 3`); `grid-area` is not
+  supported.
 - Visual CSS: `font-weight` (bold via a registered bold font in Ghost),
   `text-align` (left/center/right per line), `box-sizing`
   (content-box/border-box), and percentage lengths for `width`, `height`,
@@ -89,10 +112,17 @@ a production renderer.
 - Box model complete: `border`/`border-width`/`border-color`/`border-style`/
   `border-radius` (px and %, clamped), `box-sizing`, and `text-align`.
   `ul`/`ol`/`li` render with indentation, bullets and ordered numbers.
-- Still missing: forms, accessibility tree, `srcset`/`<picture>` selection,
-  `@supports`/`@container`/`@import`, `min()`/`max()`/`clamp()`,
-  `overflow` clipping, `minmax()`/`auto-fill` grid tracks, explicit grid
-  placement, and full CSS cascade (`display` values beyond
+- `overflow: hidden|clip|scroll|auto|overlay` clips the content to the padding
+  box. The paint list carries nested `Clip`/`ClipEnd` commands, so Ghost crops
+  cards, avatars and scroll panels exactly like a browser.
+- `<img srcset>` is honoured when there is no `src`: Wisp fetches and paints the
+  candidate with the largest descriptor instead of dropping the image.
+- Conditional CSS: `@media` and `@supports` blocks, including `not`, `and`,
+  `or`, `(propiedad: valor)` and `selector(...)`. `@supports` is evaluated
+  against what the engine actually implements, so fallbacks keep working.
+- Still missing: forms, accessibility tree, `<picture>`/`sizes` selection,
+  `@container`/`@import` inside `@supports`, `grid-area` and named grid lines,
+  `display: contents`, and full CSS cascade (`display` values beyond
   block/inline/flex/grid/none, most pseudo-classes). Many modern sites remain
   incomplete or unusable.
 - Input size and nesting limits for this experimental implementation.

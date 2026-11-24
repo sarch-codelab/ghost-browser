@@ -1,15 +1,21 @@
 use anyhow::{Result, anyhow, ensure};
 use boa_engine::builtins::promise::PromiseState;
 use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
+use boa_engine::native_function::NativeFunction;
 use boa_engine::{
-    Context, JsNativeError, JsObject, JsValue, Module, Source, js_string, property::Attribute,
+    Context, JsNativeError, JsObject, JsResult, JsString, JsValue, Module, Source, js_string,
+    property::Attribute,
 };
 use ego_tree::NodeRef;
+use reqwest::blocking::Client;
+use reqwest::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE};
+use reqwest::redirect::Policy;
 use scraper::node::Node;
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -37,6 +43,32 @@ const MAX_SCRIPT_EXECUTION_TIME: Duration = Duration::from_millis(120);
 const MAX_SCRIPT_EXECUTION_TIME: Duration = Duration::from_secs(3);
 const MAX_SCRIPT_WARNINGS: usize = 8;
 const SCRIPT_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+/// `fetch()`: tamaño máximo de una respuesta, peticiones por página y tiempo
+/// máximo. Son los mismos espíritu que el resto de límites de Wisp: la página
+/// nunca puede bloquear ni llenar la memoria del navegador.
+const MAX_FETCH_BYTES: usize = 512 * 1024;
+const MAX_FETCHES_PER_PAGE: usize = 24;
+const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Presupuesto total de red que la página puede gastar en `fetch()`/XHR. Con
+/// hasta 24 peticiones y 5 s cada una, una página lenta podía bloquear la
+/// carga más de dos minutos; el tope global mantiene la página interactiva.
+const MAX_FETCH_TOTAL_TIME: Duration = Duration::from_secs(6);
+
+/// Estado del `fetch` de la página actual. El motor de scripts corre en su
+/// propio hilo, así que un thread-local es exactamente el ámbito correcto.
+#[derive(Default)]
+struct FetchState {
+    page_url: Option<url::Url>,
+    used: usize,
+    /// Fecha límite compartida por todas las peticiones de la página.
+    deadline: Option<Instant>,
+    /// Motivos de bloqueo (CORS, límites, red) para avisar en la interfaz.
+    warnings: Vec<String>,
+}
+
+thread_local! {
+    static FETCH_STATE: RefCell<FetchState> = RefCell::new(FetchState::default());
+}
 
 const DOM_RUNTIME: &str = include_str!("dom.js");
 
@@ -620,6 +652,24 @@ fn evaluate_scripts(
         .module_loader(loader.clone())
         .build()
         .map_err(|error| anyhow!("could not start Wisp's ES module loader: {error}"))?;
+    FETCH_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.page_url = page_url.and_then(|url| url::Url::parse(url).ok());
+        state.used = 0;
+        state.deadline = Some(Instant::now() + MAX_FETCH_TOTAL_TIME);
+        state.warnings.clear();
+    });
+    if let Err(error) = context.register_global_callable(
+        js_string!("__wispFetchSync"),
+        2,
+        NativeFunction::from_fn_ptr(wisp_fetch_sync),
+    ) {
+        push_warning(
+            &mut warnings,
+            format!("No se pudo exponer fetch() en Wisp: {error}"),
+        );
+    }
+
     let mut runtime_limits = context.runtime_limits();
     runtime_limits.set_loop_iteration_limit(MAX_LOOP_ITERATIONS);
     runtime_limits.set_recursion_limit(MAX_RECURSION_DEPTH);
@@ -802,6 +852,11 @@ fn evaluate_scripts(
         );
     }
 
+    let fetch_warnings = FETCH_STATE.with(|state| std::mem::take(&mut state.borrow_mut().warnings));
+    for warning in fetch_warnings {
+        push_warning(&mut warnings, warning);
+    }
+
     let snapshot = read_snapshot(&mut context, &mut warnings);
     for warning in read_runtime_warnings(&mut context, &mut warnings) {
         push_warning(&mut warnings, warning);
@@ -820,6 +875,190 @@ fn evaluate_scripts(
     };
 
     Ok((html, warnings))
+}
+
+/// Puente nativo de `fetch()`: hace la petición HTTP de forma síncrona (el
+/// motor de scripts ya corre en su propio hilo) y devuelve un JSON con el
+/// cuerpo y los metadatos, o `null` si falla o la bloquea CORS.
+fn wisp_fetch_sync(_this: &JsValue, args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+    let Some(request) = args.first().and_then(|value| value.as_string()) else {
+        return Ok(JsValue::null());
+    };
+    let request = request.to_std_string_escaped();
+    let method = args
+        .get(1)
+        .and_then(|value| value.as_string())
+        .map(|value| value.to_std_string_escaped())
+        .unwrap_or_else(|| "GET".to_owned());
+    Ok(match fetch_json(&request, &method) {
+        Ok(json) => JsValue::from(JsString::from(json)),
+        Err(error) => {
+            record_fetch_warning(&error);
+            // La página recibe un objeto con `error` en vez de un `null` mudo:
+            // `dom.js` lo convierte en un rechazo de `fetch()` con el motivo.
+            JsValue::from(JsString::from(
+                serde_json::json!({ "error": error }).to_string(),
+            ))
+        }
+    })
+}
+
+/// Guarda el primer aviso de cada motivo (CORS, límites, red) para que Ghost
+/// lo muestre en la página y en la barra de estado. Antes estos fallos se
+/// descartaban en silencio.
+fn record_fetch_warning(warning: &str) {
+    FETCH_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.warnings.len() < 4 && !state.warnings.iter().any(|seen| seen == warning) {
+            state.warnings.push(warning.to_owned());
+        }
+    });
+}
+
+/// `fetch` acotado: sólo HTTP(S) sin credenciales, GET/HEAD, 512 KiB por
+/// respuesta, 24 peticiones y 6 s de red por página. Las respuestas de otro
+/// origen requieren `Access-Control-Allow-Origin`, igual que en un navegador.
+/// Cada fallo devuelve el motivo en texto para poder avisar.
+fn fetch_json(request: &str, method: &str) -> Result<String, String> {
+    let (page_url, used, deadline) = FETCH_STATE.with(|state| {
+        let state = state.borrow();
+        (state.page_url.clone(), state.used, state.deadline)
+    });
+    if used >= MAX_FETCHES_PER_PAGE {
+        return Err(format!(
+            "fetch(): límite de {MAX_FETCHES_PER_PAGE} peticiones por página alcanzado."
+        ));
+    }
+    let budget_exhausted = || {
+        format!(
+            "fetch(): presupuesto de red de {} s por página agotado.",
+            MAX_FETCH_TOTAL_TIME.as_secs()
+        )
+    };
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(budget_exhausted());
+    }
+    let method = method.trim().to_ascii_uppercase();
+    if !matches!(method.as_str(), "GET" | "HEAD") {
+        return Err(format!(
+            "fetch(): el método {method} no está disponible en Wisp."
+        ));
+    }
+    let target = match &page_url {
+        Some(base) => base
+            .join(request)
+            .map_err(|_| format!("fetch(): URL no válida: {request}"))?,
+        None => {
+            url::Url::parse(request).map_err(|_| format!("fetch(): URL no válida: {request}"))?
+        }
+    };
+    if !matches!(target.scheme(), "http" | "https")
+        || !target.username().is_empty()
+        || target.password().is_some()
+    {
+        return Err("fetch(): sólo se permiten URL HTTP(S) sin credenciales.".to_owned());
+    }
+    FETCH_STATE.with(|state| state.borrow_mut().used += 1);
+
+    let host = target.host_str().unwrap_or_default().to_owned();
+    let timeout = deadline
+        .map(|deadline| FETCH_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())))
+        .unwrap_or(FETCH_TIMEOUT);
+    if timeout.is_zero() {
+        return Err(budget_exhausted());
+    }
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(3).min(timeout))
+        .timeout(timeout)
+        .redirect(Policy::limited(5))
+        .user_agent("GhostWisp/0.1")
+        .build()
+        .map_err(|error| format!("fetch(): no se pudo preparar la petición: {error}"))?;
+    let request_builder = if method == "HEAD" {
+        client.head(target.clone())
+    } else {
+        client.get(target.clone())
+    };
+    let response = request_builder.send().map_err(|error| {
+        if error.is_timeout() {
+            format!(
+                "fetch(): {host} no respondió en {} s.",
+                timeout.as_secs().max(1)
+            )
+        } else {
+            format!("fetch(): no se pudo conectar con {host}: {error}")
+        }
+    })?;
+    if !same_origin(&page_url, response.url()) && !cors_allows(&response, &page_url) {
+        return Err(format!(
+            "fetch(): CORS bloqueó la respuesta de {host} (sin Access-Control-Allow-Origin)."
+        ));
+    }
+    let status = response.status().as_u16();
+    let final_url = response.url().to_string();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let mut body = Vec::new();
+    response
+        .take((MAX_FETCH_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|error| format!("fetch(): no se pudo leer la respuesta de {host}: {error}"))?;
+    if body.len() > MAX_FETCH_BYTES {
+        return Err(format!(
+            "fetch(): la respuesta de {host} supera el límite de {} KiB.",
+            MAX_FETCH_BYTES / 1024
+        ));
+    }
+    Ok(serde_json::json!({
+        "status": status,
+        "ok": (200..300).contains(&status),
+        "body": String::from_utf8_lossy(&body).into_owned(),
+        "url": final_url,
+        "type": content_type,
+    })
+    .to_string())
+}
+
+fn same_origin(page: &Option<url::Url>, target: &url::Url) -> bool {
+    let Some(page) = page else {
+        return false;
+    };
+    page.scheme() == target.scheme()
+        && page.host_str() == target.host_str()
+        && page.port_or_known_default() == target.port_or_known_default()
+}
+
+fn cors_allows(response: &reqwest::blocking::Response, page: &Option<url::Url>) -> bool {
+    let Some(value) = response
+        .headers()
+        .get(ACCESS_CONTROL_ALLOW_ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let value = value.trim();
+    if value == "*" {
+        return true;
+    }
+    let Some(page) = page else {
+        return false;
+    };
+    let host = page.host_str().unwrap_or_default();
+    let origin = match page.port() {
+        Some(port) => format!("{}://{host}:{port}", page.scheme()),
+        None => format!("{}://{host}", page.scheme()),
+    };
+    value
+        .split(',')
+        .any(|allowed| allowed.trim().eq_ignore_ascii_case(&origin))
 }
 
 fn register_global(
@@ -1159,6 +1398,38 @@ mod tests {
                 .any(|warning| warning.contains("Falló el script inline 1"))
         );
         assert_eq!(snapshot_text(html, "#out"), "after");
+    }
+
+    #[test]
+    fn custom_elements_receive_connected_callback() {
+        let html = r##"<my-card id="one" data-label="uno">inicio</my-card>
+            <script>
+                class MyCard extends HTMLElement {
+                    connectedCallback() {
+                        this.textContent = "tarjeta:" + (this.getAttribute("data-label") || "");
+                    }
+                }
+                customElements.define("my-card", MyCard);
+                const second = document.createElement("my-card");
+                second.id = "two";
+                second.setAttribute("data-label", "dos");
+                document.body.appendChild(second);
+            </script>"##;
+        assert_eq!(snapshot_text(html, "#one"), "tarjeta:uno");
+        assert_eq!(snapshot_text(html, "#two"), "tarjeta:dos");
+    }
+
+    #[test]
+    fn custom_elements_report_invalid_names() {
+        let html = r##"<p id="out">antes</p>
+            <script>
+                try {
+                    customElements.define("singuion", class extends HTMLElement {});
+                } catch (error) {
+                    document.getElementById("out").textContent = "error";
+                }
+            </script>"##;
+        assert_eq!(snapshot_text(html, "#out"), "error");
     }
 
     #[test]

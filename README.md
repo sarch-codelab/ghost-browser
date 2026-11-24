@@ -5,7 +5,8 @@
   <p>
     <a href="https://github.com/sarch-codelab/ghost-browser/releases/latest"><img src="https://img.shields.io/github/v/release/sarch-codelab/ghost-browser" alt="Última release"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-blue" alt="Licencia MIT"></a>
-    <a href="https://github.com/sarch-codelab/ghost-browser/actions/workflows/release.yml"><img src="https://github.com/sarch-codelab/ghost-browser/actions/workflows/release.yml/badge.svg" alt="Build"></a>
+    <a href="https://github.com/sarch-codelab/ghost-browser/actions/workflows/ci.yml"><img src="https://github.com/sarch-codelab/ghost-browser/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://github.com/sarch-codelab/ghost-browser/actions/workflows/release.yml"><img src="https://github.com/sarch-codelab/ghost-browser/actions/workflows/release.yml/badge.svg" alt="Release"></a>
   </p>
 </div>
 
@@ -25,19 +26,32 @@ real lo necesita.
   inactividad y limitar cuántos webviews permanecen activos.
 - **Motor híbrido:** Wisp (Rust) para artículos y documentación, WebView2
   (Chromium) para webapps, con conmutación manual por pestaña o automática
-  por URL.
+  por URL. YouTube y otras webapps de vídeo van siempre a WebView2, sin
+  descargar antes la página con Wisp.
+- **Avisos de red:** la barra de estado indica «Sin conexión a internet» o
+  «Conexión lenta», y deja de recargar esqueletos SPA cuando la red va mal.
+- **Ventanas adaptables:** la ventana principal y las subventanas (ajustes,
+  marcadores, historial, lectura) se ajustan al área de trabajo del monitor
+  actual, incluidos monitores externos más pequeños o con escalado distinto.
 - **Nueva pestaña nativa:** la página de inicio se pinta con la propia
   interfaz sin arrancar Chromium.
 - **Privacidad:** filtrado opcional de dominios conocidos en navegación y
   solicitudes `fetch`/XHR, pausa de medios en segundo plano y opción para borrar
   datos de navegación. No es un bloqueador exhaustivo.
-- **Marcadores e historial:** consultar y administrar ambos desde la interfaz.
+- **Buscar en la página:** `Ctrl+F` con recuento de coincidencias, todas
+  resaltadas, y salto entre ellas (anterior/siguiente) sin ocultar el contenido.
+  También en Wisp, donde el salto desplaza la vista hasta la coincidencia actual.
+- **Marcadores e historial:** consultar y administrar ambos desde la interfaz,
+  con borrado por período (últimas 24 h, últimos 7 días o todo).
 - **Descargas:** elegir la carpeta de destino; Ghost añade sufijos a nombres
   repetidos cuando hay un nombre disponible.
 - **Apariencia:** temas claro y oscuro, además de una página integrada para
   nuevas pestañas.
-- **Herramientas:** página de inicio configurable, búsqueda con DuckDuckGo,
-  zoom y herramientas de desarrollo.
+- **Herramientas:** página de inicio configurable, motor de búsqueda elegible
+  (DuckDuckGo, Google, Bing, Brave Search, Startpage o Ecosia), zoom y
+  herramientas de desarrollo.
+- **Datos:** desde Ajustes se borra la caché del navegador completo o las
+  cookies y todos los datos del sitio de la pestaña activa.
 
 ## Requisitos
 
@@ -64,6 +78,12 @@ Para compilar sin iniciar la aplicación:
 cargo build --release
 ```
 
+Para habilitar el trazado de rendimiento (memoria, tiempos de arranque, restauración):
+
+```powershell
+cargo run --release --features perf
+```
+
 Si no se encuentra `rc.exe`, instala el Windows SDK o define la variable de
 entorno `RC` con la ruta completa al compilador de recursos.
 
@@ -75,6 +95,7 @@ entorno `RC` con la ruta completa al compilador de recursos.
 | `Ctrl+W` | Cerrar la pestaña actual |
 | `Ctrl+Shift+T` | Reabrir la última pestaña cerrada |
 | `Ctrl+L` | Enfocar la barra de direcciones |
+| `Ctrl+F` | Buscar en la página |
 | `Ctrl+R` o `F5` | Recargar la página |
 | `Alt+Izquierda` / `Alt+Derecha` | Atrás / adelante |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Pestaña siguiente / anterior |
@@ -85,6 +106,31 @@ entorno `RC` con la ruta completa al compilador de recursos.
 | `Ctrl+P` | Imprimir |
 | `F12` | Abrir herramientas de desarrollo |
 | `Ctrl+Shift+W` | Cambiar el motor de la pestaña (Wisp ↔ WebView2) |
+
+## Variables de entorno de configuración
+
+Todos los ajustes persistidos en `ghost.json` se pueden sobrescribir al arrancar
+con variables de entorno con prefijo `GHOST_`. Ejemplos:
+
+| Variable | Descripción | Valor por defecto |
+| --- | --- | --- |
+| `GHOST_DARK_MODE` | Tema oscuro | `true` |
+| `GHOST_DEFAULT_ENGINE` | Motor por defecto: `webview2` o `wisp` | `webview2` |
+| `GHOST_HOME_PAGE` | URL de la página de inicio | `ghost://newtab` |
+| `GHOST_BLOCK_ADS` | Bloquear anuncios/rastreadores | `true` |
+| `GHOST_SEARCH_ENGINE` | Buscador: `duckduckgo`, `google`, `bing`, `brave`, `startpage`, `ecosia` | `duckduckgo` |
+| `GHOST_MAX_HISTORY_PER_TAB` | Entradas de historial por pestaña | `50` |
+| `GHOST_MAX_RESTORED_TABS` | Pestañas visibles al iniciar | `200` |
+| `GHOST_RESTORE_TIMEOUT_SECS` | Timeout de restauración (s) | `15` |
+| `GHOST_MAX_WISP_TEXTURES` | Texturas Wisp en caché (LRU) | `256` |
+| `GHOST_MAX_LIVE_TABS` | Webviews vivos simultáneos | `3` |
+| `GHOST_SUSPEND_AFTER_SECS` | Segundos antes de suspender pestaña | `60` |
+| `GHOST_MEMORY_SAVER` | Activar ahorro de memoria | `true` |
+| `GHOST_AUTO_ENGINE` | Elegir motor automáticamente por URL | `false` |
+| `GHOST_DOWNLOAD_DIR` | Carpeta de descargas | (sistema) |
+| `GHOST_TIMING_LOG` | Archivo de log de rendimiento/timing | (desactivado) |
+
+Todas las opciones están definidas en `src/store.rs` (`Settings::from_env()`).
 
 ## Control programático y agentes de IA
 
@@ -166,6 +212,10 @@ conocidos; no es un bloqueador de contenido exhaustivo ni hace anónima la
 navegación. Los sitios que visitas siguen recibiendo solicitudes de tu
 dispositivo.
 
+El motor de búsqueda se elige en **Ajustes → Búsqueda** y se aplica tanto a la
+barra de direcciones como a la página de inicio. Desde **Ajustes → Datos** se
+borra la caché de todo el navegador, y las cookies o los datos por sitio.
+
 Los marcadores, el historial, los ajustes y la información de sesión se guardan
 localmente en el directorio de datos de Ghost. En Windows, normalmente se
 encuentran en `%LOCALAPPDATA%\Ghost\ghost.json`. WebView2 también administra
@@ -181,6 +231,12 @@ cargo fmt --all -- --check
 cargo check --all-targets
 cargo test --bin ghost
 cargo test -p wisp-engine
+```
+
+Para probar con la feature de rendimiento:
+
+```powershell
+cargo test --features perf
 ```
 
 El código principal está en `src/` (`browser.rs`, `webview.rs`, `ui.rs`,
@@ -229,14 +285,16 @@ lo que soporta.
 
 ### Monitoreo de memoria
 
-Para monitorear el uso de memoria en tiempo de ejecución, establece la variable de entorno `GHOST_TIMING_LOG` con la ruta de un archivo de log:
+Para monitorear el uso de memoria en tiempo de ejecución, compila con la feature `perf`
+y establece la variable de entorno `GHOST_TIMING_LOG` con la ruta de un archivo de log:
 
 ```powershell
 $env:GHOST_TIMING_LOG = "C:\temp\ghost_memory.log"
-cargo run --release
+cargo run --release --features perf
 ```
 
-Ghost reportará periódicamente el Working Set y Private Bytes cuando suspenda pestañas o guarde cambios.
+Ghost reportará periódicamente el Working Set y Private Bytes cuando suspenda pestañas o guarde cambios,
+además de hitos de arranque y restauración.
 
 ## Wisp experimental
 
@@ -246,13 +304,21 @@ imágenes y scripts dentro de límites, y aplica una cascada CSS con
 especificidad real que incluye consultas `@media` según el ancho de la pestaña,
 variables `var(--token)`, unidades `em`/`rem`/`%`, `calc()`, `min`/`max-width`,
 márgenes `auto`, `line-height`, `white-space`, listas, bordes por lado y
-flex/grid. Los scripts inline, externos y los
+flex/grid (con `minmax()`, `repeat(auto-fill|auto-fit, …)` y colocación
+explícita por `grid-column`/`grid-row`), además de `min()`/`max()`/`clamp()`,
+`aspect-ratio` y bloques `@supports`. Los scripts inline, externos y los
 módulos ES se ejecutan sobre un DOM mutable con eventos, temporizadores,
-`localStorage`, `location` y `history` básicos; los fallos de JavaScript se
-muestran como advertencias sin impedir el renderizado estático. No implementa
-todas las APIs de JavaScript o CSS (formularios, `fetch`, XHR, `overflow`),
-así que las webs modernas e interactivas pueden verse incompletas:
-cambia esa pestaña a WebView2 para usarlas.
+`fetch`/XHR acotados (con CORS, presupuesto de red por página y avisos
+cuando CORS o un límite bloquean la petición), Web Components básicos
+(`customElements.define` y `connectedCallback`), `localStorage`, `location`
+y `history` básicos; los fallos de JavaScript se muestran como advertencias
+sin impedir el renderizado estático. La descarga de una página también tiene
+un presupuesto global (8 s) para que una web pesada no bloquee la carga
+encadenando esperas. No implementa todas las APIs de JavaScript o CSS
+(formularios, shadow DOM completo, WebSocket, `position: fixed`), así que las
+webs modernas e interactivas pueden verse incompletas: cuando Wisp detecta
+que la página depende de esas APIs, Ghost la entrega automáticamente a
+WebView2 en lugar de mostrar un esqueleto roto.
 
 Opcionalmente, **Ajustes → "Elegir motor automáticamente por URL"** envía
 artículos, documentación y wikis a Wisp y deja el resto en WebView2. El

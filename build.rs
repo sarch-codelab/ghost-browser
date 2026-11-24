@@ -49,12 +49,11 @@ fn find_resource_compiler(arch: &str) -> Option<PathBuf> {
         }
     }
 
-    if let Ok(output) = Command::new("where.exe").arg("rc.exe").output() {
-        if output.status.success() {
-            if let Some(path) = String::from_utf8_lossy(&output.stdout).lines().next() {
-                return Some(PathBuf::from(path.trim()));
-            }
-        }
+    if let Ok(output) = Command::new("where.exe").arg("rc.exe").output()
+        && output.status.success()
+        && let Some(path) = String::from_utf8_lossy(&output.stdout).lines().next()
+    {
+        return Some(PathBuf::from(path.trim()));
     }
 
     let kits = PathBuf::from(env::var_os("ProgramFiles(x86)")?)

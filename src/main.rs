@@ -126,7 +126,7 @@ fn monitor_work_area(window: &Window) -> Option<(i32, i32, i32, i32)> {
     let RawWindowHandle::Win32(win) = handle.as_raw() else {
         return None;
     };
-    let hwnd = win.hwnd.get() as isize;
+    let hwnd = win.hwnd.get();
     #[repr(C)]
     #[derive(Default)]
     struct Rect {
@@ -279,6 +279,8 @@ struct App {
     bounds_verify_at: Instant,
     /// Firma del último content_rect aplicado a las webviews.
     applied_content_sig: Option<String>,
+    /// Último monitor conocido para detectar cambios de monitor.
+    last_monitor: Option<winit::monitor::MonitorHandle>,
 }
 
 impl App {
@@ -324,6 +326,7 @@ impl App {
             remote_rx: remote::start(),
             bounds_verify_at: Instant::now(),
             applied_content_sig: None,
+            last_monitor: None,
         }
     }
 
@@ -545,13 +548,13 @@ impl App {
         // Al cambiar de pestaña el foco del teclado debe seguir a la nueva
         // (si no, se escribe en la pestaña que quedó oculta).
         if !panel_open {
-            if let Some(id) = active_id {
-                if self.focused_tab != Some(id) {
-                    if let Some(wv) = self.browser.active_tab().and_then(|t| t.webview.as_ref()) {
-                        let _ = wv.focus();
-                    }
-                    self.focused_tab = Some(id);
+            if let Some(id) = active_id
+                && self.focused_tab != Some(id)
+            {
+                if let Some(wv) = self.browser.active_tab().and_then(|t| t.webview.as_ref()) {
+                    let _ = wv.focus();
                 }
+                self.focused_tab = Some(id);
             }
         } else {
             self.focused_tab = None;
@@ -616,11 +619,11 @@ fn focus_keyboard(window: &Window) {
         fn SetFocus(hwnd: isize) -> isize;
     }
 
-    if let Ok(handle) = window.window_handle() {
-        if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-            unsafe {
-                SetFocus(win32.hwnd.get() as isize);
-            }
+    if let Ok(handle) = window.window_handle()
+        && let RawWindowHandle::Win32(win32) = handle.as_raw()
+    {
+        unsafe {
+            SetFocus(win32.hwnd.get());
         }
     }
 }
@@ -661,28 +664,28 @@ fn remove_hidden_caption(window: &Window) {
     const SWP_NOZORDER: u32 = 0x0004;
     const SWP_FRAMECHANGED: u32 = 0x0020;
 
-    if let Ok(handle) = window.window_handle() {
-        if let RawWindowHandle::Win32(win32) = handle.as_raw() {
-            let hwnd = win32.hwnd.get() as isize;
-            // Subclase propia: corrige el área cliente al maximizar para que
-            // la ventana cubra el área de trabajo del monitor sin huecos.
-            install_frame_subclass(hwnd);
-            unsafe {
-                let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
-                if style & WS_CAPTION == 0 {
-                    return;
-                }
-                SetWindowLongW(hwnd, GWL_STYLE, (style & !WS_CAPTION) as i32);
-                SetWindowPos(
-                    hwnd,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED,
-                );
+    if let Ok(handle) = window.window_handle()
+        && let RawWindowHandle::Win32(win32) = handle.as_raw()
+    {
+        let hwnd = win32.hwnd.get();
+        // Subclase propia: corrige el área cliente al maximizar para que
+        // la ventana cubra el área de trabajo del monitor sin huecos.
+        install_frame_subclass(hwnd);
+        unsafe {
+            let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+            if style & WS_CAPTION == 0 {
+                return;
             }
+            SetWindowLongW(hwnd, GWL_STYLE, (style & !WS_CAPTION) as i32);
+            SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
         }
     }
 }
@@ -860,7 +863,7 @@ fn style_window_frame(window: &Window, dark: bool) {
     let RawWindowHandle::Win32(win32) = handle.as_raw() else {
         return;
     };
-    let hwnd = win32.hwnd.get() as isize;
+    let hwnd = win32.hwnd.get();
     // DWMWA_USE_IMMERSIVE_DARK_MODE = 20
     let dark_mode: i32 = if dark { 1 } else { 0 };
     // DWMWA_WINDOW_CORNER_PREFERENCE = 33: redondeadas en ventana normal,
@@ -898,7 +901,7 @@ fn set_window_background(window: &Window, dark: bool) {
     let RawWindowHandle::Win32(win32) = handle.as_raw() else {
         return;
     };
-    let hwnd = win32.hwnd.get() as isize;
+    let hwnd = win32.hwnd.get();
     let color = if dark { 0x000E_0E0E } else { 0x00F5_F5F5 };
     unsafe {
         let brush = CreateSolidBrush(color);
@@ -947,8 +950,8 @@ impl ApplicationHandler for App {
             let size = monitor.size();
             let usable_w = (size.width as f64 / scale) * 0.88;
             let usable_h = (size.height as f64 / scale) * 0.88;
-            let min_w = usable_w.min(320.0).max(1.0);
-            let min_h = usable_h.min(240.0).max(1.0);
+            let min_w = usable_w.clamp(1.0, 320.0);
+            let min_h = usable_h.clamp(1.0, 240.0);
             window.set_min_inner_size(Some(LogicalSize::new(min_w, min_h)));
             let current = client_size_physical(&window).unwrap_or_else(|| window.inner_size());
             let cur_w = current.width as f64 / scale;
@@ -972,6 +975,7 @@ impl ApplicationHandler for App {
                 monitor_pos.y + ((monitor_size.height as i32 - win_size.height as i32) / 2).max(0);
             window.set_outer_position(PhysicalPosition::new(x, y));
         }
+        self.last_monitor = window.current_monitor();
 
         remove_hidden_caption(&window);
         style_window_frame(&window, dark);
@@ -1116,13 +1120,13 @@ impl ApplicationHandler for App {
                 // winit puede duplicar el tamaño físico tras un cambio de
                 // DPI entre monitores; el tamaño real siempre es GetClientRect.
                 let size = client_size_physical(&window).unwrap_or(reported);
-                if let Some(p) = &mut self.painter {
-                    if let (Some(w), Some(h)) = (
+                if let Some(p) = &mut self.painter
+                    && let (Some(w), Some(h)) = (
                         std::num::NonZeroU32::new(size.width),
                         std::num::NonZeroU32::new(size.height),
-                    ) {
-                        p.on_window_resized(egui::ViewportId::ROOT, w, h);
-                    }
+                    )
+                {
+                    p.on_window_resized(egui::ViewportId::ROOT, w, h);
                 }
                 // Al maximizar/restaurar winit vuelve a aplicar los estilos
                 // nativos; hay que quitar otra vez el título oculto y
@@ -1312,6 +1316,15 @@ impl App {
             self.browser.needs_bounds_sync = true;
         }
         let mut full_output = ctx.end_pass();
+        // Si el modo oscuro cambió durante el draw (desde el panel de ajustes),
+        // forzar repaint inmediato para que la nueva pestaña y la UI reflejen el tema.
+        if self.browser.dark_mode_changed {
+            self.browser.dark_mode_changed = false;
+            ctx.request_repaint();
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        }
         if let Some(output) = full_output.viewport_output.remove(&egui::ViewportId::ROOT) {
             apply_viewport_commands(event_loop, &window, output);
         }

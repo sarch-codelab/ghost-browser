@@ -46,12 +46,12 @@ pub enum TabEvent {
     WispPageLoaded {
         tab: u64,
         request_id: u64,
-        result: Result<wisp_engine::FetchedPage, String>,
+        result: Box<Result<wisp_engine::FetchedPage, String>>,
     },
     WispLayoutReady {
         tab: u64,
         request_id: u64,
-        result: Result<wisp_engine::LayoutDocument, String>,
+        result: Box<Result<wisp_engine::LayoutDocument, String>>,
     },
 }
 
@@ -332,6 +332,35 @@ pub fn set_dark_theme(webview: &WebView, dark: bool) {
     }
 }
 
+/// Desactiva la prevención de seguimiento (tracking prevention) para permitir
+/// cookies y almacenamiento de terceros (necesario para Google Identity Services / GIS).
+pub fn disable_tracking_prevention(webview: &WebView) {
+    #[cfg(windows)]
+    {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_TRACKING_PREVENTION_LEVEL, ICoreWebView2Controller, ICoreWebView2Profile3,
+        };
+        use windows::core::Interface;
+        use wry::WebViewExtWindows;
+
+        let controller: ICoreWebView2Controller = webview.controller();
+        let core = unsafe { controller.CoreWebView2() };
+        if let Ok(core) = core {
+            // ICoreWebView2Profile3 extends ICoreWebView2Profile and adds tracking prevention
+            if let Ok(profile) = core.cast::<ICoreWebView2Profile3>() {
+                let level = COREWEBVIEW2_TRACKING_PREVENTION_LEVEL(0); // None = 0
+                unsafe {
+                    let _ = profile.SetPreferredTrackingPreventionLevel(level);
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = webview;
+    }
+}
+
 const AD_DOMAINS: &[&str] = &[
     "doubleclick.net",
     "google-analytics.com",
@@ -491,6 +520,7 @@ pub fn create_webview<W: HasWindowHandle>(
 
     set_low_memory(&webview, !visible);
     set_dark_theme(&webview, dark);
+    disable_tracking_prevention(&webview);
     Ok(webview)
 }
 
@@ -602,6 +632,32 @@ const NEWTAB_HTML: &str = r##"<!DOCTYPE html>
 </body>
 </html>"##;
 
+/// Ámbito del contenido web dentro de la ventana, dejando libre la barra
+/// superior (`top_points`) y la barra de estado (`bottom_points`), en píxeles físicos exactos.
+pub fn content_bounds(
+    window_size: winit::dpi::PhysicalSize<u32>,
+    scale_factor: f64,
+    top_points: f64,
+    bottom_points: f64,
+    is_maximized: bool,
+) -> Rect {
+    let gutter = if is_maximized { 0.0 } else { RESIZE_GUTTER };
+    let gutter_px = (gutter * scale_factor).round() as i32;
+    let top_px = (top_points * scale_factor).round() as i32;
+    let bottom_px = (bottom_points * scale_factor).round() as i32;
+
+    let w = (window_size.width as i32 - 2 * gutter_px).max(1);
+    // Una webview de altura 0 no se pinta ni responde: con ventanas muy bajas
+    // el contenido quedaría invisible. 1 píxel sigue siendo válido.
+    let h = (window_size.height as i32 - top_px - bottom_px).max(1);
+
+    // Solo aplicar gutter horizontalmente, no verticalmente
+    Rect {
+        position: wry::dpi::PhysicalPosition::new(gutter_px, top_px).into(),
+        size: wry::dpi::PhysicalSize::new(w as u32, h as u32).into(),
+    }
+}
+
 #[cfg(test)]
 mod newtab_tests {
     use super::NEWTAB_HTML;
@@ -708,29 +764,5 @@ mod newtab_tests {
         let off = init_script(false, false);
         assert!(off.contains("window.__ghost_block_ads = false"));
         assert!(off.contains("window.__ghost_freeze_media = false"));
-    }
-}
-
-/// Ámbito del contenido web dentro de la ventana, dejando libre la barra
-/// superior (`top_points`) y la barra de estado (`bottom_points`), en píxeles físicos exactos.
-pub fn content_bounds(
-    window_size: winit::dpi::PhysicalSize<u32>,
-    scale_factor: f64,
-    top_points: f64,
-    bottom_points: f64,
-    is_maximized: bool,
-) -> Rect {
-    let gutter = if is_maximized { 0.0 } else { RESIZE_GUTTER };
-    let gutter_px = (gutter * scale_factor).round() as i32;
-    let top_px = (top_points * scale_factor).round() as i32;
-    let bottom_px = (bottom_points * scale_factor).round() as i32;
-
-    let w = (window_size.width as i32 - 2 * gutter_px).max(1);
-    let h = (window_size.height as i32 - top_px - bottom_px).max(0);
-
-    // Solo aplicar gutter horizontalmente, no verticalmente
-    Rect {
-        position: wry::dpi::PhysicalPosition::new(gutter_px, top_px).into(),
-        size: wry::dpi::PhysicalSize::new(w as u32, h as u32).into(),
     }
 }

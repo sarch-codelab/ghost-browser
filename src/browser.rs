@@ -332,6 +332,8 @@ pub struct Browser {
     /// Motor forzado desde la línea de comandos (`--wisp`/`--webview2`), si lo hay.
     pub cli_engine: Option<BrowserEngine>,
     dirty: bool,
+    /// Indica que el modo oscuro cambió y hay que actualizar el tema de la ventana.
+    pub dark_mode_changed: bool,
     /// `eval` remotos pendientes de que la página devuelva el resultado por IPC.
     pending_remote_evals: HashMap<u64, Sender<serde_json::Value>>,
     next_remote_eval_id: u64,
@@ -494,6 +496,7 @@ impl Browser {
             suspended_this_session: 0,
             cli_engine: None,
             dirty: false,
+            dark_mode_changed: false,
             closed_tabs,
             pending_remote_evals: HashMap::new(),
             next_remote_eval_id: 0,
@@ -698,7 +701,7 @@ impl Browser {
                 std::collections::HashMap::new(),
                 Vec::new(),
             );
-            self.deliver_wisp_result(tab_id, request_id, Ok(page));
+            self.deliver_wisp_result(tab_id, request_id, Box::new(Ok(page)));
             return;
         }
 
@@ -713,7 +716,7 @@ impl Browser {
                 let event = TabEvent::WispPageLoaded {
                     tab: tab_id,
                     request_id,
-                    result,
+                    result: Box::new(result),
                 };
                 if event_tx.send(event).is_ok()
                     && let Some(proxy) = event_proxy
@@ -726,7 +729,7 @@ impl Browser {
             self.deliver_wisp_result(
                 tab_id,
                 request_id,
-                Err(format!("No se pudo iniciar la carga: {error}")),
+                Box::new(Err(format!("No se pudo iniciar la carga: {error}"))),
             );
         }
     }
@@ -735,7 +738,7 @@ impl Browser {
         &mut self,
         tab_id: u64,
         request_id: u64,
-        result: Result<wisp_engine::FetchedPage, String>,
+        result: Box<Result<wisp_engine::FetchedPage, String>>,
     ) {
         self.handle_event(TabEvent::WispPageLoaded {
             tab: tab_id,
@@ -958,10 +961,11 @@ impl Browser {
                     t.title = title.clone();
                 }
                 let tab_url = self.tab_by_id(tab).map(|t| t.url.clone());
-                if let (Some(url), Some(last)) = (tab_url, self.store.history.last_mut()) {
-                    if last.url == url && !title.is_empty() {
-                        last.title = title.clone();
-                    }
+                if let (Some(url), Some(last)) = (tab_url, self.store.history.last_mut())
+                    && last.url == url
+                    && !title.is_empty()
+                {
+                    last.title = title.clone();
                 }
                 self.dirty = true;
                 self.save_session_immediate();
@@ -1031,7 +1035,7 @@ impl Browser {
                 let event = TabEvent::WispLayoutReady {
                     tab: tab_id,
                     request_id,
-                    result,
+                    result: Box::new(result),
                 };
                 if event_tx.send(event).is_ok()
                     && let Some(proxy) = event_proxy
@@ -1049,11 +1053,12 @@ impl Browser {
         self.pending_wisp_layouts.contains_key(&tab_id)
     }
 
+    #[allow(clippy::boxed_local)]
     fn handle_wisp_layout_ready(
         &mut self,
         tab_id: u64,
         request_id: u64,
-        result: Result<wisp_engine::LayoutDocument, String>,
+        result: Box<Result<wisp_engine::LayoutDocument, String>>,
     ) {
         let Some(pending) = self.pending_wisp_layouts.remove(&tab_id) else {
             return;
@@ -1068,7 +1073,7 @@ impl Browser {
             return;
         }
         let failed = result.is_err();
-        match result {
+        match *result {
             Ok(layout) => {
                 tab.wisp_layout = Some(layout);
                 tab.wisp_layout_width = Some(pending.width);
@@ -1093,7 +1098,7 @@ impl Browser {
         &mut self,
         tab_id: u64,
         request_id: u64,
-        result: Result<wisp_engine::FetchedPage, String>,
+        result: Box<Result<wisp_engine::FetchedPage, String>>,
     ) {
         if self.pending_wisp_requests.get(&tab_id) != Some(&request_id) {
             return;
@@ -1104,7 +1109,7 @@ impl Browser {
             self.needs_bounds_sync = true;
         }
 
-        match result {
+        match *result {
             Ok(page) => {
                 let url = normalize_tab_url(&page.final_url);
                 let title = if page.title.trim().is_empty() {
@@ -1182,8 +1187,8 @@ impl Browser {
         let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match kind {
             "shortcut" => {
-                if let Some(action) = v.get("action").and_then(|a| a.as_str()) {
-                    if webview::is_newtab_url(source_url)
+                if let Some(action) = v.get("action").and_then(|a| a.as_str())
+                    && (webview::is_newtab_url(source_url)
                         || matches!(
                             action,
                             "back"
@@ -1193,17 +1198,16 @@ impl Browser {
                                 | "zoom_out"
                                 | "zoom_reset"
                                 | "print"
-                        )
-                    {
-                        self.apply_shortcut(tab_id, action);
-                    }
+                        ))
+                {
+                    self.apply_shortcut(tab_id, action);
                 }
             }
             "open_url" | "navigate" => {
-                if let Some(url) = v.get("url").and_then(|u| u.as_str()) {
-                    if webview::is_newtab_url(source_url) || is_web_url(url) {
-                        self.navigate_tab_by_id(tab_id, url);
-                    }
+                if let Some(url) = v.get("url").and_then(|u| u.as_str())
+                    && (webview::is_newtab_url(source_url) || is_web_url(url))
+                {
+                    self.navigate_tab_by_id(tab_id, url);
                 }
             }
             "nav" => {
@@ -1235,14 +1239,14 @@ impl Browser {
                 let html = v.get("html").and_then(|n| n.as_u64()).unwrap_or(0);
                 // Esqueleto SPA atascado: DOM grande pero casi nada visible.
                 // Las páginas de error/simple tienen HTML pequeño y no aplican.
-                if len < 200 && html > 50_000 {
-                    if let Some(webview) =
+                if len < 200
+                    && html > 50_000
+                    && let Some(webview) =
                         self.tab_by_id(tab_id).and_then(|tab| tab.webview.as_ref())
-                    {
-                        log::info!("SPA atascada en pestaña {tab_id} ({len} chars): recargando");
-                        let _ = webview.reload();
-                        self.set_status("La página no terminó de cargar; recargando…".into());
-                    }
+                {
+                    log::info!("SPA atascada en pestaña {tab_id} ({len} chars): recargando");
+                    let _ = webview.reload();
+                    self.set_status("La página no terminó de cargar; recargando…".into());
                 }
             }
             "remote_eval" => {
@@ -1454,10 +1458,10 @@ impl Browser {
     }
 
     fn navigate_wisp_tab(&mut self, tab_id: u64, url: String) {
-        if let Some(tab) = self.tab_by_id_mut(tab_id) {
-            if !webview::is_newtab_url(&url) {
-                tab.ephemeral = false;
-            }
+        if let Some(tab) = self.tab_by_id_mut(tab_id)
+            && !webview::is_newtab_url(&url)
+        {
+            tab.ephemeral = false;
         }
         self.start_wisp_load(tab_id, url);
         self.dirty = true;
@@ -1742,10 +1746,7 @@ impl Browser {
                         }
                         json!({"ok": true})
                     }
-                    "text" => match self.remote_tab_text(tab_id, reply.clone()) {
-                        Some(value) => value,
-                        None => return None,
-                    },
+                    "text" => self.remote_tab_text(tab_id, reply.clone())?,
                     _ => unreachable!(),
                 }
             }
@@ -2388,14 +2389,14 @@ impl Browser {
                 if !live {
                     return;
                 }
-                if let Some(t) = self.tabs.get_mut(index) {
-                    if let Some(webview) = &t.webview {
-                        let _ = match action {
-                            "back" => webview.go_back(),
-                            "forward" => webview.go_forward(),
-                            _ => webview.reload(),
-                        };
-                    }
+                if let Some(t) = self.tabs.get_mut(index)
+                    && let Some(webview) = &t.webview
+                {
+                    let _ = match action {
+                        "back" => webview.go_back(),
+                        "forward" => webview.go_forward(),
+                        _ => webview.reload(),
+                    };
                 }
             }
             "zoom_in" | "zoom_out" | "zoom_reset" => {
@@ -2417,23 +2418,23 @@ impl Browser {
                 if !live {
                     return;
                 }
-                if let Some(t) = self.tabs.get_mut(index) {
-                    if let Some(webview) = &t.webview {
-                        let _ = webview.print();
-                    }
+                if let Some(t) = self.tabs.get_mut(index)
+                    && let Some(webview) = &t.webview
+                {
+                    let _ = webview.print();
                 }
             }
             "devtools" => {
                 if !live {
                     return;
                 }
-                if let Some(t) = self.tabs.get_mut(index) {
-                    if let Some(webview) = &t.webview {
-                        if webview.is_devtools_open() {
-                            webview.close_devtools();
-                        } else {
-                            webview.open_devtools();
-                        }
+                if let Some(t) = self.tabs.get_mut(index)
+                    && let Some(webview) = &t.webview
+                {
+                    if webview.is_devtools_open() {
+                        webview.close_devtools();
+                    } else {
+                        webview.open_devtools();
                     }
                 }
             }
@@ -2526,6 +2527,7 @@ impl Browser {
         let old = self.store.settings.clone();
         let block_ads = settings.block_ads;
         let freeze_media = settings.freeze_background_media;
+        let dark_changed = old.dark_mode != settings.dark_mode;
         let privacy_changed =
             old.block_ads != block_ads || old.freeze_background_media != freeze_media;
         self.store.update_settings(settings);
@@ -2536,6 +2538,9 @@ impl Browser {
                     webview::set_privacy_flags(webview, block_ads, freeze_media);
                 }
             }
+        }
+        if dark_changed {
+            self.dark_mode_changed = true;
         }
         let path = default_download_dir(&self.store);
         if let Ok(mut guard) = self.download_dir.write() {
@@ -2669,7 +2674,7 @@ mod tests {
         browser.start_wisp_load(tab_id, "https://example.com/".into());
         let request_id = browser.pending_wisp_requests[&tab_id];
 
-        browser.handle_wisp_page_loaded(tab_id, request_id, Err("boom".into()));
+        browser.handle_wisp_page_loaded(tab_id, request_id, Box::new(Err("boom".into())));
 
         let t = browser.tab_by_id(tab_id).unwrap();
         assert_eq!(t.engine, BrowserEngine::WebView2);
@@ -2690,7 +2695,7 @@ mod tests {
         browser.start_wisp_load(tab_id, "https://example.com/".into());
         let request_id = browser.pending_wisp_requests[&tab_id];
 
-        browser.handle_wisp_page_loaded(tab_id, request_id, Err("boom".into()));
+        browser.handle_wisp_page_loaded(tab_id, request_id, Box::new(Err("boom".into())));
 
         let t = browser.tab_by_id(tab_id).unwrap();
         assert_eq!(t.engine, BrowserEngine::Wisp);
@@ -3130,7 +3135,7 @@ mod tests {
         });
         let response = reply_rx.recv().unwrap();
         assert_eq!(response["ok"], true);
-        assert!(response["tabs"].as_array().unwrap().len() >= 1);
+        assert!(!response["tabs"].as_array().unwrap().is_empty());
 
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         browser.handle_remote_command(crate::remote::RemoteCommand::Sync {

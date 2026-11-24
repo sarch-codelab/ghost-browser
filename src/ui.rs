@@ -479,6 +479,9 @@ fn draw_wisp_page(ui: &mut Ui, app: &mut Browser, p: &Palette) {
                             }
                         }
                     }
+                    wisp_engine::PaintCommand::Clip { .. } | wisp_engine::PaintCommand::ClipEnd => {
+                        // Clipping no afecta el viewport culling ni el painting directo aquí
+                    }
                 }
             }
         });
@@ -501,6 +504,7 @@ fn command_vspan(command: &wisp_engine::PaintCommand) -> (f32, f32) {
         | wisp_engine::PaintCommand::StrokeRect { rect, .. }
         | wisp_engine::PaintCommand::Image { rect, .. }
         | wisp_engine::PaintCommand::BackgroundImage { rect, .. } => (rect.y, rect.y + rect.height),
+        wisp_engine::PaintCommand::Clip { .. } | wisp_engine::PaintCommand::ClipEnd => (0.0, 0.0),
     }
 }
 
@@ -868,10 +872,10 @@ fn wisp_image_texture(
     let texture = ctx.load_texture(url, color_image, egui::TextureOptions::LINEAR);
 
     // LRU suave: eliminar solo la más antigua si excede el límite
-    if app.wisp_textures.len() >= crate::browser::MAX_WISP_TEXTURES {
-        if let Some(old_url) = app.wisp_texture_order.pop_front() {
-            app.wisp_textures.remove(&old_url);
-        }
+    if app.wisp_textures.len() >= crate::browser::MAX_WISP_TEXTURES
+        && let Some(old_url) = app.wisp_texture_order.pop_front()
+    {
+        app.wisp_textures.remove(&old_url);
     }
     app.wisp_texture_order.push_back(url.to_owned());
     app.wisp_textures.insert(url.to_owned(), texture.clone());
@@ -973,7 +977,8 @@ fn background_texture(ctx: &egui::Context, app: &mut Browser) -> Option<egui::Te
     let size = [decoded.width() as usize, decoded.height() as usize];
     let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &decoded.into_raw());
     let texture = ctx.load_texture(BG_URL, color_image, egui::TextureOptions::LINEAR);
-    app.wisp_textures.insert(BG_URL.to_string(), texture.clone());
+    app.wisp_textures
+        .insert(BG_URL.to_string(), texture.clone());
     Some(texture)
 }
 
@@ -1001,12 +1006,13 @@ fn galley(
     max_width: f32,
     size: f32,
 ) -> std::sync::Arc<egui::Galley> {
-    let mut job = egui::text::LayoutJob::default();
-    job.wrap = egui::text::TextWrapping {
-        max_width,
-        max_rows: 1,
-        break_anywhere: true,
-        overflow_character: Some('…'),
+    let mut job = egui::text::LayoutJob {
+        wrap: egui::text::TextWrapping {
+            max_width,
+            max_rows: 1,
+            break_anywhere: true,
+            overflow_character: Some('…'),
+        },
         ..Default::default()
     };
     job.append(
@@ -1206,10 +1212,10 @@ fn draw_tab_strip(ui: &mut Ui, app: &mut Browser, p: &Palette) {
                     ui.spacing_mut().item_spacing.x = spacing;
                     ui.horizontal(|ui| {
                         for i in 0..count {
-                            if let Some(action) = draw_tab(ui, width, app, p, i, active_changed) {
-                                if tab_action.is_none() {
-                                    tab_action = Some(action);
-                                }
+                            if let Some(action) = draw_tab(ui, width, app, p, i, active_changed)
+                                && tab_action.is_none()
+                            {
+                                tab_action = Some(action);
                             }
                         }
                     });
@@ -1218,10 +1224,10 @@ fn draw_tab_strip(ui: &mut Ui, app: &mut Browser, p: &Palette) {
     } else {
         ui.spacing_mut().item_spacing.x = spacing;
         for i in 0..count {
-            if let Some(action) = draw_tab(ui, width, app, p, i, false) {
-                if tab_action.is_none() {
-                    tab_action = Some(action);
-                }
+            if let Some(action) = draw_tab(ui, width, app, p, i, false)
+                && tab_action.is_none()
+            {
+                tab_action = Some(action);
             }
         }
     }
@@ -1279,9 +1285,7 @@ fn draw_tab(
     index: usize,
     reveal: bool,
 ) -> Option<TabAction> {
-    let Some(t) = app.tabs.get(index) else {
-        return None;
-    };
+    let t = app.tabs.get(index)?;
     let is_active = index == app.active;
     // La nueva pestaña nativa no está "suspendida": se ve como cualquier
     // pestaña activa aunque no tenga proceso.
@@ -1529,29 +1533,23 @@ fn draw_toolbar_actions(ui: &mut Ui, app: &mut Browser, p: &Palette, show_all: b
     }
 
     // Modo lectura: texto limpio del DOM de Wisp, listo para IA/lectura.
-    if app.active_can_read() {
-        if glyph_button(ui, p, "Modo lectura", |pt, r, c| reader_glyph(pt, r, c)) {
-            app.panel = if app.panel == Panel::Reader {
-                Panel::None
-            } else {
-                Panel::Reader
-            };
-        }
+    if app.active_can_read() && glyph_button(ui, p, "Modo lectura", reader_glyph) {
+        app.panel = if app.panel == Panel::Reader {
+            Panel::None
+        } else {
+            Panel::Reader
+        };
     }
 
     if show_all {
-        if glyph_button(ui, p, "Marcadores (Ctrl+B)", |pt, r, c| {
-            bookmark_glyph(pt, r, c)
-        }) {
+        if glyph_button(ui, p, "Marcadores (Ctrl+B)", bookmark_glyph) {
             app.panel = if app.panel == Panel::Bookmarks {
                 Panel::None
             } else {
                 Panel::Bookmarks
             };
         }
-        if glyph_button(ui, p, "Historial (Ctrl+H)", |pt, r, c| {
-            history_glyph(pt, r, c)
-        }) {
+        if glyph_button(ui, p, "Historial (Ctrl+H)", history_glyph) {
             app.panel = if app.panel == Panel::History {
                 Panel::None
             } else {
@@ -1560,7 +1558,7 @@ fn draw_toolbar_actions(ui: &mut Ui, app: &mut Browser, p: &Palette, show_all: b
         }
     }
 
-    if glyph_button(ui, p, "Ajustes", |pt, r, c| sliders_glyph(pt, r, c)) {
+    if glyph_button(ui, p, "Ajustes", sliders_glyph) {
         app.panel = if app.panel == Panel::Settings {
             Panel::None
         } else {
@@ -1916,16 +1914,19 @@ fn draw_panels(ctx: &egui::Context, app: &mut Browser, p: &Palette) {
             let version = wry::webview_version().unwrap_or_else(|_| "?".into());
 
             panel_window("panel_settings", "Ajustes", vec2(460.0, 640.0), p).show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
-                    paint_logo(ui, r, app);
-                    ui.label(RichText::new("Ghost").size(18.0).strong().color(p.text));
-                });
-                ui.label(
-                    RichText::new("Ligero por dentro, hermoso por fuera.")
-                        .size(11.5)
-                        .color(p.muted),
-                );
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
+                            paint_logo(ui, r, app);
+                            ui.label(RichText::new("Ghost").size(18.0).strong().color(p.text));
+                        });
+                        ui.label(
+                            RichText::new("Ligero por dentro, hermoso por fuera.")
+                                .size(11.5)
+                                .color(p.muted),
+                        );
 
                 section(ui, p, "Memoria");
                 if ui
@@ -2109,6 +2110,7 @@ fn draw_panels(ctx: &egui::Context, app: &mut Browser, p: &Palette) {
                 });
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Tipo de fuente").size(12.0).color(p.text));
+                    let previous_family = s.reader_font_family.clone();
                     egui::ComboBox::from_id_salt("reader_font_family")
                         .selected_text(&s.reader_font_family)
                         .show_ui(ui, |ui| {
@@ -2116,7 +2118,9 @@ fn draw_panels(ctx: &egui::Context, app: &mut Browser, p: &Palette) {
                             ui.selectable_value(&mut s.reader_font_family, "serif".to_string(), "Serif");
                             ui.selectable_value(&mut s.reader_font_family, "mono".to_string(), "Monospace");
                         });
-                    changed = true;
+                    if s.reader_font_family != previous_family {
+                        changed = true;
+                    }
                 });
 
                 section(ui, p, "Perfil");
@@ -2191,11 +2195,6 @@ fn draw_panels(ctx: &egui::Context, app: &mut Browser, p: &Palette) {
                     changed = true;
                 }
 
-                section(ui, p, "Privacidad");
-                if ui.button("Borrar cookies y datos de navegación").clicked() {
-                    clear_data = true;
-                }
-
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     ui.label(
@@ -2212,7 +2211,8 @@ fn draw_panels(ctx: &egui::Context, app: &mut Browser, p: &Palette) {
                         }
                     });
                 });
-            });
+        });
+    });
 
             if changed {
                 app.set_settings(s);
@@ -2313,14 +2313,11 @@ fn draw_newtab_page(ui: &mut Ui, app: &mut Browser, p: &Palette) {
             );
         }
         // Overlay oscuro semitransparente
-        painter.rect_filled(
-            area,
-            0.0,
-            Color32::from_rgba_premultiplied(0, 0, 0, 158),
-        );
+        painter.rect_filled(area, 0.0, Color32::from_rgba_premultiplied(0, 0, 0, 158));
     }
 
-    ui.centered_and_justified(|ui| {
+    // Layout centrado vertical y horizontalmente
+    ui.vertical_centered_justified(|ui| {
         ui.add_space(6.0);
         let (logo_rect, _) = ui.allocate_exact_size(vec2(64.0, 64.0), Sense::hover());
         paint_logo(ui, logo_rect, app);

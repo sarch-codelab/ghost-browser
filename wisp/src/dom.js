@@ -41,6 +41,9 @@
     let timerSequence = 0;
     const timers = new Map();
     const animationFrames = new Map();
+    // Web Components básicos: definición por nombre y ciclo de vida conectado.
+    const customDefinitions = new Map();
+    const customDefinitionWaiters = new Map();
 
     function reportError(error) {
         if (runtimeWarnings.length >= MAX_RUNTIME_WARNINGS) return;
@@ -146,6 +149,82 @@
             if (matches(element, selector)) result.push(element);
         });
         return result;
+    }
+
+    // ---------------------------------------------------- custom elements
+    // Wisp no puede reemplazar el objeto que ya ocupa la posición del nodo, así
+    // que «sube de nivel» el elemento existente: adopta el prototipo de la
+    // clase definida y dispara el ciclo de vida. Al estar la sombra degradada
+    // a los hijos del propio elemento, el contenido de los componentes se
+    // serializa y se pinta con el pipeline normal de Wisp.
+    function attributeChanged(element, name, oldValue, newValue) {
+        if (!element._definition) return;
+        if (!element._definition.observed.includes(String(name).toLowerCase())) return;
+        const callback = element.attributeChangedCallback;
+        if (typeof callback !== "function") return;
+        try {
+            callback.call(element, String(name).toLowerCase(), oldValue, newValue);
+        } catch (error) {
+            reportError(error);
+        }
+    }
+
+    function elementConnected(element) {
+        if (!element._definition || element._connected) return;
+        element._connected = true;
+        const callback = element.connectedCallback;
+        if (typeof callback !== "function") return;
+        try {
+            callback.call(element);
+        } catch (error) {
+            reportError(error);
+        }
+    }
+
+    function elementDisconnected(element) {
+        if (!element._definition || !element._connected) return;
+        element._connected = false;
+        const callback = element.disconnectedCallback;
+        if (typeof callback !== "function") return;
+        try {
+            callback.call(element);
+        } catch (error) {
+            reportError(error);
+        }
+    }
+
+    function upgradeCustomElement(element) {
+        if (!element || element._type !== 1 || element._definition) return;
+        const definition = customDefinitions.get(element._tag);
+        if (!definition) return;
+        element._definition = definition;
+        try {
+            Object.setPrototypeOf(element, definition.constructor.prototype);
+        } catch (error) {
+            reportError(error);
+        }
+        // `attributeChangedCallback` para los atributos que ya tenía el HTML.
+        for (const name of definition.observed) {
+            if (element.hasAttribute(name)) {
+                attributeChanged(element, name, null, element.getAttribute(name));
+            }
+        }
+        if (element.isConnected) elementConnected(element);
+    }
+
+    function connectTree(node) {
+        if (!node) return;
+        if (node._type === 1) {
+            upgradeCustomElement(node);
+            elementConnected(node);
+        }
+        for (const child of node._children) connectTree(child);
+    }
+
+    function disconnectTree(node) {
+        if (!node) return;
+        if (node._type === 1) elementDisconnected(node);
+        for (const child of node._children) disconnectTree(child);
     }
 
     class WispEvent {
@@ -345,15 +424,20 @@
             this._children.splice(index < 0 ? this._children.length : index, 0, child);
             child._parent = this;
             bump();
+            // Insertar en el documento conecta los componentes personalizados
+            // de todo el subárbol (incluidos los creados antes de definirse).
+            if (this.isConnected) connectTree(child);
             return child;
         }
 
         removeChild(child) {
             const index = this._children.indexOf(child);
             if (index < 0) throw new Error("el nodo no es hijo");
+            const wasConnected = child.isConnected;
             this._children.splice(index, 1);
             child._parent = null;
             bump();
+            if (wasConnected) disconnectTree(child);
             return child;
         }
 
@@ -506,6 +590,7 @@
         setAttribute(name, value) {
             const key = String(name).toLowerCase();
             const text = String(value);
+            const previous = this.getAttribute(key);
             if (key === "style") {
                 this._style = parseStyle(text);
                 this._hasStyle = true;
@@ -513,10 +598,12 @@
                 this._attributes.set(key, text);
             }
             bump();
+            attributeChanged(this, key, previous, text);
         }
 
         removeAttribute(name) {
             const key = String(name).toLowerCase();
+            const previous = this.getAttribute(key);
             if (key === "style") {
                 this._style.clear();
                 this._hasStyle = false;
@@ -524,6 +611,7 @@
                 this._attributes.delete(key);
             }
             bump();
+            attributeChanged(this, key, previous, null);
         }
 
         hasAttribute(name) {
@@ -718,6 +806,7 @@
             for (const child of fragment._children) {
                 child._parent = this;
                 this._children.push(child);
+                if (this.isConnected) connectTree(child);
             }
             fragment._children.length = 0;
             bump();
@@ -912,6 +1001,16 @@
         get sheet() { return null; }
         get content() { return null; }
 
+        // Shadow DOM mínimo: los hijos del propio elemento hacen de sombra, de
+        // modo que `connectedCallback()` puede pintar el componente sin que
+        // Wisp necesite un árbol separado que no sabría serializar.
+        attachShadow() {
+            if (!this._shadowRoot) this._shadowRoot = this;
+            return this._shadowRoot;
+        }
+        get shadowRoot() { return this._shadowRoot || null; }
+        getRootNode() { return this; }
+
         getContext() { return null; }
         canPlayType() { return ""; }
         play() { return Promise.resolve(); }
@@ -1046,8 +1145,12 @@
         get charset() { return "UTF-8"; }
         get contentType() { return "text/html"; }
 
-        createElement(tag) { return new WispElement(tag); }
-        createElementNS(_namespace, tag) { return new WispElement(tag); }
+        createElement(tag) {
+            const element = new WispElement(tag);
+            upgradeCustomElement(element);
+            return element;
+        }
+        createElementNS(_namespace, tag) { return this.createElement(tag); }
         createTextNode(text) { return new WispText(text); }
         createComment(text) { return new WispComment(text); }
         createDocumentFragment() { return new WispDocumentFragment(); }
@@ -2001,10 +2104,61 @@
         takeRecords() { return []; }
     };
     globalThis.customElements = {
-        define() {},
-        get() { return undefined; },
-        whenDefined() { return Promise.resolve(); },
-        upgrade() {}
+        define(name, constructor) {
+            const tag = String(name).toLowerCase();
+            if (!/^[a-z][a-z0-9._]*-[a-z0-9._-]*$/.test(tag)) {
+                throw new TypeError(
+                    "customElements.define: el nombre debe llevar guion y minúsculas"
+                );
+            }
+            if (typeof constructor !== "function") {
+                throw new TypeError("customElements.define: se esperaba una clase");
+            }
+            if (customDefinitions.has(tag)) {
+                throw new Error("customElements.define: <" + tag + "> ya está definido");
+            }
+            const observed = Array.isArray(constructor.observedAttributes)
+                ? constructor.observedAttributes.map(attribute => String(attribute).toLowerCase())
+                : [];
+            const definition = { constructor, observed };
+            customDefinitions.set(tag, definition);
+            // Mejora los elementos que ya estaban en el documento (HTML
+            // analizado antes de que corriera el script que los define).
+            const pending = [];
+            walkElements(documentObject, element => {
+                if (!element._definition && element._tag === tag) pending.push(element);
+            });
+            for (const element of pending) upgradeCustomElement(element);
+            const waiters = customDefinitionWaiters.get(tag);
+            if (waiters) {
+                customDefinitionWaiters.delete(tag);
+                for (const resolve of waiters) resolve(constructor);
+            }
+        },
+        get(name) {
+            const definition = customDefinitions.get(String(name).toLowerCase());
+            return definition ? definition.constructor : undefined;
+        },
+        whenDefined(name) {
+            const tag = String(name).toLowerCase();
+            if (!/^[a-z][a-z0-9._]*-[a-z0-9._-]*$/.test(tag)) {
+                return Promise.reject(
+                    new TypeError("customElements.whenDefined: nombre no válido")
+                );
+            }
+            const definition = customDefinitions.get(tag);
+            if (definition) return Promise.resolve(definition.constructor);
+            return new Promise(resolve => {
+                const waiters = customDefinitionWaiters.get(tag) || [];
+                waiters.push(resolve);
+                customDefinitionWaiters.set(tag, waiters);
+            });
+        },
+        upgrade(root) {
+            const start = root || documentObject;
+            if (start._type === 1) upgradeCustomElement(start);
+            walkElements(start, element => upgradeCustomElement(element));
+        }
     };
     globalThis.CSS = {
         supports() { return false; },
@@ -2041,6 +2195,161 @@
         enumerable: false,
         configurable: false
     });
+    // ------------------------------------------------------- fetch / XHR
+    // La red la hace Rust (`__wispFetchSync`): Boa no tiene E/S. La respuesta
+    // se convierte en un objeto tipo Response con `text()`/`json()` que
+    // devuelven promesas, así el código de las webs funciona sin cambios.
+    function wispResponseFromJson(raw) {
+        const data = JSON.parse(raw);
+        const headers = new Map();
+        if (data.type) headers.set("content-type", String(data.type).toLowerCase());
+        return {
+            ok: Boolean(data.ok),
+            status: Number(data.status) || 0,
+            statusText: "",
+            url: String(data.url || locationObject.href),
+            redirected: false,
+            type: "basic",
+            headers: {
+                get(name) {
+                    const key = String(name).toLowerCase();
+                    return headers.has(key) ? headers.get(key) : null;
+                },
+                has(name) { return headers.has(String(name).toLowerCase()); },
+                forEach(callback) { headers.forEach((value, key) => callback(value, key)); }
+            },
+            text() { return Promise.resolve(String(data.body)); },
+            json() {
+                return new Promise((resolve, reject) => {
+                    try { resolve(JSON.parse(String(data.body))); }
+                    catch (error) { reject(error); }
+                });
+            },
+            clone() { return wispResponseFromJson(raw); }
+        };
+    }
+
+    function wispFetch(input, init) {
+        return new Promise((resolve, reject) => {
+            try {
+                const url = typeof input === "string" ? input : (input && input.url) || String(input);
+                const method = (init && init.method) || "GET";
+                const raw = typeof __wispFetchSync === "function"
+                    ? __wispFetchSync(url, String(method))
+                    : null;
+                if (raw === null || raw === undefined) {
+                    reject(new TypeError("Failed to fetch"));
+                    return;
+                }
+                // Wisp devuelve `{ error }` cuando CORS, un límite o la red
+                // bloquean la petición: se propaga el motivo, no un fallo mudo.
+                const failure = JSON.parse(raw);
+                if (failure && failure.error) {
+                    const error = new TypeError(String(failure.error));
+                    reportError(error);
+                    reject(error);
+                    return;
+                }
+                resolve(wispResponseFromJson(raw));
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+    globalThis.fetch = wispFetch;
+
+    class WispXMLHttpRequest {
+        constructor() {
+            this.readyState = 0;
+            this.status = 0;
+            this.statusText = "";
+            this.responseText = "";
+            this.response = "";
+            this.responseType = "";
+            this.onload = null;
+            this.onerror = null;
+            this.onreadystatechange = null;
+            this._listeners = new Map();
+            this._method = "GET";
+            this._url = "";
+            this._headers = new Map();
+        }
+        open(method, url) {
+            this._method = String(method || "GET");
+            this._url = String(url);
+            this.readyState = 1;
+            this._emit("readystatechange");
+        }
+        setRequestHeader() {}
+        getResponseHeader(name) {
+            const key = String(name).toLowerCase();
+            return this._headers.has(key) ? this._headers.get(key) : null;
+        }
+        getAllResponseHeaders() {
+            return Array.from(this._headers.entries())
+                .map(([key, value]) => `${key}: ${value}`)
+                .join("\r\n");
+        }
+        addEventListener(type, listener) {
+            if (typeof listener !== "function") return;
+            const key = String(type);
+            const list = this._listeners.get(key) || [];
+            list.push(listener);
+            this._listeners.set(key, list);
+        }
+        removeEventListener(type, listener) {
+            const list = this._listeners.get(String(type));
+            if (!list) return;
+            const index = list.indexOf(listener);
+            if (index >= 0) list.splice(index, 1);
+        }
+        _emit(type) {
+            const event = { type, target: this, currentTarget: this };
+            const handler = this["on" + type];
+            if (typeof handler === "function") handler.call(this, event);
+            for (const listener of (this._listeners.get(type) || []).slice()) {
+                listener.call(this, event);
+            }
+        }
+        abort() {}
+        send() {
+            const raw = typeof __wispFetchSync === "function"
+                ? __wispFetchSync(this._url, this._method)
+                : null;
+            if (raw === null || raw === undefined) {
+                this.readyState = 4;
+                this.status = 0;
+                this._emit("readystatechange");
+                this._emit("error");
+                this._emit("loadend");
+                return;
+            }
+            const data = JSON.parse(raw);
+            if (data && data.error) {
+                const error = new TypeError(String(data.error));
+                reportError(error);
+                this.readyState = 4;
+                this.status = 0;
+                this.statusText = String(data.error);
+                this._emit("readystatechange");
+                this._emit("error");
+                this._emit("loadend");
+                return;
+            }
+            this.status = Number(data.status) || 0;
+            this.responseText = String(data.body);
+            this.response = this.responseType === "json"
+                ? JSON.parse(this.responseText)
+                : this.responseText;
+            if (data.type) this._headers.set("content-type", String(data.type).toLowerCase());
+            this.readyState = 4;
+            this._emit("readystatechange");
+            this._emit("load");
+            this._emit("loadend");
+        }
+    }
+    globalThis.XMLHttpRequest = WispXMLHttpRequest;
+
     Object.defineProperty(globalThis, "__wispTakeWarnings", {
         value: takeWarnings,
         writable: false,

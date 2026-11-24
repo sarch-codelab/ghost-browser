@@ -8,10 +8,12 @@ use reqwest::redirect::Policy;
 use scraper::node::Node;
 use scraper::{ElementRef, Html, Selector};
 use serde::Serialize;
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use taffy::prelude::*;
 
 mod script;
@@ -38,6 +40,13 @@ const READER_VIEWPORT_WIDTH: f32 = 1280.0;
 const MAX_IMAGE_COUNT: usize = 48;
 const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+/// Presupuesto total de red de una página. Wisp descarga documento, CSS,
+/// scripts, módulos e imágenes en serie: sin un tope global una página pesada
+/// podía encadenar decenas de esperas y tardar minutos. Al agotarse, los
+/// recursos restantes se omiten con un aviso explícito.
+const MAX_NETWORK_TIME: Duration = Duration::from_secs(8);
+/// Tope de cada petición individual mientras quede presupuesto de página.
+const MAX_NETWORK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_COLOR: Color = Color {
     r: 255,
     g: 255,
@@ -69,6 +78,56 @@ fn is_bold_weight(weight: u16) -> bool {
     weight >= 600
 }
 
+/// Hasher no criptográfico para las cachés de medidas: las claves son
+/// palabras cortas y `SipHash` (el `DefaultHasher` de la std) domina el coste
+/// de una búsqueda. Es el mismo esquema FX que usan los compiladores para
+/// tablas de símbolos: multiplicación y rotación, sin dependencias nuevas.
+#[derive(Default, Clone, Copy)]
+struct FastHasher(u64);
+
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = self.0;
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let word = u64::from_le_bytes(chunk.try_into().expect("chunk is 8 bytes"));
+            hash = (hash.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut tail = [0u8; 8];
+            tail[..rest.len()].copy_from_slice(rest);
+            hash = (hash.rotate_left(5) ^ u64::from_le_bytes(tail))
+                .wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+        self.0 = hash;
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.write(&[value]);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.write(&value.to_le_bytes());
+    }
+}
+
+type FastBuildHasher = std::hash::BuildHasherDefault<FastHasher>;
+type FastMap<K, V> = HashMap<K, V, FastBuildHasher>;
+
 /// Horizontal advance of `text` at `font_size` pixels, kerning included.
 /// Results are memoized: word widths never depend on layout state, and the
 /// same strings are re-measured by every Taffy pass and every resize.
@@ -84,23 +143,33 @@ pub fn text_width_weighted(text: &str, font_size: f32, bold: bool) -> f32 {
     if text.is_empty() || font_size <= 0.0 {
         return 0.0;
     }
-    static CACHE: OnceLock<Mutex<HashMap<(u32, bool), HashMap<Box<str>, f32>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    // Caché por hilo: el layout corre en un solo hilo y este es el punto más
+    // caliente del motor (cada palabra de cada línea pasa por aquí varias
+    // veces). Un `Mutex` global obligaba a un lock por palabra y serializaba
+    // cualquier medición concurrente; `RefCell` en thread-local lo elimina.
+    thread_local! {
+        static CACHE: RefCell<FastMap<(u32, bool), FastMap<Box<str>, f32>>> =
+            RefCell::new(FastMap::default());
+    }
     let key = (font_size.to_bits(), bold);
-    if let Some(width) = cache
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .get(&key)
-        .and_then(|sizes| sizes.get(text))
-    {
-        return *width;
+    let cached = CACHE.with(|cache| {
+        cache
+            .borrow()
+            .get(&key)
+            .and_then(|sizes| sizes.get(text))
+            .copied()
+    });
+    if let Some(width) = cached {
+        return width;
     }
     let width = measure_text_width(text, font_size, bold);
-    let mut guard = cache.lock().unwrap_or_else(|error| error.into_inner());
-    let sizes = guard.entry(key).or_default();
-    if sizes.len() < 100_000 {
-        sizes.insert(text.into(), width);
-    }
+    CACHE.with(|cache| {
+        let mut guard = cache.borrow_mut();
+        let sizes = guard.entry(key).or_default();
+        if sizes.len() < 100_000 {
+            sizes.insert(text.into(), width);
+        }
+    });
     width
 }
 
@@ -120,29 +189,59 @@ fn measure_text_width(text: &str, font_size: f32, bold: bool) -> f32 {
     width.max(0.0)
 }
 
+/// Métricas verticales de la fuente a `font_size`: `(alto natural de línea,
+/// línea base)`. Se piden una vez por palabra al centrar y subrayar texto, y
+/// `as_scaled` vuelve a resolver tablas de la fuente en cada llamada, así que
+/// se memoizan por tamaño (una página usa un puñado de tamaños distintos).
+fn font_metrics(font_size: f32) -> (f32, f32) {
+    thread_local! {
+        static METRICS: RefCell<FastMap<u32, (f32, f32)>> = RefCell::new(FastMap::default());
+    }
+    let size = font_size.max(1.0);
+    let key = size.to_bits();
+    if let Some(metrics) = METRICS.with(|cache| cache.borrow().get(&key).copied()) {
+        return metrics;
+    }
+    let scaled = wisp_font().as_scaled(size);
+    let metrics = (
+        (scaled.ascent() - scaled.descent() + scaled.line_gap()).max(font_size),
+        scaled.ascent(),
+    );
+    METRICS.with(|cache| {
+        let mut guard = cache.borrow_mut();
+        if guard.len() < 4096 {
+            guard.insert(key, metrics);
+        }
+    });
+    metrics
+}
+
 /// Natural line height (`ascent - descent + line gap`) at `font_size` pixels.
 pub fn text_line_height(font_size: f32) -> f32 {
-    let scaled = wisp_font().as_scaled(font_size.max(1.0));
-    (scaled.ascent() - scaled.descent() + scaled.line_gap()).max(font_size)
+    font_metrics(font_size).0
 }
 
 /// Distancia desde el borde superior de la línea hasta la línea base, usada
 /// para pintar el subrayado de los enlaces.
 fn text_ascent(font_size: f32) -> f32 {
-    wisp_font().as_scaled(font_size.max(1.0)).ascent()
+    font_metrics(font_size).1
 }
 
 /// Aplica `text-transform` a una palabra antes de medirla y pintarla.
-fn transformed_text(word: &str, kind: TextTransformKind) -> String {
+/// Aplica `text-transform` sin asignar memoria en el caso habitual
+/// (`none`), que es el 99 % de las palabras de una página.
+fn transformed_text(word: &str, kind: TextTransformKind) -> Cow<'_, str> {
     match kind {
-        TextTransformKind::None => word.to_owned(),
-        TextTransformKind::Uppercase => word.to_uppercase(),
-        TextTransformKind::Lowercase => word.to_lowercase(),
+        TextTransformKind::None => Cow::Borrowed(word),
+        TextTransformKind::Uppercase => Cow::Owned(word.to_uppercase()),
+        TextTransformKind::Lowercase => Cow::Owned(word.to_lowercase()),
         TextTransformKind::Capitalize => {
             let mut characters = word.chars();
             match characters.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
-                None => String::new(),
+                Some(first) => {
+                    Cow::Owned(first.to_uppercase().collect::<String>() + characters.as_str())
+                }
+                None => Cow::Borrowed(""),
             }
         }
     }
@@ -204,6 +303,12 @@ pub enum PaintCommand {
         radius: f32,
         image: BgImage,
     },
+    /// Abre una región de recorte (`overflow: hidden|auto|scroll`): todo lo
+    /// que se pinte hasta el siguiente [`PaintCommand::ClipEnd`] queda
+    /// recortado a `rect`. Los recortes se anidan como una pila.
+    Clip { rect: Rect },
+    /// Cierra la región abierta por el último [`PaintCommand::Clip`].
+    ClipEnd,
 }
 
 /// Una capa de `background-image` (solo la primera; `background` admite
@@ -451,6 +556,80 @@ fn collect_reader_text(node: &DomNode, out: &mut String) {
 /// documento o lectura que el pipeline de Wisp cubre bien (artículos, wikis,
 /// documentación, blogs). Es conservadora — ante la duda devuelve `false` y
 /// la página abre en WebView2; el usuario siempre puede forzar Wisp a mano.
+/// ¿Estas advertencias significan que la página no se puede ver como en
+/// Chromium? Wisp ejecuta scripts, pero no módulos ES ni scripts externos que
+/// se saltan por límite o por fallo; en esos casos la página queda a medias.
+pub fn warnings_need_webview(warnings: &[String]) -> bool {
+    // APIs que las webs modernas asumen y que Wisp no define: si un script
+    // depende de ellas la página no va a comportarse como en un navegador.
+    const MISSING_JS_APIS: &[&str] = &[
+        "fetch is not defined",
+        "XMLHttpRequest is not defined",
+        "WebSocket is not defined",
+        "customElements is not defined",
+        "IntersectionObserver is not defined",
+        "ResizeObserver is not defined",
+    ];
+    warnings.iter().any(|warning| {
+        warning.contains("scripts externos")
+            || warning.contains("script externo")
+            || warning.contains("módulo ES")
+            || warning.contains("módulos ES")
+            || warning.contains("módulo externo")
+            || warning.contains("módulo inline")
+            || warning.contains("importaciones ES")
+            // Se agotó el presupuesto de JavaScript: la página quedó a medias.
+            || warning.contains("límite de descarga de JavaScript")
+            || warning.contains("límite de JavaScript de Wisp")
+            || warning.contains("presupuesto de red")
+            || warning.contains("DOM generado por JavaScript supera")
+            || MISSING_JS_APIS
+                .iter()
+                .any(|api| warning.contains(api))
+    })
+}
+
+/// Sitios que necesitan Chromium de verdad (MSE para vídeo, shadow DOM,
+/// JIT) y donde Wisp nunca debe ser el motor: el intento descargaba la página
+/// entera y sus recursos sólo para entregarla después a WebView2, es decir,
+/// cargaba dos veces la misma página. Se eligen para WebView2 de entrada.
+pub fn site_requires_chromium(url: &str) -> bool {
+    let Ok(url) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    const CHROMIUM_ONLY: &[&str] = &[
+        "youtube.com",
+        "youtu.be",
+        "youtube-nocookie.com",
+        "netflix.com",
+        "twitch.tv",
+        "vimeo.com",
+        "instagram.com",
+        "facebook.com",
+        "tiktok.com",
+        "x.com",
+        "twitter.com",
+        "spotify.com",
+        "discord.com",
+        "web.whatsapp.com",
+        "mail.google.com",
+        "docs.google.com",
+        "drive.google.com",
+        "maps.google.com",
+        "meet.google.com",
+    ];
+    CHROMIUM_ONLY
+        .iter()
+        .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
+}
+
 pub fn url_suits_wisp(url: &str) -> bool {
     let Ok(url) = url::Url::parse(url) else {
         return false;
@@ -761,14 +940,33 @@ enum InlineItem<'a> {
     Break,
 }
 
-/// Longitud CSS: píxeles absolutos, porcentaje del bloque contenedor o una
-/// combinación lineal de ambos (`calc()`), que es exactamente lo que puede
-/// producir una expresión de `calc()` sobre longitudes.
+/// Función de longitud de CSS que Wisp evalúa al maquetar. No son lineales,
+/// así que se resuelven contra el ancho del contenedor en el momento del
+/// layout en lugar de plegarse a `px + %` como `calc()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LengthFunction {
+    Min,
+    Max,
+    Clamp,
+}
+
+/// Longitud CSS: píxeles absolutos, porcentaje del bloque contenedor, una
+/// combinación lineal de ambos (`calc()`) o `min()`/`max()`/`clamp()` sobre
+/// hasta tres argumentos.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Length {
     Px(f32),
     Percent(f32),
-    Sum { px: f32, percent: f32 },
+    Sum {
+        px: f32,
+        percent: f32,
+    },
+    /// Cada argumento se guarda como sus coeficientes lineales `(px, %)`.
+    Function {
+        kind: LengthFunction,
+        count: u8,
+        args: [[f32; 2]; 3],
+    },
 }
 
 impl Default for Length {
@@ -783,6 +981,31 @@ impl Length {
             Length::Px(px) => px,
             Length::Percent(percent) => basis * percent / 100.0,
             Length::Sum { px, percent } => px + basis * percent / 100.0,
+            Length::Function { kind, count, args } => {
+                let value = |index: usize| {
+                    let [px, percent] = args[index];
+                    px + basis * percent / 100.0
+                };
+                let count = usize::from(count.max(1));
+                match kind {
+                    LengthFunction::Min => (0..count).map(value).fold(f32::INFINITY, f32::min),
+                    LengthFunction::Max => (0..count).map(value).fold(f32::NEG_INFINITY, f32::max),
+                    // `clamp(MIN, VAL, MAX)` equivale a `max(MIN, min(VAL, MAX))`.
+                    LengthFunction::Clamp => value(1).max(value(0)).min(value(2)),
+                }
+            }
+        }
+    }
+
+    /// `true` si el valor no depende del ancho (o alto) del contenedor.
+    fn is_absolute(self) -> bool {
+        match self {
+            Length::Px(_) => true,
+            Length::Percent(_) => false,
+            Length::Sum { percent, .. } => percent == 0.0,
+            Length::Function { count, args, .. } => {
+                (0..usize::from(count)).all(|index| args[index][1] == 0.0)
+            }
         }
     }
 }
@@ -909,6 +1132,22 @@ struct Style {
     flex_grow: f32,
     flex_shrink: f32,
     flex_basis: Option<Length>,
+    /// Colocación explícita dentro de un grid (`grid-column`/`grid-row`).
+    grid_column: GridLinePlacement,
+    grid_row: GridLinePlacement,
+    /// `aspect-ratio` (ancho / alto) para cajas con un solo eje definido.
+    aspect_ratio: Option<f32>,
+    /// `overflow` distinto de `visible`: el contenido se recorta a la caja.
+    overflow_clip: bool,
+}
+
+/// Línea (o span) de un item de grid. `None` en `start`/`end` significa
+/// colocación automática; `span` > 0 fija cuántas pistas ocupa el item.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GridLinePlacement {
+    start: Option<i16>,
+    end: Option<i16>,
+    span: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -996,6 +1235,10 @@ impl Default for Style {
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: None,
+            grid_column: GridLinePlacement::default(),
+            grid_row: GridLinePlacement::default(),
+            aspect_ratio: None,
+            overflow_clip: false,
         }
     }
 }
@@ -1156,7 +1399,61 @@ fn layout_roots(
     })
 }
 
+#[derive(Default)]
+struct NetworkBudgetState {
+    deadline: Option<Instant>,
+    skipped: usize,
+}
+
+thread_local! {
+    /// Presupuesto de red de la página que se descarga en este hilo. `fetch_url`
+    /// corre en un hilo por carga, así que el thread-local acota exactamente
+    /// una página aunque el usuario abra varias a la vez.
+    static NETWORK_BUDGET: RefCell<NetworkBudgetState> = RefCell::new(NetworkBudgetState::default());
+}
+
+fn begin_network_budget() {
+    NETWORK_BUDGET.with(|budget| {
+        let mut budget = budget.borrow_mut();
+        budget.deadline = Some(Instant::now() + MAX_NETWORK_TIME);
+        budget.skipped = 0;
+    });
+}
+
+/// Tiempo máximo que puede durar la siguiente petición. `None` cuando el
+/// presupuesto de la página ya se agotó: el recurso se omite y se cuenta para
+/// el aviso final.
+fn network_request_timeout(cap: Duration) -> Option<Duration> {
+    NETWORK_BUDGET.with(|budget| {
+        let mut budget = budget.borrow_mut();
+        let Some(deadline) = budget.deadline else {
+            return Some(cap);
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            budget.skipped += 1;
+            return None;
+        }
+        Some(cap.min(left))
+    })
+}
+
+/// Aviso de recursos omitidos por el presupuesto de red, si hubo alguno.
+fn take_network_warning() -> Option<String> {
+    NETWORK_BUDGET.with(|budget| {
+        let mut budget = budget.borrow_mut();
+        let skipped = std::mem::take(&mut budget.skipped);
+        (skipped > 0).then(|| {
+            format!(
+                "Se alcanzó el presupuesto de red de {} s: {skipped} recursos no se descargaron.",
+                MAX_NETWORK_TIME.as_secs()
+            )
+        })
+    })
+}
+
 pub fn fetch_url(url: &str) -> Result<FetchedPage> {
+    begin_network_budget();
     let url = url::Url::parse(url)?;
     ensure!(
         matches!(url.scheme(), "http" | "https"),
@@ -1221,6 +1518,9 @@ pub fn fetch_url(url: &str) -> Result<FetchedPage> {
     let (mut images, image_warnings) = fetch_images(&client, &html, &final_url);
     warnings.extend(image_warnings);
     fetch_background_images(&client, &html, &stylesheets, &final_url, &mut images);
+    if let Some(warning) = take_network_warning() {
+        warnings.push(warning);
+    }
 
     Ok(FetchedPage::new(
         final_url,
@@ -1323,11 +1623,10 @@ fn fetch_stylesheet_tree(
     warnings: &mut Vec<String>,
     depth: usize,
 ) {
-    let response = match client
-        .get(stylesheet_url)
-        .timeout(Duration::from_secs(5))
-        .send()
-    {
+    let Some(timeout) = network_request_timeout(MAX_NETWORK_REQUEST_TIMEOUT) else {
+        return;
+    };
+    let response = match client.get(stylesheet_url).timeout(timeout).send() {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
             warnings.push(format!(
@@ -1576,11 +1875,10 @@ fn fetch_external_scripts(
         }
         attempted += 1;
 
-        let response = match client
-            .get(&script_url)
-            .timeout(Duration::from_secs(5))
-            .send()
-        {
+        let Some(timeout) = network_request_timeout(MAX_NETWORK_REQUEST_TIMEOUT) else {
+            break;
+        };
+        let response = match client.get(&script_url).timeout(timeout).send() {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
                 warnings.push(format!(
@@ -1794,7 +2092,7 @@ fn fetch_images(
     let mut warnings = Vec::new();
     let mut seen = HashSet::new();
     let mut total_bytes = 0usize;
-    let image_selector = match Selector::parse("img[src]") {
+    let image_selector = match Selector::parse("img") {
         Ok(selector) => selector,
         Err(error) => {
             return (
@@ -1812,9 +2110,14 @@ fn fetch_images(
     };
 
     for image in document.select(&image_selector) {
-        let Some(src) = image.attr("src").map(str::trim) else {
-            continue;
-        };
+        // `<img srcset>` sin `src` es habitual (carga diferida, arte
+        // responsive): se usa el candidato de mayor descriptor.
+        let src = image
+            .attr("src")
+            .map(str::trim)
+            .filter(|src| !src.is_empty())
+            .or_else(|| image.attr("srcset").and_then(largest_srcset_candidate))
+            .unwrap_or_default();
         if src.is_empty() {
             continue;
         }
@@ -1848,7 +2151,10 @@ fn fetch_images(
             }
             seen.insert(key.clone());
 
-            let response = match client.get(&key).timeout(Duration::from_secs(10)).send() {
+            let Some(timeout) = network_request_timeout(Duration::from_secs(10)) else {
+                break;
+            };
+            let response = match client.get(&key).timeout(timeout).send() {
                 Ok(response) if response.status().is_success() => response,
                 Ok(response) => {
                     warnings.push(format!(
@@ -2004,7 +2310,10 @@ fn fetch_background_images(
             }
             seen.insert(key.clone());
             fetched += 1;
-            let Ok(response) = client.get(&key).timeout(Duration::from_secs(10)).send() else {
+            let Some(timeout) = network_request_timeout(Duration::from_secs(10)) else {
+                break;
+            };
+            let Ok(response) = client.get(&key).timeout(timeout).send() else {
                 continue;
             };
             if !response.status().is_success() {
@@ -2071,6 +2380,36 @@ fn decode_data_image(payload: &str) -> Option<Vec<u8>> {
 
 /// Resolves an `<img src>` to the same key used by [`fetch_images`]: the
 /// absolute http(s) URL, or the full `data:` URI.
+/// Candidato de mayor descriptor de un `srcset` (`url 480w`, `url 2x`).
+fn largest_srcset_candidate(srcset: &str) -> Option<&str> {
+    let mut best: Option<(f32, &str)> = None;
+    let mut first_without_descriptor: Option<&str> = None;
+    for candidate in split_top_level_commas(srcset) {
+        let mut parts = candidate.split_whitespace();
+        let Some(url) = parts.next() else {
+            continue;
+        };
+        let descriptor = parts.next().unwrap_or_default();
+        if descriptor.is_empty() {
+            first_without_descriptor.get_or_insert(url);
+            continue;
+        }
+        let weight = if let Some(width) = descriptor.strip_suffix('w') {
+            width.parse::<f32>().ok()
+        } else if let Some(density) = descriptor.strip_suffix('x') {
+            density.parse::<f32>().ok().map(|density| density * 1000.0)
+        } else {
+            None
+        };
+        if let Some(weight) = weight
+            && best.is_none_or(|(best_weight, _)| weight > best_weight)
+        {
+            best = Some((weight, url));
+        }
+    }
+    best.map(|(_, url)| url).or(first_without_descriptor)
+}
+
 fn resolve_image_key(page_url: Option<&str>, src: &str) -> Option<String> {
     let src = src.trim();
     if src.is_empty() {
@@ -2130,9 +2469,15 @@ fn is_url_like_module_specifier(specifier: &str) -> bool {
 }
 
 fn fetch_javascript_source(client: &Client, script_url: &str) -> Result<String, String> {
+    let timeout = network_request_timeout(MAX_NETWORK_REQUEST_TIMEOUT).ok_or_else(|| {
+        format!(
+            "Se alcanzó el presupuesto de red de {} s: un módulo no se descargó.",
+            MAX_NETWORK_TIME.as_secs()
+        )
+    })?;
     let response = client
         .get(script_url)
-        .timeout(Duration::from_secs(5))
+        .timeout(timeout)
         .send()
         .map_err(|error| format!("No se pudo cargar un módulo: {error}"))?;
     if !response.status().is_success() {
@@ -2548,7 +2893,16 @@ fn parse_css_rules_inner(
                         let selector_end = declarations_start - 1;
                         let selector_list = stylesheet[start..selector_end].trim();
                         let declarations = stylesheet[declarations_start..index].trim();
-                        if let Some(condition) = media_condition(selector_list) {
+                        if let Some(condition) = supports_condition(selector_list) {
+                            if supports_query_matches(condition) {
+                                rules.extend(parse_css_rules_inner(
+                                    declarations,
+                                    order,
+                                    viewport_width,
+                                    nesting + 1,
+                                ));
+                            }
+                        } else if let Some(condition) = media_condition(selector_list) {
                             if media_query_matches(condition, viewport_width) {
                                 rules.extend(parse_css_rules_inner(
                                     declarations,
@@ -2611,6 +2965,191 @@ fn split_selector_list(selectors: &str) -> Vec<&str> {
     }
     parts.push(&selectors[start..]);
     parts
+}
+
+/// Preludio de un `@supports`, o `None` si el bloque no es un `@supports`.
+fn supports_condition(prelude: &str) -> Option<&str> {
+    let prelude = prelude.trim();
+    let keyword = prelude.get(..9)?;
+    keyword
+        .eq_ignore_ascii_case("@supports")
+        .then(|| prelude[9..].trim())
+}
+
+/// Propiedades que Wisp interpreta de verdad. `@supports` se evalúa contra
+/// esta lista: si el motor no implementa la declaración, el bloque se omite,
+/// que es exactamente lo que hace un navegador con `@supports`.
+const SUPPORTED_CSS_PROPERTIES: &[&str] = &[
+    "align-items",
+    "background",
+    "background-color",
+    "background-image",
+    "border",
+    "border-bottom",
+    "border-bottom-color",
+    "border-bottom-style",
+    "border-bottom-width",
+    "border-color",
+    "border-left",
+    "border-left-color",
+    "border-left-style",
+    "border-left-width",
+    "border-radius",
+    "border-right",
+    "border-right-color",
+    "border-right-style",
+    "border-right-width",
+    "border-style",
+    "border-top",
+    "border-top-color",
+    "border-top-style",
+    "border-top-width",
+    "border-width",
+    "box-sizing",
+    "column-gap",
+    "color",
+    "display",
+    "flex",
+    "flex-basis",
+    "flex-direction",
+    "flex-grow",
+    "flex-shrink",
+    "flex-wrap",
+    "font-size",
+    "font-weight",
+    "gap",
+    "grid-column",
+    "grid-column-end",
+    "grid-column-start",
+    "grid-row",
+    "grid-row-end",
+    "grid-row-start",
+    "grid-template-columns",
+    "grid-template-rows",
+    "height",
+    "justify-content",
+    "line-height",
+    "list-style",
+    "list-style-type",
+    "margin",
+    "margin-bottom",
+    "margin-left",
+    "margin-right",
+    "margin-top",
+    "max-height",
+    "max-width",
+    "min-height",
+    "min-width",
+    "overflow-wrap",
+    "padding",
+    "padding-bottom",
+    "padding-left",
+    "padding-right",
+    "padding-top",
+    "row-gap",
+    "text-align",
+    "text-decoration",
+    "text-transform",
+    "top",
+    "right",
+    "bottom",
+    "left",
+    "visibility",
+    "white-space",
+    "width",
+    "word-break",
+];
+
+/// Evalúa una condición de `@supports`: `not`, `and`, `or`,
+/// `(propiedad: valor)` y `selector(...)`.
+fn supports_query_matches(condition: &str) -> bool {
+    let condition = condition.trim();
+    if condition.is_empty() {
+        return false;
+    }
+    if condition
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("not "))
+    {
+        return !supports_query_matches(&condition[4..]);
+    }
+    if let Some((left, right)) = split_top_level_keyword(condition, " or ") {
+        return supports_query_matches(left) || supports_query_matches(right);
+    }
+    if let Some((left, right)) = split_top_level_keyword(condition, " and ") {
+        return supports_query_matches(left) && supports_query_matches(right);
+    }
+    if let Some(inner) = strip_parentheses(condition) {
+        return supports_declaration_supported(inner);
+    }
+    if let Some(inner) = strip_css_function(condition, "selector") {
+        // `scraper` implementa el motor de selectores que usa Wisp.
+        return !inner.trim().is_empty();
+    }
+    false
+}
+
+fn supports_declaration_supported(declaration: &str) -> bool {
+    let Some((name, value)) = declaration.split_once(':') else {
+        return false;
+    };
+    let name = name.trim().to_ascii_lowercase();
+    let value = value.trim().to_ascii_lowercase();
+    if name.starts_with("--") {
+        return true;
+    }
+    match name.as_str() {
+        // `@supports (display: grid)` es el caso más habitual: sólo cuenta la
+        // variante que el motor sabe maquetar.
+        "display" => matches!(
+            value.as_str(),
+            "block"
+                | "inline"
+                | "inline-block"
+                | "flex"
+                | "inline-flex"
+                | "grid"
+                | "inline-grid"
+                | "none"
+        ),
+        "position" => matches!(value.as_str(), "static" | "relative" | "absolute"),
+        "visibility" => matches!(value.as_str(), "visible" | "hidden"),
+        _ => SUPPORTED_CSS_PROPERTIES.contains(&name.as_str()),
+    }
+}
+
+/// Divide por la primera aparición de `keyword` en el nivel superior de
+/// paréntesis y corchetes.
+fn split_top_level_keyword<'a>(value: &'a str, keyword: &str) -> Option<(&'a str, &'a str)> {
+    let bytes = value.as_bytes();
+    let keyword_bytes = keyword.as_bytes();
+    let mut depth = 0i32;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' | b'[' => {
+                depth += 1;
+                index += 1;
+            }
+            b')' | b']' => {
+                depth = (depth - 1).max(0);
+                index += 1;
+            }
+            _ => {
+                if depth == 0
+                    && index + keyword_bytes.len() <= bytes.len()
+                    && bytes[index..index + keyword_bytes.len()].eq_ignore_ascii_case(keyword_bytes)
+                {
+                    return Some((
+                        value[..index].trim(),
+                        value[index + keyword_bytes.len()..].trim(),
+                    ));
+                }
+                index += 1;
+            }
+        }
+    }
+    None
 }
 
 /// Condición de un `@media`, o `None` si el preludio no es una media query.
@@ -2933,6 +3472,9 @@ fn convert_node(
                 Some(DomImage {
                     src: element
                         .attr("src")
+                        .map(str::trim)
+                        .filter(|src| !src.is_empty())
+                        .or_else(|| element.attr("srcset").and_then(largest_srcset_candidate))
                         .and_then(|src| resolve_image_key(page_url, src))
                         .unwrap_or_default(),
                     alt: element.attr("alt").unwrap_or_default().to_owned(),
@@ -3392,13 +3934,12 @@ fn layout_block(
             value
         }
     };
-    // Una altura en porcentaje sigue resolviendo como `auto` (comportamiento
+    // Un alto en porcentaje sigue resolviendo como `auto` (comportamiento
     // correcto cuando el contenedor no tiene altura definida).
-    let explicit_height = match style.height {
-        Some(Length::Px(height)) => Some(height),
-        Some(Length::Sum { px, percent: 0.0 }) => Some(px),
-        _ => None,
-    };
+    let explicit_height = style
+        .height
+        .filter(|length| length.is_absolute())
+        .map(|length| length.resolve(0.0));
     let mut box_height = match explicit_height {
         Some(height) => {
             if style.box_sizing == BoxSizingKind::BorderBox {
@@ -3407,7 +3948,21 @@ fn layout_block(
                 height
             }
         }
-        None => content_height,
+        // `aspect-ratio` con un solo eje definido: el alto lo determina el
+        // ancho del bloque (o su caja de borde con `box-sizing: border-box`).
+        None => match style.aspect_ratio {
+            Some(ratio) if ratio > 0.0 => {
+                let horizontal = padding[1] + padding[3] + border[1] + border[3];
+                let vertical = padding[0] + padding[2] + border[0] + border[2];
+                match style.box_sizing {
+                    BoxSizingKind::BorderBox => {
+                        ((content_width + horizontal) / ratio - vertical).max(0.0)
+                    }
+                    BoxSizingKind::ContentBox => content_width / ratio,
+                }
+            }
+            _ => content_height,
+        },
     };
     if let Some(max) = style.max_height {
         box_height = box_height.min(to_content_height(max));
@@ -3458,6 +4013,19 @@ fn layout_block(
             radius,
             commands,
         );
+    }
+    // `overflow: hidden|auto|scroll`: el contenido (incluidos los hijos
+    // absolutos) queda recortado al padding box, como en un navegador. El
+    // recorte va antes del fondo para que éste también se limite.
+    if style.overflow_clip && !measure_only {
+        let clip = Rect {
+            x: outer_x + border[3],
+            y: box_y + border[0],
+            width: (outer_width - border[1] - border[3]).max(0.0),
+            height: (border_box_height - border[0] - border[2]).max(0.0),
+        };
+        commands.insert(command_start, PaintCommand::Clip { rect: clip });
+        commands.push(PaintCommand::ClipEnd);
     }
 
     Ok(margin[0] + border_box_height + margin[2])
@@ -3580,7 +4148,7 @@ fn resolve_radius(radius: Length, width: f32, height: f32) -> f32 {
     let radius = match radius {
         Length::Px(px) => px,
         Length::Percent(percent) => basis * percent / 100.0,
-        Length::Sum { .. } => radius.resolve(basis),
+        Length::Sum { .. } | Length::Function { .. } => radius.resolve(basis),
     };
     radius.max(0.0).min(basis / 2.0)
 }
@@ -3761,6 +4329,9 @@ fn layout_taffy_children(
     let mut items: Vec<TaffyItem<'_>> = Vec::new();
     let mut run: Vec<&DomNode> = Vec::new();
     let mut absolute_children: Vec<&DomNode> = Vec::new();
+    // En un grid todo hijo es un item ("blockificado"): un `<span>` con
+    // `grid-column` tiene que ocupar pistas, no fluir como texto inline.
+    let grid_container = matches!(parent_style.display, Display::Grid);
     for child in &node.children {
         if is_hidden(child) {
             continue;
@@ -3769,7 +4340,7 @@ fn layout_taffy_children(
             absolute_children.push(child);
             continue;
         }
-        if is_block(child) {
+        if is_block(child) || (grid_container && child.tag.is_some()) {
             if !run.is_empty() {
                 items.push(TaffyItem::Run(std::mem::take(&mut run)));
             }
@@ -4024,8 +4595,27 @@ fn taffy_item_style(
         style.flex_basis = dimension(child_style.flex_basis);
         style.flex_grow = child_style.flex_grow;
         style.flex_shrink = child_style.flex_shrink;
+        style.aspect_ratio = child_style.aspect_ratio;
+        if matches!(parent_style.display, Display::Grid) {
+            style.grid_column = taffy_grid_line(child_style.grid_column);
+            style.grid_row = taffy_grid_line(child_style.grid_row);
+        }
     }
     style
+}
+
+/// `GridLinePlacement` de Wisp → `Line<GridPlacement>` de Taffy.
+fn taffy_grid_line(placement: GridLinePlacement) -> taffy::geometry::Line<GridPlacement> {
+    let mut line = taffy::geometry::Line::<GridPlacement>::default();
+    if let Some(start) = placement.start {
+        line.start = GridPlacement::Line(start.into());
+    }
+    if let Some(end) = placement.end {
+        line.end = GridPlacement::Line(end.into());
+    } else if placement.span > 0 {
+        line.end = GridPlacement::Span(placement.span);
+    }
+    line
 }
 
 /// Estilo de Taffy para el contenedor flex/grid: traduce las propiedades CSS
@@ -4087,7 +4677,9 @@ fn taffy_dimension(length: Length, basis: f32) -> Dimension {
     match length {
         Length::Px(px) => Dimension::from_length(px),
         Length::Percent(percent) => Dimension::from_percent(percent / 100.0),
-        Length::Sum { .. } => Dimension::from_length(length.resolve(basis)),
+        Length::Sum { .. } | Length::Function { .. } => {
+            Dimension::from_length(length.resolve(basis))
+        }
     }
 }
 
@@ -4096,7 +4688,9 @@ fn taffy_length_percentage(length: Length, basis: f32) -> LengthPercentage {
     match length {
         Length::Px(px) => taffy::style_helpers::length(px),
         Length::Percent(percent) => taffy::style_helpers::percent(percent / 100.0),
-        Length::Sum { .. } => taffy::style_helpers::length(length.resolve(basis)),
+        Length::Sum { .. } | Length::Function { .. } => {
+            taffy::style_helpers::length(length.resolve(basis))
+        }
     }
 }
 
@@ -4105,7 +4699,9 @@ fn taffy_length_percentage_auto(length: Length, basis: f32) -> LengthPercentageA
     match length {
         Length::Px(px) => LengthPercentageAuto::length(px),
         Length::Percent(percent) => LengthPercentageAuto::percent(percent / 100.0),
-        Length::Sum { .. } => LengthPercentageAuto::length(length.resolve(basis)),
+        Length::Sum { .. } | Length::Function { .. } => {
+            LengthPercentageAuto::length(length.resolve(basis))
+        }
     }
 }
 
@@ -4122,51 +4718,206 @@ fn inline_declaration<'a>(node: &'a DomNode, name: &str) -> Option<&'a str> {
 }
 
 /// Parsea `grid-template-columns`/`grid-template-rows`: longitudes `px`,
-/// porcentajes, `fr`, `auto` y `repeat(N, ...)` (sin `minmax` ni `auto-fill`).
+/// porcentajes, `fr`, `auto`, `minmax(a, b)` y `repeat(N | auto-fill |
+/// auto-fit, ...)`.
 fn parse_grid_template(value: &str) -> Vec<GridTemplateComponent<String>> {
-    let value = value.trim();
-    if let Some(inner) = value
-        .strip_prefix("repeat(")
-        .and_then(|rest| rest.strip_suffix(')'))
-    {
-        if let Some((count, list)) = inner.split_once(',') {
-            if let Ok(count) = count.trim().parse::<u16>() {
-                let repeated = parse_track_list(list.trim());
-                if !repeated.is_empty() {
-                    let count = usize::from(count.min(16));
-                    return repeated
-                        .iter()
-                        .cloned()
-                        .cycle()
-                        .take(count * repeated.len())
-                        .collect();
-                }
-            }
+    let mut components = Vec::new();
+    // El spec admite una sola repetición automática por plantilla.
+    let mut auto_repeat_used = false;
+    for token in split_track_tokens(value.trim()) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
         }
-        return Vec::new();
+        if let Some(inner) = strip_css_function(token, "repeat") {
+            let Some((count_text, list)) = inner.split_once(',') else {
+                continue;
+            };
+            let count_text = count_text.trim().to_ascii_lowercase();
+            let count = match count_text.as_str() {
+                "auto-fill" | "auto-fit" if !auto_repeat_used => {
+                    auto_repeat_used = true;
+                    if count_text == "auto-fill" {
+                        RepetitionCount::AutoFill
+                    } else {
+                        RepetitionCount::AutoFit
+                    }
+                }
+                _ => match count_text.parse::<u16>() {
+                    Ok(count) => RepetitionCount::Count(count.min(16)),
+                    Err(_) => continue,
+                },
+            };
+            let tracks = parse_track_list(list);
+            if tracks.is_empty() {
+                continue;
+            }
+            components.push(GridTemplateComponent::Repeat(
+                taffy::style::GridTemplateRepetition {
+                    count,
+                    tracks,
+                    line_names: Vec::new(),
+                },
+            ));
+        } else if let Some(track) = parse_track_sizing(token) {
+            components.push(GridTemplateComponent::Single(track));
+        }
     }
-    parse_track_list(value)
+    components
 }
 
-fn parse_track_list(value: &str) -> Vec<GridTemplateComponent<String>> {
-    value
-        .split_whitespace()
-        .filter_map(|token| {
-            let max = if let Some(fr) = token.strip_suffix("fr") {
-                MaxTrackSizingFunction::fr(fr.parse::<f32>().ok()?)
-            } else if token == "auto" {
-                MaxTrackSizingFunction::auto()
-            } else if let Some(percent) = token.strip_suffix('%') {
-                MaxTrackSizingFunction::percent(percent.parse::<f32>().ok()? / 100.0)
-            } else {
-                MaxTrackSizingFunction::length(parse_length(token)?)
-            };
-            Some(GridTemplateComponent::Single(taffy::MinMax {
-                min: MinTrackSizingFunction::auto(),
-                max,
-            }))
-        })
+/// Separa los componentes de una plantilla por espacios de primer nivel (sin
+/// cortar dentro de `minmax(...)` ni `repeat(...)`).
+fn split_track_tokens(value: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut depth = 0i32;
+    let mut start: Option<usize> = None;
+    for (index, character) in value.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = (depth - 1).max(0),
+            _ => {}
+        }
+        if character.is_whitespace() && depth == 0 {
+            if let Some(start) = start.take() {
+                tokens.push(&value[start..index]);
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(start) = start {
+        tokens.push(&value[start..]);
+    }
+    tokens
+}
+
+/// `nombre(args)` sin los paréntesis exteriores, insensible a mayúsculas.
+fn strip_css_function<'a>(value: &'a str, name: &str) -> Option<&'a str> {
+    let value = value.trim();
+    let inner = value.strip_suffix(')')?;
+    let open = inner.find('(')?;
+    if !inner[..open].trim().eq_ignore_ascii_case(name) {
+        return None;
+    }
+    Some(&inner[open + 1..])
+}
+
+fn parse_track_list(value: &str) -> Vec<TrackSizingFunction> {
+    split_track_tokens(value.trim())
+        .into_iter()
+        .filter_map(parse_track_sizing)
         .collect()
+}
+
+/// `minmax(a, b)` o una única función de tamaño (que implica `minmax(auto,
+/// valor)`, salvo en longitudes fijas, donde el mínimo también es fijo).
+fn parse_track_sizing(token: &str) -> Option<TrackSizingFunction> {
+    if let Some(inner) = strip_css_function(token, "minmax") {
+        let parts = split_top_level_commas(inner);
+        if parts.len() != 2 {
+            return None;
+        }
+        return Some(TrackSizingFunction {
+            min: parse_min_track(parts[0])?,
+            max: parse_max_track(parts[1])?,
+        });
+    }
+    let max = parse_max_track(token)?;
+    let min = parse_min_track(token).unwrap_or_else(MinTrackSizingFunction::auto);
+    Some(TrackSizingFunction { min, max })
+}
+
+fn parse_min_track(token: &str) -> Option<MinTrackSizingFunction> {
+    let token = token.trim();
+    if token.eq_ignore_ascii_case("auto") {
+        return Some(MinTrackSizingFunction::auto());
+    }
+    if let Some(percent) = token.strip_suffix('%') {
+        let percent = percent.trim().parse::<f32>().ok()?;
+        return (percent.is_finite() && percent >= 0.0)
+            .then(|| MinTrackSizingFunction::percent(percent / 100.0));
+    }
+    parse_length(token).map(MinTrackSizingFunction::length)
+}
+
+fn parse_max_track(token: &str) -> Option<MaxTrackSizingFunction> {
+    let token = token.trim();
+    if let Some(fr) = token.strip_suffix("fr") {
+        let fr = fr.trim().parse::<f32>().ok()?;
+        return (fr.is_finite() && fr >= 0.0).then(|| MaxTrackSizingFunction::fr(fr));
+    }
+    if token.eq_ignore_ascii_case("auto") {
+        return Some(MaxTrackSizingFunction::auto());
+    }
+    if let Some(percent) = token.strip_suffix('%') {
+        let percent = percent.trim().parse::<f32>().ok()?;
+        return (percent.is_finite() && percent >= 0.0)
+            .then(|| MaxTrackSizingFunction::percent(percent / 100.0));
+    }
+    parse_length(token).map(MaxTrackSizingFunction::length)
+}
+
+/// `aspect-ratio: 16 / 9`, `1.5` o `auto`.
+fn parse_aspect_ratio(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    let ratio = match value.split_once('/') {
+        Some((width, height)) => {
+            let width = width.trim().parse::<f32>().ok()?;
+            let height = height.trim().parse::<f32>().ok()?;
+            (height != 0.0).then(|| width / height)?
+        }
+        None => value.parse::<f32>().ok()?,
+    };
+    (ratio.is_finite() && ratio > 0.0).then_some(ratio)
+}
+
+fn parse_grid_line(value: &str) -> Option<Option<i16>> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        return Some(None);
+    }
+    value.parse::<i16>().ok().map(Some)
+}
+
+/// `grid-column`/`grid-row`: `2`, `1 / 3`, `span 2`, `2 / span 3`.
+fn parse_grid_placement(value: &str) -> Option<GridLinePlacement> {
+    let mut parts = value.split('/');
+    let start = parts.next().unwrap_or_default().trim();
+    let end = parts.next().map(str::trim);
+    let mut placement = GridLinePlacement::default();
+    apply_grid_placement(&mut placement, start, true)?;
+    if let Some(end) = end {
+        apply_grid_placement(&mut placement, end, false)?;
+    }
+    Some(placement)
+}
+
+fn apply_grid_placement(
+    placement: &mut GridLinePlacement,
+    value: &str,
+    is_start: bool,
+) -> Option<()> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        return Some(());
+    }
+    let lower = value.to_ascii_lowercase();
+    if let Some(span) = lower.strip_prefix("span") {
+        let span = span.trim().parse::<u16>().ok()?;
+        placement.span = span.max(1);
+        return Some(());
+    }
+    let line = value.parse::<i16>().ok()?;
+    if is_start {
+        placement.start = Some(line);
+    } else {
+        placement.end = Some(line);
+    }
+    Some(())
 }
 
 /// Shorthand `border`: acepta `<ancho> <estilo> <color>` en cualquier orden
@@ -4404,7 +5155,7 @@ impl<'a> InlineWriter<'a> {
             self.commands.push(PaintCommand::Text {
                 x,
                 y,
-                content,
+                content: content.into_owned(),
                 color: style.color,
                 font_size: style.font_size,
                 font_weight: style.font_weight,
@@ -4570,20 +5321,22 @@ fn flow_words(
     href: Option<&str>,
     wrap: bool,
 ) {
-    let mut word = String::new();
-    for character in text.chars() {
+    // Corta por índices de byte en lugar de acumular en un `String`: así cada
+    // palabra es una rebanada de `text` y no hay una asignación por palabra
+    // (ni un `push` por carácter) en el camino caliente.
+    let mut word_start: Option<usize> = None;
+    for (index, character) in text.char_indices() {
         if character.is_whitespace() {
-            if !word.is_empty() {
-                place_flow_word(writer, &word, style, href, wrap);
-                word.clear();
+            if let Some(start) = word_start.take() {
+                place_flow_word(writer, &text[start..index], style, href, wrap);
             }
             writer.pending_space = true;
-        } else {
-            word.push(character);
+        } else if word_start.is_none() {
+            word_start = Some(index);
         }
     }
-    if !word.is_empty() {
-        place_flow_word(writer, &word, style, href, wrap);
+    if let Some(start) = word_start {
+        place_flow_word(writer, &text[start..], style, href, wrap);
         writer.pending_space = false;
     }
 }
@@ -4707,7 +5460,9 @@ fn align_inline_lines(
                 PaintCommand::Image { rect, .. }
                 | PaintCommand::FillRect { rect, .. }
                 | PaintCommand::StrokeRect { rect, .. }
-                | PaintCommand::BackgroundImage { rect, .. } => rect.x + rect.width,
+                | PaintCommand::BackgroundImage { rect, .. }
+                | PaintCommand::Clip { rect } => rect.x + rect.width,
+                PaintCommand::ClipEnd => 0.0,
             };
             right_edge = right_edge.max(right);
         }
@@ -4726,9 +5481,11 @@ fn align_inline_lines(
                 PaintCommand::Image { rect, .. }
                 | PaintCommand::FillRect { rect, .. }
                 | PaintCommand::StrokeRect { rect, .. }
-                | PaintCommand::BackgroundImage { rect, .. } => {
+                | PaintCommand::BackgroundImage { rect, .. }
+                | PaintCommand::Clip { rect } => {
                     rect.x += delta;
                 }
+                PaintCommand::ClipEnd => {}
             }
         }
     }
@@ -4824,6 +5581,15 @@ fn collect_inline_runs<'a>(
 }
 
 fn is_block(node: &DomNode) -> bool {
+    // Una vez calculado el estilo, `display` ya incorpora la hoja de estilos
+    // y el atributo `style`; reescanear `inline_style` en cada llamada (esto
+    // se ejecuta para cada nodo en cada pase de Taffy) es trabajo repetido.
+    if let Some(style) = node.style_cache.get() {
+        return matches!(
+            style.display,
+            Display::Block | Display::Flex | Display::Grid
+        );
+    }
     let Some(tag) = node.tag.as_deref() else {
         return false;
     };
@@ -4863,6 +5629,9 @@ fn is_block(node: &DomNode) -> bool {
 }
 
 fn is_hidden(node: &DomNode) -> bool {
+    if let Some(style) = node.style_cache.get() {
+        return style.display == Display::None;
+    }
     inline_display(node) == Some(Display::None)
 }
 
@@ -4948,6 +5717,10 @@ fn compute_style(node: &DomNode, inherited: Style) -> Style {
     style.flex_grow = 0.0;
     style.flex_shrink = 1.0;
     style.flex_basis = None;
+    style.grid_column = GridLinePlacement::default();
+    style.grid_row = GridLinePlacement::default();
+    style.aspect_ratio = None;
+    style.overflow_clip = false;
     style.display = if is_block(node) {
         Display::Block
     } else {
@@ -5083,6 +5856,46 @@ fn compute_style(node: &DomNode, inherited: Style) -> Style {
                     "baseline" => AlignKind::Baseline,
                     _ => AlignKind::Stretch,
                 };
+            }
+            "aspect-ratio" => {
+                style.aspect_ratio = parse_aspect_ratio(value);
+            }
+            "overflow" | "overflow-x" | "overflow-y" => {
+                style.overflow_clip = value.split_whitespace().any(|token| {
+                    matches!(
+                        token.to_ascii_lowercase().as_str(),
+                        "hidden" | "clip" | "scroll" | "auto" | "overlay"
+                    )
+                });
+            }
+            "grid-column" | "grid-row" => {
+                if let Some(placement) = parse_grid_placement(value) {
+                    if name.as_str() == "grid-column" {
+                        style.grid_column = placement;
+                    } else {
+                        style.grid_row = placement;
+                    }
+                }
+            }
+            "grid-column-start" => {
+                if let Some(line) = parse_grid_line(value) {
+                    style.grid_column.start = line;
+                }
+            }
+            "grid-column-end" => {
+                if let Some(line) = parse_grid_line(value) {
+                    style.grid_column.end = line;
+                }
+            }
+            "grid-row-start" => {
+                if let Some(line) = parse_grid_line(value) {
+                    style.grid_row.start = line;
+                }
+            }
+            "grid-row-end" => {
+                if let Some(line) = parse_grid_line(value) {
+                    style.grid_row.end = line;
+                }
             }
             "gap" => {
                 if let Some(gap) = parse_gap_em(value, style.font_size) {
@@ -5384,6 +6197,9 @@ fn absolute_length_parts(value: &str, font_size: f32) -> Option<(f32, f32)> {
 /// `rem`, `pt`, `pc`, `%` o una expresión `calc()` de longitudes.
 fn parse_dimension_em(value: &str, font_size: f32) -> Option<Length> {
     let value = value.trim();
+    if let Some((kind, args)) = strip_length_function(value) {
+        return parse_length_function(kind, args, font_size);
+    }
     if let Some(expression) = strip_calc(value) {
         return parse_calc_expression(expression, font_size);
     }
@@ -5397,6 +6213,54 @@ fn parse_dimension_em(value: &str, font_size: f32) -> Option<Length> {
         return (percent.is_finite() && percent >= 0.0).then_some(Length::Percent(percent));
     }
     parse_absolute_length(value, font_size).map(Length::Px)
+}
+
+/// `min(...)`, `max(...)` o `clamp(...)`: devuelve el tipo de función y sus
+/// argumentos sin los paréntesis exteriores.
+fn strip_length_function(value: &str) -> Option<(LengthFunction, &str)> {
+    let value = value.trim();
+    let inner = value.strip_suffix(')')?;
+    let open = inner.find('(')?;
+    let name = inner[..open].trim();
+    let kind = if name.eq_ignore_ascii_case("min") {
+        LengthFunction::Min
+    } else if name.eq_ignore_ascii_case("max") {
+        LengthFunction::Max
+    } else if name.eq_ignore_ascii_case("clamp") {
+        LengthFunction::Clamp
+    } else {
+        return None;
+    };
+    Some((kind, &inner[open + 1..]))
+}
+
+/// `min(a, b)`, `max(a, b, c)` y `clamp(min, val, max)` con argumentos que
+/// pueden ser longitudes, porcentajes, `calc()` o funciones anidadas.
+fn parse_length_function(kind: LengthFunction, args: &str, font_size: f32) -> Option<Length> {
+    let parts = split_top_level_commas(args);
+    let count = match kind {
+        LengthFunction::Clamp if parts.len() == 3 => 3,
+        LengthFunction::Min | LengthFunction::Max if parts.len() == 2 => 2,
+        LengthFunction::Min | LengthFunction::Max if parts.len() == 3 => 3,
+        _ => return None,
+    };
+    let mut values = [[0.0f32; 2]; 3];
+    for (index, part) in parts.iter().take(count).enumerate() {
+        let length = parse_dimension_em(part.trim(), font_size)?;
+        // Anidar una función que dependa del contenedor no es representable
+        // con coeficientes lineales; se descarta la declaración, como haría
+        // un navegador con un valor no soportado.
+        if matches!(length, Length::Function { .. }) && !length.is_absolute() {
+            return None;
+        }
+        let (px, percent) = length_components(length);
+        values[index] = [px, percent];
+    }
+    Some(Length::Function {
+        kind,
+        count: count as u8,
+        args: values,
+    })
 }
 
 fn strip_calc(value: &str) -> Option<&str> {
@@ -5436,6 +6300,10 @@ fn length_components(length: Length) -> (f32, f32) {
         Length::Px(px) => (px, 0.0),
         Length::Percent(percent) => (0.0, percent),
         Length::Sum { px, percent } => (px, percent),
+        // Una función dependiente del contenedor no se puede plegar a una
+        // combinación lineal; el parser sólo la admite dentro de `calc()`
+        // cuando es absoluta, así que aquí siempre es plegable.
+        Length::Function { .. } => (length.resolve(0.0), 0.0),
     }
 }
 
@@ -5721,9 +6589,57 @@ mod tests {
                 PaintCommand::FillRect { .. }
                 | PaintCommand::Image { .. }
                 | PaintCommand::StrokeRect { .. }
-                | PaintCommand::BackgroundImage { .. } => None,
+                | PaintCommand::BackgroundImage { .. }
+                | PaintCommand::Clip { .. }
+                | PaintCommand::ClipEnd => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn overflow_hidden_emits_a_clip_region() {
+        let document = layout_html(
+            r#"<div style="width:200px;height:100px;overflow:hidden"><div style="height:400px"></div></div>"#,
+            640.0,
+        )
+        .unwrap();
+        let clips = document
+            .commands
+            .iter()
+            .filter(|command| matches!(command, PaintCommand::Clip { .. }))
+            .count();
+        let ends = document
+            .commands
+            .iter()
+            .filter(|command| matches!(command, PaintCommand::ClipEnd))
+            .count();
+        assert_eq!((clips, ends), (1, 1));
+        let Some(PaintCommand::Clip { rect }) = document
+            .commands
+            .iter()
+            .find(|command| matches!(command, PaintCommand::Clip { .. }))
+        else {
+            panic!("expected a clip command");
+        };
+        assert_eq!((rect.width, rect.height), (200.0, 100.0));
+    }
+
+    #[test]
+    fn css_min_max_and_clamp_resolve_against_the_container() {
+        let document = layout_html(
+            r#"<div style="width:min(100%,400px);height:10px;background:#010101"></div><div style="width:clamp(100px,50%,300px);height:10px;background:#020202"></div><div style="width:max(200px,10%);height:10px;background:#030303"></div>"#,
+            640.0,
+        )
+        .unwrap();
+        let widths: Vec<f32> = document
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                PaintCommand::FillRect { rect, .. } if rect.height == 10.0 => Some(rect.width),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(widths, vec![400.0, 300.0, 200.0]);
     }
 
     #[test]
@@ -5968,6 +6884,161 @@ mod tests {
     fn wisp_network_loader_rejects_non_web_schemes_and_url_credentials() {
         assert!(fetch_url("file:///C:/private.html").is_err());
         assert!(fetch_url("https://user:password@example.com/").is_err());
+    }
+
+    #[test]
+    fn page_scripts_can_fetch_and_xhr_data_from_the_same_origin() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let mut served = 0usize;
+            while served < 3 && std::time::Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(_) => {
+                        thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                };
+                served += 1;
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]).to_string();
+                let (content_type, body) = if request.starts_with("GET /data.json ") {
+                    ("application/json", r#"{"message":"desde fetch"}"#)
+                } else if request.starts_with("GET /xhr.json ") {
+                    ("application/json", r#"{"message":"desde xhr"}"#)
+                } else {
+                    (
+                        "text/html; charset=utf-8",
+                        r#"<html><body><p id="a">inicio</p><p id="b">inicio</p><script>
+fetch("/data.json").then(function (response) { return response.json(); }).then(function (data) {
+  document.getElementById("a").textContent = data.message;
+});
+var xhr = new XMLHttpRequest();
+xhr.open("GET", "/xhr.json");
+xhr.onload = function () {
+  document.getElementById("b").textContent = JSON.parse(xhr.responseText).message;
+};
+xhr.send();
+</script></body></html>"#,
+                    )
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            }
+        });
+
+        let page = fetch_url(&format!("http://{address}/")).unwrap();
+        let layout = page.layout(800.0).unwrap();
+        server.join().unwrap();
+        let texts = text_commands(&layout).join(" ");
+        assert!(
+            texts.contains("desde fetch"),
+            "textos: {texts} / avisos: {:?}",
+            layout.warnings
+        );
+        assert!(
+            texts.contains("desde xhr"),
+            "textos: {texts} / avisos: {:?}",
+            layout.warnings
+        );
+    }
+
+    #[test]
+    fn cross_origin_fetch_blocked_by_cors_reports_the_reason() {
+        let page_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let page_address = page_listener.local_addr().unwrap();
+        let data_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let data_address = data_listener.local_addr().unwrap();
+        page_listener.set_nonblocking(true).unwrap();
+        data_listener.set_nonblocking(true).unwrap();
+
+        // El servidor de datos responde SIN Access-Control-Allow-Origin.
+        let data_server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while std::time::Instant::now() < deadline {
+                let (mut stream, _) = match data_listener.accept() {
+                    Ok(connection) => connection,
+                    Err(_) => {
+                        thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0; 1024];
+                let _ = stream.read(&mut request);
+                let body = r#"{"ok":1}"#;
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+                break;
+            }
+        });
+
+        let html = format!(
+            r#"<p id="a">inicio</p><script>
+fetch("http://{data_address}/data.json").then(function () {{
+  document.getElementById("a").textContent = "sin bloqueo";
+}}).catch(function (error) {{
+  document.getElementById("a").textContent = error.message;
+}});
+</script>"#
+        );
+        let page_server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while std::time::Instant::now() < deadline {
+                let (mut stream, _) = match page_listener.accept() {
+                    Ok(connection) => connection,
+                    Err(_) => {
+                        thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut request = [0; 2048];
+                let _ = stream.read(&mut request);
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    html.len(),
+                    html
+                )
+                .unwrap();
+                break;
+            }
+        });
+
+        let page = fetch_url(&format!("http://{page_address}/")).unwrap();
+        let layout = page.layout(800.0).unwrap();
+        page_server.join().unwrap();
+        data_server.join().unwrap();
+        let texts = text_commands(&layout).join(" ");
+        assert!(
+            texts.contains("CORS bloqueó"),
+            "textos: {texts} / avisos: {:?}",
+            layout.warnings
+        );
+        assert!(
+            layout
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("fetch(): CORS")),
+            "avisos: {:?}",
+            layout.warnings
+        );
     }
 
     #[test]
@@ -6330,7 +7401,9 @@ mod tests {
                 PaintCommand::FillRect { .. }
                 | PaintCommand::Image { .. }
                 | PaintCommand::StrokeRect { .. }
-                | PaintCommand::BackgroundImage { .. } => None,
+                | PaintCommand::BackgroundImage { .. }
+                | PaintCommand::Clip { .. }
+                | PaintCommand::ClipEnd => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(positions.len(), 2);
@@ -6346,7 +7419,9 @@ mod tests {
                 PaintCommand::FillRect { .. }
                 | PaintCommand::Image { .. }
                 | PaintCommand::StrokeRect { .. }
-                | PaintCommand::BackgroundImage { .. } => None,
+                | PaintCommand::BackgroundImage { .. }
+                | PaintCommand::Clip { .. }
+                | PaintCommand::ClipEnd => None,
             })
             .collect()
     }

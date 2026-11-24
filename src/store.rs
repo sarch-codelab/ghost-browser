@@ -301,19 +301,19 @@ impl Store {
 
     pub fn add_history(&mut self, url: String, title: String) {
         // Evita duplicar la misma URL consecutiva.
-        if let Some(last) = self.history.last() {
-            if last.url == url {
-                if last.title.is_empty() && !title.is_empty() {
-                    let mut last = last.clone();
-                    last.title = title;
-                    last.timestamp = now_secs();
-                    if let Some(slot) = self.history.last_mut() {
-                        *slot = last;
-                    }
-                    self.mark_dirty();
+        if let Some(last) = self.history.last()
+            && last.url == url
+        {
+            if last.title.is_empty() && !title.is_empty() {
+                let mut last = last.clone();
+                last.title = title;
+                last.timestamp = now_secs();
+                if let Some(slot) = self.history.last_mut() {
+                    *slot = last;
                 }
-                return;
+                self.mark_dirty();
             }
+            return;
         }
         self.history.push(HistoryEntry {
             url,
@@ -348,6 +348,13 @@ impl Store {
     }
 }
 
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,11 +380,4 @@ mod tests {
         assert_eq!(tab.engine, BrowserEngine::WebView2);
         assert_eq!(store.settings.default_engine, BrowserEngine::WebView2);
     }
-}
-
-pub fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

@@ -271,13 +271,8 @@ fn tool_definitions() -> Value {
 }
 
 fn handle_request(request: &Value) -> Option<Value> {
-    let id = request.get("id").cloned();
+    let id = request.get("id").cloned()?;
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-    // Notificaciones (sin id) no llevan respuesta.
-    if id.is_none() {
-        return None;
-    }
-    let id = id.unwrap();
     let result = match method {
         "initialize" => {
             let version = request

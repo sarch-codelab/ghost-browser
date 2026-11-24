@@ -4,6 +4,28 @@ Todos los cambios notables de Ghost Browser se documentan aquí.
 El formato sigue [Keep a Changelog](https://keepachangelog.com/es/1.1.0/) y
 el proyecto usa [Versionado Semántico](https://semver.org/lang/es/).
 
+## [Sin publicar]
+
+### Añadido
+- **Buscar en la página** (`Ctrl+F`): barra propia con recuento exacto,
+  resaltado de todas las coincidencias y salto entre ellas (Enter,
+  Shift+Enter o botones), sin ocultar el contenido. Distingue «Buscando…» de
+  «sin coincidencias» cuando la página aún no respondió y repite la búsqueda
+  al terminar de cargar. En Wisp cuenta sobre el texto maquetado, resalta todas
+  las coincidencias, marca la actual y desplaza la vista hasta ella.
+- **Motor de búsqueda configurable** (Ajustes → Búsqueda): DuckDuckGo, Google,
+  Bing, Brave Search, Startpage o Ecosia. Lo usan la barra de direcciones y la
+  página de inicio.
+- **Borrado de datos** (Ajustes → Datos): la caché del navegador completo, y
+  las cookies o todos los datos del sitio de la pestaña activa, vía Chrome
+  DevTools Protocol.
+
+### Corregido
+- Los botones de borrado de historial por período (24 h / 7 días) y de
+  caché/cookies ya no son marcadores de posición: hacen lo que prometen.
+- La página de inicio `ghost://newtab` envía la consulta cruda a Ghost en vez
+  de construir una URL fija de DuckDuckGo, así respeta el motor elegido.
+
 ## [0.1.2] - 2026-11-17
 
 ### Añadido
