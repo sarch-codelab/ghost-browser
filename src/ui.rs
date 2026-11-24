@@ -1854,10 +1854,25 @@ fn draw_panels(ctx: &egui::Context, app: &mut Browser, p: &Palette) {
                 .active_tab()
                 .map(|tab| tab.display_title())
                 .unwrap_or_default();
+            // Los ajustes de «Modo lectura» (tamaño, fuente y colores) se
+            // guardaban pero no se aplicaban nunca: el panel los ignora.
+            let reader_settings = app.store.settings.clone();
+            let reader_size = reader_settings.reader_font_size.clamp(8, 32) as f32;
+            let reader_family = if reader_settings.reader_font_family == "mono" {
+                egui::FontFamily::Monospace
+            } else {
+                egui::FontFamily::Proportional
+            };
+            let reader_color = parse_hex_color(&reader_settings.reader_text_color);
+            let reader_bg = parse_hex_color(&reader_settings.reader_bg_color);
             let mut close = false;
             let mut copied = false;
 
             panel_window("panel_reader", "Lectura", vec2(560.0, 520.0), p).show(ctx, |ui| {
+                if let Some(bg) = reader_bg {
+                    ui.painter()
+                        .rect_filled(ui.max_rect(), egui::CornerRadius::same(6), bg);
+                }
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&title).size(13.0).strong().color(p.text));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1875,9 +1890,13 @@ fn draw_panels(ctx: &egui::Context, app: &mut Browser, p: &Palette) {
                     .show(ui, |ui| match &reader {
                         Some(text) => {
                             ui.add(
-                                egui::Label::new(RichText::new(text).size(13.0).color(p.text))
-                                    .selectable(true)
-                                    .wrap(),
+                                egui::Label::new(
+                                    RichText::new(text)
+                                        .font(FontId::new(reader_size, reader_family))
+                                        .color(reader_color.unwrap_or(p.text)),
+                                )
+                                .selectable(true)
+                                .wrap(),
                             );
                         }
                         None => {
@@ -2162,44 +2181,32 @@ fn draw_panels(ctx: &egui::Context, app: &mut Browser, p: &Palette) {
                 );
 
                 section(ui, p, "Datos");
-                ui.label(RichText::new("Gestión de datos y caché").size(12.0).color(p.text));
-                if ui.button("Ver tamaño de caché").clicked() {
-                    // TODO: Implementar cálculo de tamaño de caché
+                ui.label(RichText::new("Caché y cookies").size(12.0).color(p.text));
+                if ui
+                    .button("Borrar caché, cookies y datos de todos los sitios")
+                    .clicked()
+                {
+                    clear_data = true;
                 }
-                if ui.button("Borrar caché del sitio actual").clicked() {
-                    // TODO: Implementar borrado de caché por sitio
-                }
-                if ui.button("Ver cookies del sitio actual").clicked() {
-                    // TODO: Implementar visor de cookies
-                }
-                if ui.button("Borrar cookies del sitio actual").clicked() {
-                    // TODO: Implementar borrado de cookies por sitio
-                }
+                ui.label(
+                    RichText::new("Requiere una pestaña con WebView2 activa.")
+                        .size(11.0)
+                        .color(p.muted),
+                );
 
                 section(ui, p, "Historial");
                 ui.label(RichText::new("Gestión del historial de navegación").size(12.0).color(p.text));
                 ui.horizontal(|ui| {
                     if ui.button("Borrar últimas 24h").clicked() {
-                        // TODO: Implementar borrado por período
+                        app.store.clear_history_since(24 * 60 * 60);
                     }
-                    if ui.button("Borrar últimas 7 días").clicked() {
-                        // TODO: Implementar borrado por período
+                    if ui.button("Borrar últimos 7 días").clicked() {
+                        app.store.clear_history_since(7 * 24 * 60 * 60);
                     }
                     if ui.button("Borrar todo el historial").clicked() {
                         app.store.clear_history();
-                        changed = true;
                     }
                 });
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut s.home_page)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("ghost://newtab"),
-                    )
-                    .changed()
-                {
-                    changed = true;
-                }
 
                 section(ui, p, "Descargas");
                 let mut dir = s.download_dir.clone().unwrap_or_default();

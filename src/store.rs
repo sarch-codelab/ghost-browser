@@ -341,6 +341,14 @@ impl Store {
         self.mark_dirty();
     }
 
+    /// Borra las entradas más recientes que `secs` segundos: usado por los
+    /// botones de «últimas 24 h» y «últimos 7 días».
+    pub fn clear_history_since(&mut self, secs: u64) {
+        let cutoff = now_secs().saturating_sub(secs);
+        self.history.retain(|entry| entry.timestamp < cutoff);
+        self.mark_dirty();
+    }
+
     pub fn recent_history(&self, limit: usize) -> Vec<&HistoryEntry> {
         self.history.iter().rev().take(limit).collect()
     }
