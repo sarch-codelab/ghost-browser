@@ -732,7 +732,12 @@ fn generate_js_bindings(interfaces: &[InterfaceDef]) -> String {
             writeln!(js, "  link(\"{}\", \"{}\");", iface.name, parent).unwrap();
         }
         if !iface.constants.is_empty() {
-            writeln!(js, "  if (typeof g[\"{}\"] === \"function\") {{", iface.name).unwrap();
+            writeln!(
+                js,
+                "  if (typeof g[\"{}\"] === \"function\") {{",
+                iface.name
+            )
+            .unwrap();
             for c in &iface.constants {
                 writeln!(
                     js,

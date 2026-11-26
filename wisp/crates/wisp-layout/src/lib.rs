@@ -214,7 +214,14 @@ pub struct LineBox {
 pub fn layout_tree(root: &LayoutNode, available_width: f32) -> LayoutState {
     let mut state = LayoutState::default();
     let mut next_anon_id = 1_000_000usize;
-    layout_block(root, 0.0, 0.0, available_width, &mut next_anon_id, &mut state);
+    layout_block(
+        root,
+        0.0,
+        0.0,
+        available_width,
+        &mut next_anon_id,
+        &mut state,
+    );
     state
 }
 
@@ -376,8 +383,14 @@ fn layout_table_children(
 ) -> f32 {
     let mut y = content_y;
     for row in rows {
-        let row_h =
-            layout_flex_children(&row.children, content_x, y, content_width, next_anon_id, state);
+        let row_h = layout_flex_children(
+            &row.children,
+            content_x,
+            y,
+            content_width,
+            next_anon_id,
+            state,
+        );
         y += row_h;
     }
     (y - content_y).max(0.0)

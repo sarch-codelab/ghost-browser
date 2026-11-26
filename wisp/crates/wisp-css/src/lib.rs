@@ -716,11 +716,7 @@ fn eval_calc_expr(expr: &str, font_size: f32, container_px: Option<f32>) -> Opti
     let tokens = tokenize_calc(expr)?;
     let mut pos = 0usize;
     let val = parse_add_sub(&tokens, &mut pos, font_size, container_px)?;
-    if pos == tokens.len() {
-        Some(val)
-    } else {
-        None
-    }
+    if pos == tokens.len() { Some(val) } else { None }
 }
 
 #[derive(Debug, Clone)]

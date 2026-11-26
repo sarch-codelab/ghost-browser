@@ -381,7 +381,9 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
                     result["target"] = el.to_json();
                     return result;
                 }
-                if el.role == "button" && let Some(href) = el.href.as_deref() {
+                if let Some(href) = el.href.as_deref()
+                    && el.role == "button"
+                {
                     let note = format!("botón sin navegación ({href})");
                     return json!({"ok": true, "target": el.to_json(), "note": note});
                 }

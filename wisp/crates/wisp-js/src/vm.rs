@@ -345,7 +345,8 @@ impl Parser {
         if self.eat(expected) {
             Ok(())
         } else {
-            Err(format!("se esperaba `{expected:?}`, se encontró `{:?}`", self.peek()))
+            let got = self.peek();
+            Err(format!("se esperaba `{expected:?}`, se encontró `{got:?}`"))
         }
     }
 
@@ -847,9 +848,9 @@ fn exec_chunk(
             }
             Op::Store(name) => {
                 let val = stack.last().cloned().unwrap_or(JsVal::Undefined);
-                if locals.contains_key(name)
-                    || (!locals.is_empty() && !globals.contains_key(name))
-                {
+                let in_locals = locals.contains_key(name);
+                let new_local = !locals.is_empty() && !globals.contains_key(name);
+                if in_locals || new_local {
                     locals.insert(name.clone(), val);
                 } else {
                     globals.insert(name.clone(), val);

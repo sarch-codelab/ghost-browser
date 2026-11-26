@@ -44,11 +44,12 @@ impl Origin {
         }
         // `host[:port][/...]`: el host termina en `/`, `?`, `#` o `:`.
         let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let default_port = if scheme == "https" { 443 } else { 80 };
         let (host, port) = match authority.rsplit_once(':') {
             Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => {
-                (host, port.parse::<u16>().unwrap_or(if scheme == "https" { 443 } else { 80 }))
+                (host, port.parse::<u16>().unwrap_or(default_port))
             }
-            _ => (authority, if scheme == "https" { 443 } else { 80 }),
+            _ => (authority, default_port),
         };
         if host.is_empty() {
             return Origin::Opaque;
