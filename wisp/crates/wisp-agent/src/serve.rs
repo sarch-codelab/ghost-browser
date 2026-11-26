@@ -967,9 +967,18 @@ fn fill_control(tab: &mut Tab, ref_id: Option<&str>, name: Option<&str>, value: 
     };
     let q_name = serde_json::to_string(&field_name).unwrap_or_else(|_| "\"\"".into());
     let q_val = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into());
-    let js = format!(
-        "(function(){{ var el = document.querySelector('[name=' + {q_name} + ']') || document.getElementById({q_name}); if (!el) return false; el.value = {q_val}; el.setAttribute('value', {q_val}); return true; }})()"
-    );
+    let js = [
+        "(function(){ var el = document.querySelector('[name=' + ",
+        &q_name,
+        " + ']') || document.getElementById(",
+        &q_name,
+        "); if (!el) return false; el.value = ",
+        &q_val,
+        "; el.setAttribute('value', ",
+        &q_val,
+        "); return true; })()",
+    ]
+    .concat();
     match page.eval_js(&js) {
         Ok(res) => {
             if let Some(mutated_html) = res.html {
