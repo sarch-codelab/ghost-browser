@@ -86,8 +86,10 @@ impl Drop for Host {
 }
 
 fn spawn_host(binary: &Path, port: u16) -> Host {
+    let port_str = port.to_string();
+    let args = ["serve", "--port", &port_str, "--allow-private-network"];
     let child = Command::new(binary)
-        .args(["serve", "--port", &port.to_string(), "--allow-private-network"])
+        .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -290,7 +292,8 @@ fn the_mcp_bridge_drives_wisp_agent_over_stdio() {
 
     // Snapshot accesible con referencias `@e1` antes de clicar.
     let snap = bridge.tool("browser_snapshot", json!({"tab_id": tab_id}));
-    assert_eq!(snap.get("ok").and_then(Value::as_bool), Some(true), "{snap}");
+    let snap_ok = snap.get("ok").and_then(Value::as_bool);
+    assert_eq!(snap_ok, Some(true), "{snap}");
     assert_eq!(
         snap.pointer("/refs/0/ref").and_then(Value::as_str),
         Some("@e1"),

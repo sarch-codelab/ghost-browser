@@ -158,9 +158,7 @@ where
     }
 
     if !policy.allow_private_network && host_clean.eq_ignore_ascii_case("localhost") {
-        return Err(
-            "SSRF bloqueado: `localhost` requiere --allow-private-network".into(),
-        );
+        return Err("SSRF bloqueado: `localhost` requiere --allow-private-network".into());
     }
 
     let addrs = resolve(host_clean, port)?;

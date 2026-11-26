@@ -668,14 +668,7 @@ impl FetchedPage {
                     .map(|(_, rect)| *rect)
             });
 
-            let centrality = compute_centrality(
-                &role,
-                rect,
-                center_x,
-                center_y,
-                viewport_width,
-                idx,
-            );
+            let centrality = compute_centrality(&role, rect, center_x, center_y, viewport_width, idx);
 
             elements.push(SnapshotElement {
                 ref_id: format!("@e{}", elements.len() + 1),
@@ -4320,7 +4313,15 @@ fn layout_absolute_child(
             measure_only: true,
             measure_cache: ctx.measure_cache,
         };
-        layout_block(child, x, 0.0, width, parent_style, depth + 1, &mut measure_ctx)?
+        layout_block(
+            child,
+            x,
+            0.0,
+            width,
+            parent_style,
+            depth + 1,
+            &mut measure_ctx,
+        )?
     };
     let y = match (top, bottom) {
         (Some(top), _) => bounds.y + top,

@@ -189,13 +189,9 @@ impl StyleComputer {
                     entry.origin as u8
                 }
             };
-            (
-                a.important,
-                origin_rank(a),
-                a.specificity,
-                a.order,
-            )
-                .cmp(&(b.important, origin_rank(b), b.specificity, b.order))
+            let key_a = (a.important, origin_rank(a), a.specificity, a.order);
+            let key_b = (b.important, origin_rank(b), b.specificity, b.order);
+            key_a.cmp(&key_b)
         });
 
         let mut resolved = HashMap::new();
@@ -468,9 +464,11 @@ mod tests {
         };
 
         let candidates = computer.candidate_indices(&child);
-        assert!(candidates.len() < 20, "solo se inspeccionan los buckets del nodo");
+        let count = candidates.len();
+        assert!(count < 20, "solo buckets del nodo ({count})");
         let decls = computer.resolve_declarations(&child, "");
-        assert_eq!(decls.get("color").map(|d| d.value.as_str()), Some("#123456"));
+        let color = decls.get("color").map(|d| d.value.as_str());
+        assert_eq!(color, Some("#123456"));
     }
 
     #[test]
