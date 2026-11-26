@@ -345,7 +345,11 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             }
         }
         Route::Eval(tab_id) => {
-            let js = request.body.get("js").and_then(Value::as_str).unwrap_or("");
+            let js = request
+                .body
+                .get("js")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if js.is_empty() {
                 return json!({"ok": false, "error": "falta 'js'"});
             }

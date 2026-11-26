@@ -45,7 +45,9 @@ pub fn render_pdf(title: &str, document: &LayoutDocument) -> Vec<u8> {
     // Obj 1: Catalog
     objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
     // Obj 2: Pages (kids = 4, 6, 8...)
-    let kids: Vec<String> = (0..page_count).map(|i| format!("{} 0 R", 4 + i * 2)).collect();
+    let kids: Vec<String> = (0..page_count)
+        .map(|i| format!("{} 0 R", 4 + i * 2))
+        .collect();
     let pages_obj = format!(
         "<< /Type /Pages /Kids [{}] /Count {} >>",
         kids.join(" "),

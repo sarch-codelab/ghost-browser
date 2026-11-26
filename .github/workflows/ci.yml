@@ -78,7 +78,7 @@ jobs:
         run: |
           if ! out=$(cargo fmt --all -- --check 2>&1); then
             printf '%s\n' "$out"
-            printf '%s\n' "$out" | grep -E '^(Diff in|[+-])' | head -n 8 | while IFS= read -r line; do
+            printf '%s\n' "$out" | grep '^Diff in ' | head -n 8 | while IFS= read -r line; do
               echo "::error::$line"
             done
             exit 1
@@ -88,17 +88,31 @@ jobs:
         run: |
           if ! out=$(cargo fmt --manifest-path wisp/Cargo.toml --all -- --check 2>&1); then
             printf '%s\n' "$out"
-            printf '%s\n' "$out" | grep -E '^(Diff in|[+-])' | head -n 8 | while IFS= read -r line; do
+            printf '%s\n' "$out" | grep '^Diff in ' | head -n 8 | while IFS= read -r line; do
               echo "::error::$line"
             done
             exit 1
           fi
 
       - name: Clippy (root)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: |
+          if ! out=$(cargo clippy --all-targets --all-features -- -D warnings 2>&1); then
+            printf '%s\n' "$out"
+            printf '%s\n' "$out" | grep -E '^(error| --> )' | head -n 8 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          fi
 
       - name: Clippy (wisp)
-        run: cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+        run: |
+          if ! out=$(cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features -- -D warnings 2>&1); then
+            printf '%s\n' "$out"
+            printf '%s\n' "$out" | grep -E '^(error| --> )' | head -n 8 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          fi
 
       - name: Build (root)
         run: cargo build --release --locked
