@@ -2254,14 +2254,8 @@ impl HostBridge for NativeDomHost<'_> {
                         ("top".to_owned(), JsVal::Number(geom.y as f64)),
                         ("width".to_owned(), JsVal::Number(geom.width as f64)),
                         ("height".to_owned(), JsVal::Number(geom.height as f64)),
-                        (
-                            "right".to_owned(),
-                            JsVal::Number((geom.x + geom.width) as f64),
-                        ),
-                        (
-                            "bottom".to_owned(),
-                            JsVal::Number((geom.y + geom.height) as f64),
-                        ),
+                        ("right".to_owned(), JsVal::Number((geom.x + geom.width) as f64)),
+                        ("bottom".to_owned(), JsVal::Number((geom.y + geom.height) as f64)),
                     ]));
                     Ok(rect)
                 }

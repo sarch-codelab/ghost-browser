@@ -2747,10 +2747,7 @@ impl VmRuntime {
             ("__wispType".to_owned(), JsVal::Str("RegExp".to_owned())),
             ("source".to_owned(), JsVal::Str(pat.to_owned())),
             ("flags".to_owned(), JsVal::Str(flags.to_owned())),
-            (
-                "ignoreCase".to_owned(),
-                JsVal::Bool(flags.contains('i')),
-            ),
+            ("ignoreCase".to_owned(), JsVal::Bool(flags.contains('i'))),
             ("global".to_owned(), JsVal::Bool(flags.contains('g'))),
         ]))
     }
@@ -2807,10 +2804,7 @@ impl VmRuntime {
                 let idx = self.maps.len();
                 self.maps.push(pairs);
                 Some(Ok(self.alloc_object(HashMap::from([
-                    (
-                        "__wispType".to_owned(),
-                        JsVal::Str("URLSearchParams".to_owned()),
-                    ),
+                    ("__wispType".to_owned(), JsVal::Str("URLSearchParams".to_owned())),
                     ("__wispIdx".to_owned(), JsVal::Number(idx as f64)),
                 ]))))
             }
@@ -3637,10 +3631,7 @@ fn pct_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         if b.is_ascii_alphanumeric()
-            || matches!(
-                b,
-                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
-            )
+            || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')')
         {
             out.push(*b as char);
         } else {

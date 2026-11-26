@@ -1758,10 +1758,7 @@ mod tests {
             body: Value::Null,
         };
         let version = handle_cdp_discovery(&version_req, &state).expect("version");
-        assert_eq!(
-            version["webSocketDebuggerUrl"],
-            "ws://127.0.0.1:49123/devtools/browser/wisp"
-        );
+        assert_eq!(version["webSocketDebuggerUrl"], "ws://127.0.0.1:49123/devtools/browser/wisp");
 
         let list_req = control::Request {
             method: "GET".into(),
@@ -1844,7 +1841,11 @@ mod tests {
         assert!(head.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
 
         // Send masked Runtime.evaluate frame
-        let msg = br#"{"id":7,"method":"Runtime.evaluate","params":{"expression":"document.getElementById('h').textContent"}}"#;
+        let msg = concat!(
+            r#"{"id":7,"method":"Runtime.evaluate","#,
+            r#""params":{"expression":"document.getElementById('h').textContent"}}"#
+        )
+        .as_bytes();
         let mask = [1u8, 2, 3, 4];
         let mut frame = vec![0x81, 0x80 | (msg.len() as u8)];
         frame.extend_from_slice(&mask);

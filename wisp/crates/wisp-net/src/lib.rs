@@ -278,7 +278,9 @@ impl StealthProfile {
             user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             accept_language: "en-US,en;q=0.9,es;q=0.8",
-            sec_ch_ua: Some("\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\""),
+            sec_ch_ua: Some(
+                "\"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"",
+            ),
             sec_ch_ua_mobile: Some("?0"),
             sec_ch_ua_platform: Some("\"Windows\""),
             sec_fetch_dest: Some("document"),
@@ -682,9 +684,7 @@ mod tests {
 
     #[test]
     fn tracker_blocker_matches_exact_and_subdomains() {
-        assert!(is_tracker_url(
-            "https://www.google-analytics.com/analytics.js"
-        ));
+        assert!(is_tracker_url("https://www.google-analytics.com/analytics.js"));
         assert!(is_tracker_url("https://doubleclick.net/pixel"));
         assert!(!is_tracker_url("https://example.com/?ref=doubleclick.net"));
     }

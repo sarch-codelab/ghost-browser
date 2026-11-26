@@ -4725,10 +4725,7 @@ fn layout_block(
                     PositionKind::Absolute => "absolute",
                 }
                 .to_owned(),
-                color: format!(
-                    "rgb({}, {}, {})",
-                    style.color.r, style.color.g, style.color.b
-                ),
+                color: format!("rgb({}, {}, {})", style.color.r, style.color.g, style.color.b),
                 background_color: match style.background {
                     Some(bg) => format!("rgba({}, {}, {}, {})", bg.r, bg.g, bg.b, bg.a),
                     None => "rgba(0, 0, 0, 0)".to_owned(),
