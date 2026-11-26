@@ -31,3 +31,14 @@ wisp-layout = { path = "crates/wisp-layout" }
 wisp-net = { path = "crates/wisp-net" }
 wisp-paint = { path = "crates/wisp-paint" }
 wisp-style = { path = "crates/wisp-style" }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
+opt-level = 1
+
+[profile.test]
+debug = "line-tables-only"
+

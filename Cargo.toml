@@ -42,3 +42,14 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
 ] }
 windows-core = "0.62"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
+opt-level = 1
+
+[profile.test]
+debug = "line-tables-only"
+

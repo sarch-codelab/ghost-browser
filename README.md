@@ -146,24 +146,26 @@ entorno `GHOST_REMOTE_PORT`.
 | Método y ruta | Acción |
 | --- | --- |
 | `GET /health` | Comprueba que la API responde |
-| `GET /tabs` | Lista pestañas: id, título, url, motor, estado |
+| `GET /tabs` (`?engine=wisp`) | Lista pestañas: id, título, url, motor, estado (`?engine=wisp` filtra solo pestañas Wisp) |
 | `POST /tabs` | `{"url": "..."}` abre una pestaña nueva |
-| `POST /tabs/{id}/navigate` | `{"url": "..."}` navega la pestaña |
-| `POST /tabs/{id}/back` `/forward` `/reload` `/close` `/activate` | Acciones de historial y gestión |
-| `POST /tabs/{id}/eval` | `{"js": "..."}` ejecuta JS (WebView2 por IPC o Wisp vía `eval_js`) y devuelve el resultado |
-| `POST /tabs/{id}/text` | Texto legible de la página (reader en Wisp, `innerText` en WebView2) |
-| `POST /tabs/{id}/snapshot` | `{"width"?}` snapshot accesible con referencias estables `@e1`, `@e2`…, rol y centralidad |
-| `POST /tabs/{id}/click` | `{"ref"?,"x"?,"y"?,"button"?,"clicks"?}` clic por `@ref` o coordenadas CSS |
-| `POST /tabs/{id}/fill` / `select_option` | `{"ref"?,"name"?,"value"}` rellena o selecciona un control del formulario |
-| `POST /tabs/{id}/type` | `{"ref"?,"text": "..."}` inserta texto en el foco o `@ref` |
-| `POST /tabs/{id}/press` | `{"key": "enter"}` pulsa una tecla (enter, tab, esc, flechas, etc.) |
-| `POST /tabs/{id}/scroll` | `{"deltaX","deltaY","x"?,"y"?}` rueda del ratón |
-| `POST /tabs/{id}/move` | `{"x","y"}` mueve el cursor o resuelve el enlace bajo `(x, y)` |
-| `POST /tabs/{id}/wait_for` | `{"text"?}` espera/comprueba la presencia de texto |
-| `GET /tabs/{id}/network` / `console` / `events` | Registro de red, mensajes de consola y eventos CDP |
-| `POST /tabs/{id}/cdp` | `{"method","params"}` método CDP (WebView2 nativo o dispatcher headless en `wisp-agent`, incl. `LP.getMarkdown`) |
-| `POST /tabs/{id}/screenshot` | `{"path"?}` captura PNG (WebView2 `CapturePreview` o rasterizador de `wisp-agent`) |
-| `POST /tabs/{id}/pdf` | `{"path"?}` exporta la página actual a PDF (`wisp-agent`) |
+| `POST /tabs/{id\|active}/navigate` | `{"url": "..."}` navega la pestaña (o la activa con `active`) |
+| `POST /tabs/{id\|active}/back` `/forward` `/reload` `/close` `/activate` | Acciones de historial y gestión |
+| `POST /tabs/{id\|active}/eval` | `{"js": "..."}` ejecuta JS (WebView2 por IPC o Wisp vía `eval_js`) y devuelve el resultado (`400` si el JSON está malformado) |
+| `POST /tabs/{id\|active}/text` | Texto legible de la página (reader en Wisp, `innerText` en WebView2) |
+| `POST /tabs/{id\|active}/snapshot` | `{"width"?}` snapshot accesible con referencias estables `@e1`, `@e2`…, rol y centralidad |
+| `POST /tabs/{id\|active}/click` | `{"ref"?,"x"?,"y"?,"button"?,"clicks"?}` clic por `@ref` o coordenadas CSS |
+| `POST /tabs/{id\|active}/fill` / `select_option` | `{"ref"?,"name"?,"value"}` rellena o selecciona un control del formulario |
+| `POST /tabs/{id\|active}/type` | `{"ref"?,"text": "..."}` inserta texto en el foco o `@ref` |
+| `POST /tabs/{id\|active}/press` | `{"key": "enter"}` pulsa una tecla (enter, tab, esc, flechas, etc.) |
+| `POST /tabs/{id\|active}/scroll` | `{"deltaX","deltaY","x"?,"y"?}` rueda del ratón |
+| `POST /tabs/{id\|active}/move` | `{"x","y"}` mueve el cursor o resuelve el enlace bajo `(x, y)` |
+| `POST /tabs/{id\|active}/wait_for` | `{"text"?}` espera/comprueba la presencia de texto |
+| `GET /tabs/{id\|active}/network` / `console` / `events` | Registro de red, mensajes de consola y eventos CDP |
+| `POST /tabs/{id\|active}/cdp` | `{"method","params"}` método CDP (WebView2 nativo o dispatcher headless en `wisp-agent`, incl. `LP.getMarkdown`) |
+| `POST /tabs/{id\|active}/screenshot` | `{"path"?}` captura PNG (WebView2 `CapturePreview` o rasterizador de `wisp-agent`) |
+| `POST /tabs/{id\|active}/pdf` | `{"path"?}` exporta la página actual a PDF (`wisp-agent`) |
+
+> Nota sobre sesiones restauradas e IDs: al arrancar Ghost, las pestañas restauradas quedan suspendidas (`suspended: true`) con IDs correlativos (`1`, `2`, ...) y con `--wisp` / `GHOST_ENGINE=wisp` pasan a Wisp salvo los sitios de `site_requires_chromium`. Para evitar depender de un ID numérico variable, usa `/tabs/active/...` o consulta primero `GET /tabs?engine=wisp`.
 
 ### `wisp-agent`: motor headless sin UI ni Chromium
 
@@ -175,14 +177,14 @@ cargo run --manifest-path wisp/Cargo.toml --release -p wisp-agent -- screenshot 
 cargo run --manifest-path wisp/Cargo.toml --release -p wisp-agent -- serve --port 47820 --workers 4
 ```
 
-Ejemplo contra la API HTTP:
+Ejemplo contra la API HTTP (usando `active` y filtro `?engine=wisp`):
 
 ```powershell
-curl http://127.0.0.1:47820/tabs
-curl -X POST http://127.0.0.1:47820/tabs/1/snapshot -d '{}'
-curl -X POST http://127.0.0.1:47820/tabs/1/eval -d '{"js":"document.title"}'
-curl -X POST http://127.0.0.1:47820/tabs/1/click -d '{"ref":"@e1"}'
-curl -X POST http://127.0.0.1:47820/tabs/1/screenshot -d '{}'
+curl "http://127.0.0.1:47820/tabs?engine=wisp"
+curl -X POST http://127.0.0.1:47820/tabs/active/snapshot -d '{}'
+curl -X POST http://127.0.0.1:47820/tabs/active/eval -d '{"js":"document.title"}'
+curl -X POST http://127.0.0.1:47820/tabs/active/click -d '{"ref":"@e1"}'
+curl -X POST http://127.0.0.1:47820/tabs/active/screenshot -d '{}'
 ```
 
 ### `wisp-mcp`: Ghost (y el motor headless) como herramienta MCP

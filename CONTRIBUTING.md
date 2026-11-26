@@ -43,6 +43,25 @@ Incluye en el issue:
 
 5. Describe en el PR el *por qué* del cambio, no solo el *qué*.
 
+## Huella de disco y `LNK1180` en Windows
+
+La raíz y `wisp/` mantienen manifiestos separados; sin configuración adicional,
+`target/` (~10,9 GB) y `wisp/target/` (~14,4 GB) pueden superar los 25 GB en
+Windows por los PDBs de `debug = 2` y causar `fatal error LNK1180`.
+
+- Ambos `Cargo.toml` fijan `[profile.dev.package."*"] debug = 0` y
+  `debug = "line-tables-only"` en el código propio para reducir la huella en
+  disco por debajo de ~6 GB.
+- Para evitar compilar `wisp-engine` y sus dependencias dos veces al alternar
+  entre raíz y `wisp/`, exporta un directorio compartido:
+
+  ```powershell
+  $env:CARGO_TARGET_DIR = "$PWD\.cargo-target"
+  ```
+
+- Si el disco queda justo, limpia artefactos previos con `cargo clean` y
+  `cargo clean --manifest-path wisp/Cargo.toml`.
+
 ## Arquitectura (mapa rápido)
 
 - `src/main.rs` — bucle de eventos winit, ventana borderless Win32, egui+wry.
