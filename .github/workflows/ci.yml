@@ -82,13 +82,14 @@ jobs:
 
       - name: Run tests (root)
         run: |
-          if ! out=$(RUST_BACKTRACE=1 cargo test --locked -- --nocapture 2>&1); then
-            bin=$(echo "$out" | grep -oE '/home/runner/work/[^ ]+/ghost-[a-f0-9]+' | head -n1 || true)
-            if [ -n "$bin" ] && [ -x "$bin" ]; then
-              bt=$(gdb -batch -ex "run" -ex "thread apply all bt" "$bin" 2>&1 || true)
-              out="$out | GDB_BT: $bt"
+          if ! out=$(RUST_BACKTRACE=1 cargo test --locked 2>&1); then
+            bin=$(find target/debug -maxdepth 5 -type f -executable -name 'ghost-*' ! -name '*.so' | head -n1 || true)
+            bt=""
+            if [ -n "$bin" ]; then
+              bt=$(gdb -batch -ex "run" -ex "thread apply all bt" "$bin" 2>&1 | tail -n 80 || true)
             fi
-            python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | "); txt=txt[-14000:]; [print("::error::" + txt[i:i+3500]) for i in range(0, len(txt), 3500)]' <<< "$out"
+            msg=$(python3 -c 'import sys; print(sys.stdin.read().replace("\n"," | ")[-3500:])' <<< "BIN=$bin | OUT=${out: -1500} | BT=$bt")
+            echo "::error::$msg"
             exit 1
           fi
 
@@ -136,9 +137,9 @@ jobs:
         run: cargo test --manifest-path wisp/Cargo.toml --workspace --locked
 
       - name: Smoke E2E (SSRF + fetch + serve API)
-        shell: bash
+        shell: pwsh
         run: |
-          python - << 'PY'
+          @'
           import http.server, json, os, socketserver, subprocess, threading, time, traceback, urllib.error, urllib.request
 
           class Handler(http.server.BaseHTTPRequestHandler):
@@ -209,31 +210,34 @@ jobs:
                       except urllib.error.HTTPError as err:
                           assert err.code == 400, err.code
                           payload = json.loads(err.read())
-                          assert "JSON inválido" in payload["error"], payload
+                          assert "JSON inv\u00e1lido" in payload["error"], payload
                   finally:
                       srv.terminate()
                       srv.wait(timeout=5)
           except Exception:
               print("::error::" + traceback.format_exc().replace("\n", " | ")[:3500])
               raise
-          PY
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Run benchmarks & update WISP_RESULTS.md
-        shell: bash
+        shell: pwsh
         run: |
-          mkdir -p target
-          cargo run --manifest-path wisp/Cargo.toml --release --locked -p wisp-benchmark -- \
-            --track all \
-            --json target/wisp-benchmark.json \
-            --md target/wisp-benchmark.md \
+          New-Item -ItemType Directory -Force -Path target | Out-Null
+          cargo run --manifest-path wisp/Cargo.toml --release --locked -p wisp-benchmark -- `
+            --track all `
+            --json target/wisp-benchmark.json `
+            --md target/wisp-benchmark.md `
             --victory-table WISP_RESULTS.md
-          python - << 'PY'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
           import json
           with open("target/wisp-benchmark.json", encoding="utf-8") as f:
               data = json.load(f)
           assert data["memory_measured"] is True, data
           assert data["rss_mb"] is not None and data["rss_mb"] > 0, data
-          PY
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload Wisp benchmark artifacts
         uses: actions/upload-artifact@v4
