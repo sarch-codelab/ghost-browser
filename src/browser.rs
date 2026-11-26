@@ -1771,7 +1771,10 @@ impl Browser {
                 self.remote_tab_snapshot(tab_id, &request.body, reply.clone())?
             }
             Route::Click(tab_id) => {
-                if self.tab_by_id(tab_id).is_some_and(|t| t.engine == BrowserEngine::Wisp) {
+                if self
+                    .tab_by_id(tab_id)
+                    .is_some_and(|t| t.engine == BrowserEngine::Wisp)
+                {
                     self.remote_wisp_click(tab_id, &request.body)
                 } else {
                     self.remote_input(tab_id, "click", &request.body)
@@ -1784,7 +1787,10 @@ impl Browser {
             Route::Press(tab_id) => self.remote_input(tab_id, "press", &request.body),
             Route::Scroll(tab_id) => self.remote_input(tab_id, "scroll", &request.body),
             Route::Move(tab_id) => {
-                if self.tab_by_id(tab_id).is_some_and(|t| t.engine == BrowserEngine::Wisp) {
+                if self
+                    .tab_by_id(tab_id)
+                    .is_some_and(|t| t.engine == BrowserEngine::Wisp)
+                {
                     self.remote_wisp_move(tab_id, &request.body)
                 } else {
                     self.remote_input(tab_id, "move", &request.body)

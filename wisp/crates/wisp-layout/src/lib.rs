@@ -264,7 +264,10 @@ fn layout_block(
             lines.iter().map(|l| l.height).sum()
         }
         FormattingContext::Block => {
-            if children.iter().all(|c| matches!(c.kind, BoxKind::Inline | BoxKind::TextRun)) {
+            if children
+                .iter()
+                .all(|c| matches!(c.kind, BoxKind::Inline | BoxKind::TextRun))
+            {
                 let lines = break_inline_lines(&children, content_width);
                 lines.iter().map(|l| l.height).sum()
             } else {
