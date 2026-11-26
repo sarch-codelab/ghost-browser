@@ -603,7 +603,10 @@ fn render_victory_table(report: &Value) -> String {
     let sample_str = |fw: &str| -> String {
         find("compare")
             .and_then(|t| t.get("samples")?.as_array())
-            .and_then(|arr| arr.iter().find(|s| s.get("name").and_then(Value::as_str) == Some(fw)))
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|s| s.get("name").and_then(Value::as_str) == Some(fw))
+            })
             .map(|s| {
                 let ms = s.get("ms").and_then(Value::as_f64).unwrap_or(0.0);
                 let rss = match s.get("rss_mb").and_then(Value::as_f64) {
@@ -626,7 +629,10 @@ fn render_victory_table(report: &Value) -> String {
 
     let workers = find("perf")
         .map(|t| {
-            let pg_s = t.get("pages_per_sec").and_then(Value::as_f64).unwrap_or(0.0);
+            let pg_s = t
+                .get("pages_per_sec")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
             let rss = match t.get("rss_mb").and_then(Value::as_f64) {
                 Some(v) => format!("{v:.1} MB"),
                 None => "no medido".into(),

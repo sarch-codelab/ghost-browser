@@ -259,7 +259,7 @@ jobs:
       - name: Check formatting (wisp)
         run: |
           if ! out=$(cargo fmt --manifest-path wisp/Cargo.toml --all -- --check 2>&1); then
-            python3 -c 'import sys; txt=sys.stdin.read(); print("::error::" + txt.replace("\n", " | ")[:3500])' <<< "$out"
+            python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | "); [print("::error::" + txt[i:i+3500]) for i in range(0, min(len(txt), 14000), 3500)]' <<< "$out"
             exit 1
           fi
 

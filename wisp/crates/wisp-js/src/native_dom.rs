@@ -700,12 +700,7 @@ impl NativeDomHost {
 }
 
 impl HostBridge for NativeDomHost {
-    fn get_prop(
-        &mut self,
-        vm: &mut VmRuntime,
-        target: &JsVal,
-        prop: &str,
-    ) -> Result<JsVal, JsVal> {
+    fn get_prop(&mut self, vm: &mut VmRuntime, target: &JsVal, prop: &str) -> Result<JsVal, JsVal> {
         match target {
             JsVal::NativeHandle(handle) => match handle.as_str() {
                 "document" => match prop {
@@ -1073,7 +1068,13 @@ impl HostBridge for NativeDomHost {
                     };
                     let state = self.promises.get(pid).cloned();
                     match (method, state) {
-                        ("then", Some(PromiseState { resolved: Some(val), .. })) => {
+                        (
+                            "then",
+                            Some(PromiseState {
+                                resolved: Some(val),
+                                ..
+                            }),
+                        ) => {
                             let next = self.alloc_promise(None, None);
                             let JsVal::NativeHandle(nh) = &next else {
                                 unreachable!();
@@ -1089,10 +1090,20 @@ impl HostBridge for NativeDomHost {
                             }
                             Ok(next)
                         }
-                        ("then", Some(PromiseState { rejected: Some(err), .. })) => {
-                            Ok(self.alloc_promise(None, Some(err)))
-                        }
-                        ("catch", Some(PromiseState { rejected: Some(err), .. })) => {
+                        (
+                            "then",
+                            Some(PromiseState {
+                                rejected: Some(err),
+                                ..
+                            }),
+                        ) => Ok(self.alloc_promise(None, Some(err))),
+                        (
+                            "catch",
+                            Some(PromiseState {
+                                rejected: Some(err),
+                                ..
+                            }),
+                        ) => {
                             let next = self.alloc_promise(None, None);
                             let JsVal::NativeHandle(nh) = &next else {
                                 unreachable!();
