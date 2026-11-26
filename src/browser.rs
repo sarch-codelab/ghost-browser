@@ -1799,7 +1799,9 @@ impl Browser {
                 json!({"ok": true})
             }
             Route::Text(tab_id) => self.remote_tab_text(tab_id, reply.clone())?,
-            Route::Snapshot(tab_id) => self.remote_snapshot(tab_id, &request.body, reply.clone())?,
+            Route::Snapshot(tab_id) => {
+                self.remote_snapshot(tab_id, &request.body, reply.clone())?
+            }
             Route::Click(tab_id) => {
                 if self.is_wisp_tab(tab_id) {
                     self.remote_wisp_click(tab_id, &request.body)
