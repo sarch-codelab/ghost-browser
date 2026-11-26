@@ -668,7 +668,7 @@ impl FetchedPage {
                     .map(|(_, rect)| *rect)
             });
 
-            let centrality = compute_centrality(&role, rect, center_x, center_y, viewport_width, idx);
+            let c = compute_centrality(&role, rect, center_x, center_y, viewport_width, idx);
 
             elements.push(SnapshotElement {
                 ref_id: format!("@e{}", elements.len() + 1),
@@ -685,7 +685,7 @@ impl FetchedPage {
                 input_type,
                 value: el.value().attr("value").map(str::to_owned),
                 rect,
-                centrality,
+                centrality: c,
             });
         }
 
@@ -4549,7 +4549,8 @@ fn layout_block(
             width: (outer_width - border[1] - border[3]).max(0.0),
             height: (border_box_height - border[0] - border[2]).max(0.0),
         };
-        ctx.commands.insert(command_start, PaintCommand::Clip { rect: clip });
+        let cmd = PaintCommand::Clip { rect: clip };
+        ctx.commands.insert(command_start, cmd);
         ctx.commands.push(PaintCommand::ClipEnd);
     }
 
@@ -5031,9 +5032,16 @@ fn measure_taffy_item(
 
     let size = match item {
         TaffyItem::Element(child) => {
-            let height =
-                layout_block(child, 0.0, 0.0, layout_width, parent_style, depth + 1, ctx)
-                    .unwrap_or(0.0);
+            let measured = layout_block(
+                child,
+                0.0,
+                0.0,
+                layout_width,
+                parent_style,
+                depth + 1,
+                ctx,
+            );
+            let height = measured.unwrap_or(0.0);
             let child_style = cached_style(child, parent_style);
             let margin_x = child_style.margin[1].resolve(layout_width)
                 + child_style.margin[3].resolve(layout_width);
@@ -9027,7 +9035,8 @@ fetch("http://{data_address}/data.json").then(function () {{
         assert_eq!(snap.elements[2].ref_id, "@e3");
         assert_eq!(snap.elements[2].role, "button");
         assert_eq!(snap.elements[3].ref_id, "@e4");
-        assert_eq!(snap.elements[3].url.as_deref(), Some("https://example.com/next"));
+        let link_url = snap.elements[3].url.as_deref();
+        assert_eq!(link_url, Some("https://example.com/next"));
         assert!(snap.find_ref("@e4").is_some());
         assert!(snap.elements[3].centrality > 0.0);
     }
