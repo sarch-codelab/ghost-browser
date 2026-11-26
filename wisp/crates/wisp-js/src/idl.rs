@@ -22,14 +22,14 @@ use serde::Deserialize;
 const IDL_CHECK: &str = include_str!("idl_check.js");
 
 /// Presencia de una interfaz descrita en el IDL dentro del runtime de Wisp.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct InterfaceStatus {
     pub name: &'static str,
     pub present: bool,
 }
 
 /// Informe de conformidad entre `wisp-idl` y el runtime DOM.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct IdlConformance {
     /// Estado de cada interfaz descrita, en el orden del IDL.
     pub interfaces: Vec<InterfaceStatus>,

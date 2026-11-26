@@ -739,7 +739,7 @@ impl HostBridge for NativeDomHost {
                     "document" => Ok(JsVal::NativeHandle("document".to_owned())),
                     "location" => Ok(JsVal::NativeHandle("location".to_owned())),
                     "localStorage" => Ok(JsVal::NativeHandle("localStorage".to_owned())),
-                    "innerWidth" => Ok(JsVal::Number(self.viewport_width as f64)),
+                    "innerWidth" => Ok(JsVal::Number(1280.0)),
                     "innerHeight" => Ok(JsVal::Number(720.0)),
                     "closed" => Ok(JsVal::Bool(false)),
                     "name" => Ok(JsVal::Str(String::new())),
