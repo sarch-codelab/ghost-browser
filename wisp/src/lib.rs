@@ -5032,16 +5032,8 @@ fn measure_taffy_item(
 
     let size = match item {
         TaffyItem::Element(child) => {
-            let measured = layout_block(
-                child,
-                0.0,
-                0.0,
-                layout_width,
-                parent_style,
-                depth + 1,
-                ctx,
-            );
-            let height = measured.unwrap_or(0.0);
+            let h = layout_block(child, 0.0, 0.0, layout_width, parent_style, depth + 1, ctx);
+            let height = h.unwrap_or(0.0);
             let child_style = cached_style(child, parent_style);
             let margin_x = child_style.margin[1].resolve(layout_width)
                 + child_style.margin[3].resolve(layout_width);
