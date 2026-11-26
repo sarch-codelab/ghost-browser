@@ -51,7 +51,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev gdb
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -83,6 +83,11 @@ jobs:
       - name: Run tests (root)
         run: |
           if ! out=$(RUST_BACKTRACE=1 cargo test --locked -- --nocapture 2>&1); then
+            bin=$(echo "$out" | grep -oE '/home/runner/work/[^ ]+/ghost-[a-f0-9]+' | head -n1 || true)
+            if [ -n "$bin" ] && [ -x "$bin" ]; then
+              bt=$(gdb -batch -ex "run" -ex "thread apply all bt" "$bin" 2>&1 || true)
+              out="$out | GDB_BT: $bt"
+            fi
             python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | "); txt=txt[-14000:]; [print("::error::" + txt[i:i+3500]) for i in range(0, len(txt), 3500)]' <<< "$out"
             exit 1
           fi
@@ -98,6 +103,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
