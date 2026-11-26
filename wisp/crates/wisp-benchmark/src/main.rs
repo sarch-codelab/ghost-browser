@@ -391,9 +391,8 @@ fn run_single_framework_sample(name: &str) -> String {
              root.setAttribute('data-framework', 'vue');"
         }
     };
-    let html = format!(
-        "<html><body><div id=\"root\"></div><script>{script}</script></body></html>"
-    );
+    let html =
+        format!("<html><body><div id=\"root\"></div><script>{script}</script></body></html>");
     let ok = layout_html(&html, 1280.0).is_ok();
     let render_ms = round2(t0.elapsed().as_secs_f64() * 1000.0);
     let mem = sample_memory_mb();

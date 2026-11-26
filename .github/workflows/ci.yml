@@ -66,7 +66,7 @@ jobs:
       - name: Check formatting (root)
         run: |
           if ! out=$(cargo fmt --all -- --check 2>&1); then
-            echo "$out" | head -n 40 | while IFS= read -r l; do echo "::error::$l"; done
+            python3 -c 'import sys; txt=sys.stdin.read(); print("::error::" + txt.replace("\n", " | ")[:3500])' <<< "$out"
             exit 1
           fi
 
@@ -79,7 +79,7 @@ jobs:
       - name: Run tests (root)
         run: |
           if ! out=$(cargo test --locked 2>&1); then
-            echo "$out" | tail -n 50 | while IFS= read -r l; do echo "::error::$l"; done
+            python3 -c 'import sys; txt=sys.stdin.read(); print("::error::" + txt.replace("\n", " | ")[-3500:])' <<< "$out"
             exit 1
           fi
 
@@ -259,7 +259,7 @@ jobs:
       - name: Check formatting (wisp)
         run: |
           if ! out=$(cargo fmt --manifest-path wisp/Cargo.toml --all -- --check 2>&1); then
-            echo "$out" | head -n 40 | while IFS= read -r l; do echo "::error::$l"; done
+            python3 -c 'import sys; txt=sys.stdin.read(); print("::error::" + txt.replace("\n", " | ")[:3500])' <<< "$out"
             exit 1
           fi
 
@@ -272,7 +272,7 @@ jobs:
       - name: Run tests (wisp)
         run: |
           if ! out=$(cargo test --manifest-path wisp/Cargo.toml --workspace --locked 2>&1); then
-            echo "$out" | tail -n 50 | while IFS= read -r l; do echo "::error::$l"; done
+            python3 -c 'import sys; txt=sys.stdin.read(); print("::error::" + txt.replace("\n", " | ")[-3500:])' <<< "$out"
             exit 1
           fi
 

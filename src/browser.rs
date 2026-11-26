@@ -3680,10 +3680,18 @@ mod tests {
         let (mut browser, _) = Browser::from_store(store);
         browser.set_cli_engine(Some(BrowserEngine::Wisp));
 
-        let ex = browser.tabs.iter().find(|t| t.url == "https://example.com/").unwrap();
+        let ex = browser
+            .tabs
+            .iter()
+            .find(|t| t.url == "https://example.com/")
+            .unwrap();
         assert_eq!(ex.engine, BrowserEngine::Wisp);
 
-        let google = browser.tabs.iter().find(|t| t.url == "https://accounts.google.com/").unwrap();
+        let google = browser
+            .tabs
+            .iter()
+            .find(|t| t.url == "https://accounts.google.com/")
+            .unwrap();
         assert_eq!(google.engine, BrowserEngine::WebView2);
 
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
@@ -3701,7 +3709,11 @@ mod tests {
         assert!(arr.iter().any(|t| t["url"] == "https://example.com/"));
 
         // `switch_tab` aplica `--wisp` en pestañas suspendidas salvo `engine_manual`.
-        let ex_idx = browser.tabs.iter().position(|t| t.url == "https://example.com/").unwrap();
+        let ex_idx = browser
+            .tabs
+            .iter()
+            .position(|t| t.url == "https://example.com/")
+            .unwrap();
         browser.tabs[ex_idx].engine = BrowserEngine::WebView2;
         browser.switch_tab(ex_idx);
         assert_eq!(browser.tabs[ex_idx].engine, BrowserEngine::Wisp);
