@@ -122,7 +122,8 @@ jobs:
         shell: pwsh
         run: |
           @'
-          import http.server, json, os, socketserver, subprocess, threading, time, traceback, urllib.error, urllib.request
+          import http.server, json, os, socket, socketserver, subprocess, sys, threading, time, traceback, urllib.error, urllib.request
+          sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
           class Handler(http.server.BaseHTTPRequestHandler):
               def do_GET(self):
@@ -152,10 +153,12 @@ jobs:
                   assert "Example Domain" in fetched.stdout, fetched.stdout
 
                   # 3. Serve API + /tabs/active/* + malformed JSON 400
-                  api_port = 47829
+                  with socket.socket() as s:
+                      s.bind(("127.0.0.1", 0))
+                      api_port = s.getsockname()[1]
                   srv = subprocess.Popen([agent, "serve", "--port", str(api_port), "--allow-private-network"])
                   try:
-                      for _ in range(40):
+                      for _ in range(100):
                           try:
                               with urllib.request.urlopen(f"http://127.0.0.1:{api_port}/health", timeout=1) as r:
                                   health = json.loads(r.read())
@@ -165,7 +168,7 @@ jobs:
                           except Exception:
                               time.sleep(0.2)
                       else:
-                          raise RuntimeError(f"wisp-agent serve did not become healthy; rc={srv.poll()}")
+                          raise RuntimeError(f"wisp-agent serve did not become healthy on port {api_port}; rc={srv.poll()}")
 
                       req = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs", data=json.dumps({"url": f"http://127.0.0.1:{port}/"}).encode(), method="POST")
                       with urllib.request.urlopen(req, timeout=5) as r:
@@ -195,9 +198,13 @@ jobs:
                           assert "JSON inv\u00e1lido" in payload["error"], payload
                   finally:
                       srv.terminate()
-                      srv.wait(timeout=5)
+                      try:
+                          srv.wait(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          srv.kill()
+                          srv.wait()
           except Exception:
-              print("::error::" + traceback.format_exc().replace("\n", " | ")[:3500])
+              print("::error::" + traceback.format_exc().replace("\n", " | ")[:3500], flush=True)
               raise
           '@ | python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
