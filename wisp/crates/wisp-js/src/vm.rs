@@ -929,9 +929,9 @@ impl Parser {
                     other => Expr::CallValue(Box::new(other), args),
                 };
             } else if self.eat(&Tok::Dot) {
-                let prop = match self.next() {
-                    Tok::Ident(p) => p,
-                    other => return Err(format!("propiedad inválida tras `.`: {other:?}")),
+                let prop = match tok_as_prop_name(self.next()) {
+                    Some(p) => p,
+                    None => return Err("propiedad inválida tras `.`".into()),
                 };
                 expr = Expr::Prop(Box::new(expr), prop);
             } else if self.eat(&Tok::LBracket) {
@@ -1834,6 +1834,34 @@ impl VmRuntime {
             _ => {}
         }
         host.call_method(self, &target, method, args)
+    }
+}
+
+fn tok_as_prop_name(tok: Tok) -> Option<String> {
+    match tok {
+        Tok::Ident(s) => Some(s),
+        Tok::KwLet => Some("let".to_owned()),
+        Tok::KwConst => Some("const".to_owned()),
+        Tok::KwVar => Some("var".to_owned()),
+        Tok::KwFunction => Some("function".to_owned()),
+        Tok::KwReturn => Some("return".to_owned()),
+        Tok::KwIf => Some("if".to_owned()),
+        Tok::KwElse => Some("else".to_owned()),
+        Tok::KwWhile => Some("while".to_owned()),
+        Tok::KwFor => Some("for".to_owned()),
+        Tok::KwBreak => Some("break".to_owned()),
+        Tok::KwContinue => Some("continue".to_owned()),
+        Tok::KwTry => Some("try".to_owned()),
+        Tok::KwCatch => Some("catch".to_owned()),
+        Tok::KwThrow => Some("throw".to_owned()),
+        Tok::KwNew => Some("new".to_owned()),
+        Tok::KwTypeof => Some("typeof".to_owned()),
+        Tok::KwVoid => Some("void".to_owned()),
+        Tok::KwTrue => Some("true".to_owned()),
+        Tok::KwFalse => Some("false".to_owned()),
+        Tok::KwNull => Some("null".to_owned()),
+        Tok::KwUndefined => Some("undefined".to_owned()),
+        _ => None,
     }
 }
 

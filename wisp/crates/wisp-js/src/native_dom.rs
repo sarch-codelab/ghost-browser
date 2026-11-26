@@ -43,16 +43,23 @@ struct ArenaNode {
 }
 
 #[derive(Clone, Debug)]
+struct PromiseWaiter {
+    cb_fn_id: Option<usize>,
+    target_promise: usize,
+    is_catch: bool,
+}
+
+#[derive(Clone, Debug)]
 struct PromiseState {
     resolved: Option<JsVal>,
     rejected: Option<JsVal>,
+    waiters: Vec<PromiseWaiter>,
 }
 
 struct Microtask {
     cb_fn_id: usize,
     arg: JsVal,
     target_promise: usize,
-    is_catch: bool,
 }
 
 pub struct NativeDomHost {
@@ -635,8 +642,72 @@ impl NativeDomHost {
 
     fn alloc_promise(&mut self, resolved: Option<JsVal>, rejected: Option<JsVal>) -> JsVal {
         let id = self.promises.len();
-        self.promises.push(PromiseState { resolved, rejected });
+        self.promises.push(PromiseState {
+            resolved,
+            rejected,
+            waiters: Vec::new(),
+        });
         JsVal::NativeHandle(format!("promise:{id}"))
+    }
+
+    fn settle_promise(&mut self, pid: usize, ok: bool, val: JsVal) {
+        if ok && let JsVal::NativeHandle(nh) = &val
+            && let Some(rest) = nh.strip_prefix("promise:")
+            && let Ok(inner_id) = rest.parse::<usize>()
+        {
+            let inner_state = self
+                .promises
+                .get(inner_id)
+                .map(|p| (p.resolved.clone(), p.rejected.clone()));
+            match inner_state {
+                Some((Some(v), _)) => {
+                    self.settle_promise(pid, true, v);
+                    return;
+                }
+                Some((_, Some(e))) => {
+                    self.settle_promise(pid, false, e);
+                    return;
+                }
+                Some((None, None)) => {
+                    if let Some(inner) = self.promises.get_mut(inner_id) {
+                        inner.waiters.push(PromiseWaiter {
+                            cb_fn_id: None,
+                            target_promise: pid,
+                            is_catch: false,
+                        });
+                    }
+                    return;
+                }
+                None => {}
+            }
+        }
+        let waiters = {
+            let Some(p) = self.promises.get_mut(pid) else {
+                return;
+            };
+            if p.resolved.is_some() || p.rejected.is_some() {
+                return;
+            }
+            if ok {
+                p.resolved = Some(val.clone());
+            } else {
+                p.rejected = Some(val.clone());
+            }
+            std::mem::take(&mut p.waiters)
+        };
+        for w in waiters {
+            match w.cb_fn_id {
+                None => self.settle_promise(w.target_promise, ok, val.clone()),
+                Some(fn_id) if (ok && !w.is_catch) || (!ok && w.is_catch) => {
+                    self.microtasks.push(Microtask {
+                        cb_fn_id: fn_id,
+                        arg: val.clone(),
+                        target_promise: w.target_promise,
+                    });
+                }
+                Some(_) => self.settle_promise(w.target_promise, ok, val.clone()),
+            }
+        }
     }
 
     fn drain_async_tasks(&mut self, vm: &mut VmRuntime) {
@@ -647,16 +718,9 @@ impl NativeDomHost {
                 let batch = std::mem::take(&mut self.microtasks);
                 for task in batch {
                     match vm.invoke_fn(task.cb_fn_id, vec![task.arg], self) {
-                        Ok(val) => {
-                            if let Some(p) = self.promises.get_mut(task.target_promise) {
-                                p.resolved = Some(val);
-                            }
-                        }
+                        Ok(val) => self.settle_promise(task.target_promise, true, val),
                         Err(err) => {
-                            if let Some(p) = self.promises.get_mut(task.target_promise) {
-                                p.rejected = Some(JsVal::Str(err));
-                            }
-                            let _ = task.is_catch;
+                            self.settle_promise(task.target_promise, false, JsVal::Str(err))
                         }
                     }
                 }
@@ -1188,8 +1252,9 @@ impl HostBridge for NativeDomHost {
                                     cb_fn_id: *fn_id,
                                     arg: val,
                                     target_promise: next_id,
-                                    is_catch: false,
                                 });
+                            } else {
+                                self.settle_promise(next_id, true, val);
                             }
                             Ok(next)
                         }
@@ -1199,7 +1264,56 @@ impl HostBridge for NativeDomHost {
                                 rejected: Some(err),
                                 ..
                             }),
-                        ) => Ok(self.alloc_promise(None, Some(err))),
+                        ) => {
+                            let next = self.alloc_promise(None, None);
+                            let JsVal::NativeHandle(nh) = &next else {
+                                unreachable!();
+                            };
+                            let next_id = nh[8..].parse::<usize>().unwrap_or(0);
+                            if let Some(JsVal::Function(fn_id)) = args.get(1) {
+                                self.microtasks.push(Microtask {
+                                    cb_fn_id: *fn_id,
+                                    arg: err,
+                                    target_promise: next_id,
+                                });
+                            } else {
+                                self.settle_promise(next_id, false, err);
+                            }
+                            Ok(next)
+                        }
+                        (
+                            "then",
+                            Some(PromiseState {
+                                resolved: None,
+                                rejected: None,
+                                ..
+                            }),
+                        ) => {
+                            let next = self.alloc_promise(None, None);
+                            let JsVal::NativeHandle(nh) = &next else {
+                                unreachable!();
+                            };
+                            let next_id = nh[8..].parse::<usize>().unwrap_or(0);
+                            let cb = match args.first() {
+                                Some(JsVal::Function(fn_id)) => Some(*fn_id),
+                                _ => None,
+                            };
+                            if let Some(p) = self.promises.get_mut(pid) {
+                                p.waiters.push(PromiseWaiter {
+                                    cb_fn_id: cb,
+                                    target_promise: next_id,
+                                    is_catch: false,
+                                });
+                            }
+                            Ok(next)
+                        }
+                        (
+                            "catch",
+                            Some(PromiseState {
+                                resolved: Some(val),
+                                ..
+                            }),
+                        ) => Ok(self.alloc_promise(Some(val), None)),
                         (
                             "catch",
                             Some(PromiseState {
@@ -1216,6 +1330,33 @@ impl HostBridge for NativeDomHost {
                                 self.microtasks.push(Microtask {
                                     cb_fn_id: *fn_id,
                                     arg: err,
+                                    target_promise: next_id,
+                                });
+                            } else {
+                                self.settle_promise(next_id, false, err);
+                            }
+                            Ok(next)
+                        }
+                        (
+                            "catch",
+                            Some(PromiseState {
+                                resolved: None,
+                                rejected: None,
+                                ..
+                            }),
+                        ) => {
+                            let next = self.alloc_promise(None, None);
+                            let JsVal::NativeHandle(nh) = &next else {
+                                unreachable!();
+                            };
+                            let next_id = nh[8..].parse::<usize>().unwrap_or(0);
+                            let cb = match args.first() {
+                                Some(JsVal::Function(fn_id)) => Some(*fn_id),
+                                _ => None,
+                            };
+                            if let Some(p) = self.promises.get_mut(pid) {
+                                p.waiters.push(PromiseWaiter {
+                                    cb_fn_id: cb,
                                     target_promise: next_id,
                                     is_catch: true,
                                 });
@@ -1541,6 +1682,119 @@ impl HostBridge for NativeDomHost {
                 }
                 _ => Err(JsVal::Str(format!("método DOM `{method}` no soportado"))),
             },
+            JsVal::Object(id) => {
+                let body_opt = vm.objects.get(*id).and_then(|m| match m.get("__wispBody") {
+                    Some(JsVal::Str(s)) => Some(s.clone()),
+                    _ => None,
+                });
+                if let Some(body) = body_opt {
+                    match method {
+                        "text" => return Ok(self.alloc_promise(Some(JsVal::Str(body)), None)),
+                        "json" => {
+                            return match serde_json::from_str::<Value>(&body) {
+                                Ok(parsed) => {
+                                    let val = json_to_jsval(&parsed, vm);
+                                    Ok(self.alloc_promise(Some(val), None))
+                                }
+                                Err(err) => {
+                                    let err_obj = vm.alloc_object(HashMap::from([
+                                        ("name".to_owned(), JsVal::Str("SyntaxError".to_owned())),
+                                        ("message".to_owned(), JsVal::Str(err.to_string())),
+                                    ]));
+                                    Ok(self.alloc_promise(None, Some(err_obj)))
+                                }
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                let is_xhr = vm
+                    .objects
+                    .get(*id)
+                    .and_then(|m| m.get("__wispXhr"))
+                    .is_some_and(|v| matches!(v, JsVal::Bool(true)));
+                if is_xhr {
+                    match method {
+                        "open" => {
+                            let req_method =
+                                args.first().map(ToString::to_string).unwrap_or_default();
+                            let req_url = args.get(1).map(ToString::to_string).unwrap_or_default();
+                            if let Some(obj) = vm.objects.get_mut(*id) {
+                                obj.insert("__method".to_owned(), JsVal::Str(req_method));
+                                obj.insert("__url".to_owned(), JsVal::Str(req_url));
+                                obj.insert("readyState".to_owned(), JsVal::Number(1.0));
+                            }
+                            return Ok(JsVal::Undefined);
+                        }
+                        "send" => {
+                            let (req_method, req_url) = vm
+                                .objects
+                                .get(*id)
+                                .map(|obj| {
+                                    (
+                                        obj.get("__method")
+                                            .map(ToString::to_string)
+                                            .unwrap_or_else(|| "GET".to_owned()),
+                                        obj.get("__url")
+                                            .map(ToString::to_string)
+                                            .unwrap_or_default(),
+                                    )
+                                })
+                                .unwrap_or_else(|| ("GET".to_owned(), String::new()));
+                            match fetch_json(&req_url, &req_method) {
+                                Ok(json_str) => {
+                                    let meta: Value =
+                                        serde_json::from_str(&json_str).unwrap_or(Value::Null);
+                                    let status =
+                                        meta.get("status").and_then(Value::as_f64).unwrap_or(200.0);
+                                    let body = meta
+                                        .get("body")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_owned();
+                                    if let Some(obj) = vm.objects.get_mut(*id) {
+                                        obj.insert("status".to_owned(), JsVal::Number(status));
+                                        obj.insert("readyState".to_owned(), JsVal::Number(4.0));
+                                        obj.insert("responseText".to_owned(), JsVal::Str(body));
+                                    }
+                                    let cbs = vm
+                                        .objects
+                                        .get(*id)
+                                        .map(|obj| {
+                                            (
+                                                obj.get("onreadystatechange").cloned(),
+                                                obj.get("onload").cloned(),
+                                            )
+                                        })
+                                        .unwrap_or((None, None));
+                                    if let Some(JsVal::Function(fn_id)) = cbs.0 {
+                                        let _ = vm.invoke_fn(fn_id, Vec::new(), self);
+                                    }
+                                    if let Some(JsVal::Function(fn_id)) = cbs.1 {
+                                        let _ = vm.invoke_fn(fn_id, Vec::new(), self);
+                                    }
+                                }
+                                Err(error) => {
+                                    record_fetch_warning(&error);
+                                    if let Some(obj) = vm.objects.get_mut(*id) {
+                                        obj.insert("status".to_owned(), JsVal::Number(0.0));
+                                        obj.insert("readyState".to_owned(), JsVal::Number(4.0));
+                                    }
+                                    if let Some(JsVal::Function(fn_id)) =
+                                        vm.objects.get(*id).and_then(|o| o.get("onerror").cloned())
+                                    {
+                                        let _ = vm.invoke_fn(fn_id, Vec::new(), self);
+                                    }
+                                }
+                            }
+                            return Ok(JsVal::Undefined);
+                        }
+                        "setRequestHeader" => return Ok(JsVal::Undefined),
+                        _ => {}
+                    }
+                }
+                Err(JsVal::Str(format!("método no definido `{method}`")))
+            }
             _ => Err(JsVal::Str(format!("método no definido `{method}`"))),
         }
     }
@@ -1573,13 +1827,34 @@ impl HostBridge for NativeDomHost {
                     .unwrap_or_else(|| "GET".to_owned());
                 match fetch_json(&url, &method) {
                     Ok(json_str) => {
-                        let parsed: Value = serde_json::from_str(&json_str).unwrap_or(Value::Null);
-                        let resp = json_to_jsval(&parsed, vm);
+                        let meta: Value = serde_json::from_str(&json_str).unwrap_or(Value::Null);
+                        let status = meta.get("status").and_then(Value::as_f64).unwrap_or(200.0);
+                        let ok = meta.get("ok").and_then(Value::as_bool).unwrap_or(true);
+                        let final_url = meta
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or(&url)
+                            .to_owned();
+                        let body = meta
+                            .get("body")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        let resp = vm.alloc_object(HashMap::from([
+                            ("status".to_owned(), JsVal::Number(status)),
+                            ("ok".to_owned(), JsVal::Bool(ok)),
+                            ("url".to_owned(), JsVal::Str(final_url)),
+                            ("__wispBody".to_owned(), JsVal::Str(body)),
+                        ]));
                         Some(Ok(self.alloc_promise(Some(resp), None)))
                     }
                     Err(error) => {
                         record_fetch_warning(&error);
-                        Some(Ok(self.alloc_promise(None, Some(JsVal::Str(error)))))
+                        let err_obj = vm.alloc_object(HashMap::from([
+                            ("name".to_owned(), JsVal::Str("TypeError".to_owned())),
+                            ("message".to_owned(), JsVal::Str(error)),
+                        ]));
+                        Some(Ok(self.alloc_promise(None, Some(err_obj))))
                     }
                 }
             }
@@ -1601,6 +1876,12 @@ impl HostBridge for NativeDomHost {
                     ("message".to_owned(), JsVal::Str(msg)),
                 ])))
             }
+            "XMLHttpRequest" => Ok(vm.alloc_object(HashMap::from([
+                ("__wispXhr".to_owned(), JsVal::Bool(true)),
+                ("readyState".to_owned(), JsVal::Number(0.0)),
+                ("status".to_owned(), JsVal::Number(0.0)),
+                ("responseText".to_owned(), JsVal::Str(String::new())),
+            ]))),
             "URL" => {
                 let raw = args.first().map(ToString::to_string).unwrap_or_default();
                 let base = args.get(1).map(ToString::to_string);
