@@ -709,6 +709,21 @@ impl HostBridge for NativeDomHost {
                     "documentElement" => {
                         Ok(self.html_id.map(JsVal::DomNode).unwrap_or(JsVal::Null))
                     }
+                    "doctype" => Ok(JsVal::Null),
+                    "readyState" => Ok(JsVal::Str("complete".to_owned())),
+                    "URL" => Ok(JsVal::Str(self.page_url.clone().unwrap_or_default())),
+                    "images" => Ok(JsVal::Array(
+                        self.get_elements_by_tag_name("img")
+                            .into_iter()
+                            .map(JsVal::DomNode)
+                            .collect(),
+                    )),
+                    "links" => Ok(JsVal::Array(
+                        self.get_elements_by_tag_name("a")
+                            .into_iter()
+                            .map(JsVal::DomNode)
+                            .collect(),
+                    )),
                     "title" => {
                         let mut text = String::new();
                         if let Some(tid) = self.find_first_tag(self.doc_id, "title") {
@@ -720,9 +735,15 @@ impl HostBridge for NativeDomHost {
                     _ => Ok(JsVal::Undefined),
                 },
                 "window" => match prop {
+                    "window" | "self" => Ok(JsVal::NativeHandle("window".to_owned())),
                     "document" => Ok(JsVal::NativeHandle("document".to_owned())),
                     "location" => Ok(JsVal::NativeHandle("location".to_owned())),
                     "localStorage" => Ok(JsVal::NativeHandle("localStorage".to_owned())),
+                    "innerWidth" => Ok(JsVal::Number(self.viewport_width as f64)),
+                    "innerHeight" => Ok(JsVal::Number(720.0)),
+                    "closed" => Ok(JsVal::Bool(false)),
+                    "name" => Ok(JsVal::Str(String::new())),
+                    "event" => Ok(JsVal::Undefined),
                     _ => Ok(JsVal::Undefined),
                 },
                 "location" => Ok(JsVal::Str(location_part(self.page_url.as_deref(), prop))),
@@ -756,7 +777,7 @@ impl HostBridge for NativeDomHost {
                     return Ok(JsVal::Undefined);
                 };
                 match prop {
-                    "textContent" | "innerText" => {
+                    "textContent" | "innerText" | "outerText" => {
                         let mut text = String::new();
                         self.collect_text(*nid, &mut text);
                         Ok(JsVal::Str(text))
@@ -768,6 +789,20 @@ impl HostBridge for NativeDomHost {
                         }
                         Ok(JsVal::Str(out))
                     }
+                    "outerHTML" => {
+                        let mut out = String::new();
+                        self.serialize_node(*nid, &mut out);
+                        Ok(JsVal::Str(out))
+                    }
+                    "nodeType" => Ok(JsVal::Number(match &node.kind {
+                        NodeKind::Element { .. } => 1.0,
+                        NodeKind::Text(_) => 3.0,
+                        NodeKind::Document => 9.0,
+                    })),
+                    "nodeValue" => Ok(match &node.kind {
+                        NodeKind::Text(t) => JsVal::Str(t.clone()),
+                        _ => JsVal::Null,
+                    }),
                     "tagName" | "nodeName" => Ok(match &node.kind {
                         NodeKind::Element { tag, .. } => JsVal::Str(tag.to_ascii_uppercase()),
                         NodeKind::Document => JsVal::Str("#document".to_owned()),
@@ -785,14 +820,62 @@ impl HostBridge for NativeDomHost {
                         }
                         _ => JsVal::Str(String::new()),
                     }),
+                    "title" | "lang" | "dir" | "accessKey" => Ok(match &node.kind {
+                        NodeKind::Element { attrs, .. } => {
+                            let key = if prop == "accessKey" {
+                                "accesskey"
+                            } else {
+                                prop
+                            };
+                            JsVal::Str(attrs.get(key).cloned().unwrap_or_default())
+                        }
+                        _ => JsVal::Str(String::new()),
+                    }),
+                    "hidden" => Ok(match &node.kind {
+                        NodeKind::Element { attrs, .. } => {
+                            JsVal::Bool(attrs.contains_key("hidden"))
+                        }
+                        _ => JsVal::Bool(false),
+                    }),
                     "classList" => Ok(JsVal::NativeHandle(format!("classList:{nid}"))),
                     "style" => Ok(JsVal::NativeHandle(format!("style:{nid}"))),
+                    "attributes" => Ok(match &node.kind {
+                        NodeKind::Element { attrs, .. } => {
+                            let pairs = attrs
+                                .iter()
+                                .map(|(k, v)| (k.clone(), JsVal::Str(v.clone())))
+                                .collect();
+                            vm.alloc_object(pairs)
+                        }
+                        _ => vm.alloc_object(HashMap::new()),
+                    }),
+                    "childNodes" => Ok(JsVal::Array(
+                        node.children.iter().copied().map(JsVal::DomNode).collect(),
+                    )),
                     "firstChild" => Ok(node
                         .children
                         .first()
                         .copied()
                         .map(JsVal::DomNode)
                         .unwrap_or(JsVal::Null)),
+                    "lastChild" => Ok(node
+                        .children
+                        .last()
+                        .copied()
+                        .map(JsVal::DomNode)
+                        .unwrap_or(JsVal::Null)),
+                    "previousSibling" | "nextSibling" => {
+                        let sibling = node.parent.and_then(|pid| {
+                            let siblings = &self.nodes.get(pid)?.children;
+                            let pos = siblings.iter().position(|&c| c == *nid)?;
+                            if prop == "previousSibling" {
+                                pos.checked_sub(1).and_then(|i| siblings.get(i).copied())
+                            } else {
+                                siblings.get(pos + 1).copied()
+                            }
+                        });
+                        Ok(sibling.map(JsVal::DomNode).unwrap_or(JsVal::Null))
+                    }
                     "parentNode" | "parentElement" => {
                         Ok(node.parent.map(JsVal::DomNode).unwrap_or(JsVal::Null))
                     }
@@ -952,6 +1035,22 @@ impl HostBridge for NativeDomHost {
                         let txt = args.first().map(ToString::to_string).unwrap_or_default();
                         Ok(JsVal::DomNode(self.alloc_node(NodeKind::Text(txt))))
                     }
+                    "createDocumentFragment" => {
+                        let id = self.alloc_node(NodeKind::Element {
+                            tag: "fragment".to_owned(),
+                            attrs: HashMap::new(),
+                            styles: Vec::new(),
+                        });
+                        Ok(JsVal::DomNode(id))
+                    }
+                    "open" | "close" => Ok(JsVal::Undefined),
+                    "write" => {
+                        let html: String = args.iter().map(ToString::to_string).collect();
+                        if let Some(body) = self.body_id {
+                            self.insert_adjacent_html(body, "beforeend", &html);
+                        }
+                        Ok(JsVal::Undefined)
+                    }
                     "addEventListener" => {
                         if let (Some(JsVal::Str(ev)), Some(JsVal::Function(fn_id))) =
                             (args.first(), args.get(1))
@@ -963,6 +1062,7 @@ impl HostBridge for NativeDomHost {
                         }
                         Ok(JsVal::Undefined)
                     }
+                    "removeEventListener" | "dispatchEvent" => Ok(JsVal::Bool(true)),
                     _ => Err(JsVal::Str(format!("document.{method} no soportado"))),
                 },
                 "window" => match method {
@@ -977,6 +1077,9 @@ impl HostBridge for NativeDomHost {
                         }
                         Ok(JsVal::Undefined)
                     }
+                    "removeEventListener" | "dispatchEvent" => Ok(JsVal::Bool(true)),
+                    "alert" | "close" | "focus" | "blur" => Ok(JsVal::Undefined),
+                    "open" => Ok(JsVal::Null),
                     _ => Ok(JsVal::Undefined),
                 },
                 "localStorage" => match method {
@@ -1267,6 +1370,25 @@ impl HostBridge for NativeDomHost {
                     };
                     Ok(JsVal::Bool(has))
                 }
+                "toggleAttribute" => {
+                    let name = args.first().map(ToString::to_string).unwrap_or_default();
+                    let force = args.get(1).map(JsVal::is_truthy);
+                    let mut present = false;
+                    if let Some(node) = self.nodes.get_mut(*nid)
+                        && let NodeKind::Element { attrs, .. } = &mut node.kind
+                    {
+                        let had = attrs.contains_key(&name);
+                        let want = force.unwrap_or(!had);
+                        if want {
+                            attrs.entry(name).or_default();
+                            present = true;
+                        } else {
+                            attrs.remove(&name);
+                        }
+                        self.mutated = true;
+                    }
+                    Ok(JsVal::Bool(present))
+                }
                 "appendChild" => {
                     if let Some(JsVal::DomNode(child)) = args.first() {
                         self.attach_child(*nid, *child);
@@ -1276,6 +1398,77 @@ impl HostBridge for NativeDomHost {
                         Ok(JsVal::Null)
                     }
                 }
+                "insertBefore" => {
+                    if let Some(JsVal::DomNode(new_child)) = args.first() {
+                        self.attach_child(*nid, *new_child);
+                        self.mutated = true;
+                        Ok(JsVal::DomNode(*new_child))
+                    } else {
+                        Ok(JsVal::Null)
+                    }
+                }
+                "replaceChild" => {
+                    if let (Some(JsVal::DomNode(new_c)), Some(JsVal::DomNode(old_c))) =
+                        (args.first(), args.get(1))
+                    {
+                        self.detach_node(*old_c);
+                        self.attach_child(*nid, *new_c);
+                        self.mutated = true;
+                        Ok(JsVal::DomNode(*old_c))
+                    } else {
+                        Ok(JsVal::Null)
+                    }
+                }
+                "cloneNode" => {
+                    let cloned = self
+                        .nodes
+                        .get(*nid)
+                        .map(|n| n.kind.clone())
+                        .map(|kind| self.alloc_node(kind));
+                    Ok(cloned.map(JsVal::DomNode).unwrap_or(JsVal::Null))
+                }
+                "hasChildNodes" => Ok(JsVal::Bool(
+                    self.nodes.get(*nid).is_some_and(|n| !n.children.is_empty()),
+                )),
+                "contains" => {
+                    let target_id = match args.first() {
+                        Some(JsVal::DomNode(other)) => Some(*other),
+                        _ => None,
+                    };
+                    let mut cur = target_id;
+                    let mut found = false;
+                    while let Some(c) = cur {
+                        if c == *nid {
+                            found = true;
+                            break;
+                        }
+                        cur = self.nodes.get(c).and_then(|n| n.parent);
+                    }
+                    Ok(JsVal::Bool(found))
+                }
+                "isEqualNode" => Ok(JsVal::Bool(matches!(
+                    args.first(),
+                    Some(JsVal::DomNode(other)) if other == nid
+                ))),
+                "closest" => {
+                    let sel = args.first().map(ToString::to_string).unwrap_or_default();
+                    let mut cur = Some(*nid);
+                    let mut hit = None;
+                    while let Some(c) = cur {
+                        if sel
+                            .split(',')
+                            .map(str::trim)
+                            .any(|b| self.matches_complex_selector(c, b))
+                        {
+                            hit = Some(c);
+                            break;
+                        }
+                        cur = self.nodes.get(c).and_then(|n| n.parent);
+                    }
+                    Ok(hit.map(JsVal::DomNode).unwrap_or(JsVal::Null))
+                }
+                "focus" | "blur" => Ok(JsVal::Undefined),
+                "removeEventListener" | "dispatchEvent" => Ok(JsVal::Bool(true)),
                 "prepend" => {
                     for arg in args.into_iter().rev() {
                         if let JsVal::DomNode(child) = arg {
@@ -1761,6 +1954,115 @@ fn camel_to_kebab(s: &str) -> String {
         }
     }
     out
+}
+
+pub(crate) fn native_idl_supports_interface(iface: &str) -> bool {
+    matches!(
+        iface,
+        "EventTarget" | "Node" | "Element" | "HTMLElement" | "Document" | "Window"
+    )
+}
+
+pub(crate) fn native_idl_supports_member(iface: &str, member: &str) -> bool {
+    match iface {
+        "EventTarget" => matches!(
+            member,
+            "addEventListener" | "removeEventListener" | "dispatchEvent"
+        ),
+        "Node" => matches!(
+            member,
+            "nodeType"
+                | "nodeName"
+                | "nodeValue"
+                | "parentNode"
+                | "parentElement"
+                | "childNodes"
+                | "firstChild"
+                | "lastChild"
+                | "previousSibling"
+                | "nextSibling"
+                | "appendChild"
+                | "insertBefore"
+                | "removeChild"
+                | "replaceChild"
+                | "cloneNode"
+                | "hasChildNodes"
+                | "contains"
+                | "isEqualNode"
+        ),
+        "Element" => matches!(
+            member,
+            "tagName"
+                | "id"
+                | "className"
+                | "classList"
+                | "attributes"
+                | "innerHTML"
+                | "outerHTML"
+                | "getAttribute"
+                | "setAttribute"
+                | "removeAttribute"
+                | "hasAttribute"
+                | "toggleAttribute"
+                | "querySelector"
+                | "querySelectorAll"
+                | "closest"
+                | "insertAdjacentHTML"
+        ),
+        "HTMLElement" => matches!(
+            member,
+            "title"
+                | "lang"
+                | "hidden"
+                | "dir"
+                | "innerText"
+                | "outerText"
+                | "accessKey"
+                | "click"
+                | "focus"
+                | "blur"
+        ),
+        "Document" => matches!(
+            member,
+            "doctype"
+                | "documentElement"
+                | "title"
+                | "URL"
+                | "readyState"
+                | "images"
+                | "links"
+                | "location"
+                | "getElementById"
+                | "getElementsByTagName"
+                | "getElementsByClassName"
+                | "querySelector"
+                | "querySelectorAll"
+                | "createElement"
+                | "createTextNode"
+                | "createDocumentFragment"
+                | "open"
+                | "close"
+                | "write"
+        ),
+        "Window" => matches!(
+            member,
+            "window"
+                | "self"
+                | "document"
+                | "location"
+                | "innerWidth"
+                | "innerHeight"
+                | "closed"
+                | "name"
+                | "event"
+                | "alert"
+                | "close"
+                | "focus"
+                | "blur"
+                | "open"
+        ),
+        _ => false,
+    }
 }
 
 fn escape_text(s: &str) -> String {
