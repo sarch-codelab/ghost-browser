@@ -651,7 +651,8 @@ impl NativeDomHost {
     }
 
     fn settle_promise(&mut self, pid: usize, ok: bool, val: JsVal) {
-        if ok && let JsVal::NativeHandle(nh) = &val
+        if ok
+            && let JsVal::NativeHandle(nh) = &val
             && let Some(rest) = nh.strip_prefix("promise:")
             && let Ok(inner_id) = rest.parse::<usize>()
         {
