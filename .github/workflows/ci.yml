@@ -51,7 +51,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev gdb
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -73,35 +73,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Run tests (root)
-        run: |
-          bin=$(cargo test --locked --no-run --message-format=json | python3 -c 'import json,sys; [print(d["executable"]) for l in sys.stdin if l.startswith("{") for d in [json.loads(l)] if d.get("reason")=="compiler-artifact" and d.get("profile",{}).get("test") and d.get("executable")]' | head -n1)
-          for mod in browser::tests logo::tests store::tests ui::tests webview::newtab_tests window_frame_tests; do
-            for k in $(seq 1 15); do
-              out=$("$bin" "$mod" 2>&1) && rc=0 || rc=$?
-              if [ $rc -ne 0 ]; then
-                msg=$(python3 -c 'import sys; print(sys.stdin.read().replace("\n"," | ")[-3000:])' <<< "$out")
-                echo "::error::FAILED mod=$mod k=$k rc=$rc | $msg"
-                exit 1
-              fi
-            done
-          done
-          for k in $(seq 1 15); do
-            out=$("$bin" --test-threads=1 2>&1) && rc=0 || rc=$?
-            if [ $rc -ne 0 ]; then
-              msg=$(python3 -c 'import sys; print(sys.stdin.read().replace("\n"," | ")[-3000:])' <<< "$out")
-              echo "::error::FAILED single-thread k=$k rc=$rc | $msg"
-              exit 1
-            fi
-          done
-          for k in $(seq 1 15); do
-            out=$("$bin" 2>&1) && rc=0 || rc=$?
-            if [ $rc -ne 0 ]; then
-              msg=$(python3 -c 'import sys; print(sys.stdin.read().replace("\n"," | ")[-3000:])' <<< "$out")
-              echo "::error::FAILED parallel k=$k rc=$rc | $msg"
-              exit 1
-            fi
-          done
-          cargo test --locked
+        run: cargo test --locked -- --test-threads=1
 
   wisp-windows:
     name: Wisp (Windows)
