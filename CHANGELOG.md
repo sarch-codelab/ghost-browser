@@ -19,6 +19,44 @@ el proyecto usa [Versionado Semántico](https://semver.org/lang/es/).
 - **Borrado de datos** (Ajustes → Datos): la caché del navegador completo, y
   las cookies o todos los datos del sitio de la pestaña activa, vía Chrome
   DevTools Protocol.
+- **Motor y agentes separados de la UI**: `src/cdp.rs` y `src/bin/ghost-mcp.rs`
+  se mueven a los crates `wisp-cdp` y `wisp-mcp` del workspace `wisp/`, sobre un
+  contrato de control compartido (`wisp_mcp::control`) y con el binario headless
+  `wisp-agent` (`fetch` y `serve`). El mismo cliente MCP —y su configuración—
+  controla Ghost y `wisp-agent` indistintamente.
+- **Descriptores del DOM generados desde WebIDL**: el crate `wisp-idl` parsea
+  fragmentos `.webidl` (`EventTarget`, `Node`, `Element`, `HTMLElement`,
+  `Document` y `Window`) y genera, en tiempo de compilación, las tablas Rust de
+  interfaces, atributos y operaciones que describen el DOM que Wisp expone a
+  JavaScript.
+- **Chequeo de conformidad del DOM**: `wisp-js` compara los descriptores WebIDL
+  con el DOM real que instala `dom.js` (`wisp_js::idl::idl_conformance()`) y
+  devuelve la lista exacta de interfaces y miembros que faltan, para alinear el
+  runtime con el IDL sin revisar el código a mano. El DOM de `dom.js` ya cubre
+  todos los miembros descritos: `Document` y `Window` instalados como
+  constructores, `Node.nodeName`/`nodeValue`/`isEqualNode()`, los atributos de
+  `HTMLElement` (`title`, `lang`, `dir`, `hidden`, `accessKey`, `outerText`) y
+  `Document.doctype`/`readyState`/`images`/`links`.
+- **Evaluación de JS en el motor Wisp**: `wisp-js` expone `evaluate_expression`
+  y `wisp-engine` la publica como `FetchedPage::eval_js()`, y `wisp-agent serve`
+  responde ya a `POST /tabs/{id}/eval` (`ghost_eval`). La evaluación levanta un
+  contexto Boa efímero sobre el HTML de la página: ve el DOM y devuelve el valor
+  serializado, más el HTML resultante cuando el script muta la página. Como el
+  contexto es efímero, no conserva las variables que definió la página ni los
+  cambios entre llamadas.
+- **Entrada en `wisp-agent`**: `POST /tabs/{id}/click` resuelve el enlace bajo
+  las coordenadas (`FetchedPage::hit_test`, sobre la lista de pintura: texto con
+  `href` o imagen con `href`) y navega, y `POST /tabs/{id}/move` informa del
+  enlace bajo el punto. La GUI usa el mismo criterio. Las operaciones que
+  necesitan foco, desplazamiento o CDP nativo (`type`, `press`, `scroll`, `cdp`)
+  devuelven un error explícito en vez de fallar en silencio.
+- **Captura en `wisp-agent`**: el motor rasteriza su lista de pintura a un PNG
+  (fondos, bordes, degradados, texto y recorte) sin añadir un codificador al
+  binario: el PNG se escribe con deflate «stored» y CRC/Adler-32 propios. Se
+  expone como `POST /tabs/{id}/screenshot` (con `path` opcional y guardado por
+  defecto en `%TEMP%/ghost_shots/`) y como `wisp-agent screenshot <url>` por
+  línea de comandos. Es lo que deja a un agente **ver** la página y elegir las
+  coordenadas que luego usa `click`/`move`.
 
 ### Corregido
 - Los botones de borrado de historial por período (24 h / 7 días) y de

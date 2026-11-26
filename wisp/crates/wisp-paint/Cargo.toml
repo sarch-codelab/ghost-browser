@@ -1,0 +1,9 @@
+[package]
+name = "wisp-paint"
+version = "0.1.0"
+edition = "2024"
+description = "Wisp paint list: immutable display-list primitives and geometry."
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }

@@ -1,3 +1,9 @@
+//! Etapa de JavaScript de Wisp: ejecuta los scripts de una página en un
+//! runtime Boa acotado (límites de tamaño, tiempo, iteraciones y profundidad),
+//! expone el DOM a la página y devuelve el documento serializado cuando los
+//! scripts lo modifican. Este crate es autocontenido: no conoce el `DomNode`
+//! del motor, solo el árbol parseado y el HTML resultante.
+
 use anyhow::{Result, anyhow, ensure};
 use boa_engine::builtins::promise::PromiseState;
 use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
@@ -19,6 +25,9 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+/// Conformidad entre los descriptores WebIDL (`wisp-idl`) y el DOM de `dom.js`.
+pub mod idl;
 
 const MAX_INLINE_SCRIPT_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_SCRIPT_BYTES: usize = 256 * 1024;
@@ -73,11 +82,11 @@ thread_local! {
 const DOM_RUNTIME: &str = include_str!("dom.js");
 
 #[derive(Default)]
-pub(crate) struct ScriptResult {
+pub struct ScriptResult {
     /// Serialized document produced by `dom.js` when page scripts changed the
     /// tree. `None` means the original Rust-side document is still accurate.
-    pub(crate) html: Option<String>,
-    pub(crate) warnings: Vec<String>,
+    pub html: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -112,7 +121,7 @@ struct ModuleEntry {
     source: String,
 }
 
-pub(crate) fn execute_scripts(
+pub fn execute_scripts(
     document: &Html,
     external_scripts: &HashMap<String, String>,
     module_scripts: &HashMap<String, String>,
@@ -357,6 +366,144 @@ pub(crate) fn execute_scripts(
     }
 
     Ok(ScriptResult { html, warnings })
+}
+
+/// Resultado de evaluar una expresión contra el DOM de una página.
+#[derive(Debug, Default)]
+pub struct EvalResult {
+    /// Valor devuelto por la expresión, serializado a JSON. `None` si la
+    /// expresión no devolvió nada (p. ej. `undefined`) o su valor no se pudo
+    /// serializar.
+    pub value: Option<serde_json::Value>,
+    /// Documento serializado si la expresión mutó el DOM; `None` si no cambió.
+    pub html: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Evalúa `source` contra el DOM de `html` y devuelve su valor.
+///
+/// El contexto de JavaScript es efímero: se levanta desde el HTML, ejecuta la
+/// expresión y se descarta, porque Boa no es `Send` y no puede conservarse
+/// entre peticiones. Por eso `eval` ve el DOM tal y como quedó tras los
+/// scripts de la página, pero no las variables que esos scripts definieron.
+pub fn evaluate_expression(
+    html: &str,
+    page_url: Option<&str>,
+    viewport_width: f32,
+    source: &str,
+) -> Result<EvalResult> {
+    let document = Html::parse_document(html);
+    let initial = build_initial_document(&document)?;
+    let page_url = page_url.map(str::to_owned);
+    let source = source.to_owned();
+    // Boa puede necesitar más pila nativa que la que da el hilo llamante.
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("wisp-eval".to_owned())
+            .stack_size(SCRIPT_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                evaluate_expression_on_thread(initial, page_url.as_deref(), viewport_width, &source)
+            })
+            .map_err(|error| anyhow!("could not start Wisp's evaluator: {error}"))?;
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("Wisp's evaluator failed unexpectedly")),
+        }
+    })
+}
+
+fn evaluate_expression_on_thread(
+    initial: InitialNode,
+    page_url: Option<&str>,
+    viewport_width: f32,
+    source: &str,
+) -> Result<EvalResult> {
+    let mut warnings = Vec::new();
+    let mut context = Context::builder()
+        .build()
+        .map_err(|error| anyhow!("could not start Wisp's evaluator: {error}"))?;
+    FETCH_STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        state.page_url = page_url.and_then(|url| url::Url::parse(url).ok());
+        state.used = 0;
+        state.deadline = Some(Instant::now() + MAX_FETCH_TOTAL_TIME);
+        state.warnings.clear();
+    });
+    if let Err(error) = context.register_global_callable(
+        js_string!("__wispFetchSync"),
+        2,
+        NativeFunction::from_fn_ptr(wisp_fetch_sync),
+    ) {
+        push_warning(
+            &mut warnings,
+            format!("No se pudo exponer fetch() en Wisp: {error}"),
+        );
+    }
+
+    let mut runtime_limits = context.runtime_limits();
+    runtime_limits.set_loop_iteration_limit(MAX_LOOP_ITERATIONS);
+    runtime_limits.set_recursion_limit(MAX_RECURSION_DEPTH);
+    runtime_limits.set_stack_size_limit(MAX_STACK_SIZE);
+    context.set_runtime_limits(runtime_limits);
+
+    register_document_globals(
+        &mut context,
+        initial,
+        page_url,
+        viewport_width,
+        &mut warnings,
+    )?;
+
+    if let Err(error) = context.eval(Source::from_bytes(DOM_RUNTIME)) {
+        return Err(anyhow!(
+            "no se pudo iniciar el DOM de JavaScript de Wisp: {}",
+            truncate_error(&error.to_string())
+        ));
+    }
+
+    let evaluated = context.eval(Source::from_bytes(source)).map_err(|error| {
+        anyhow!(
+            "falló la evaluación: {}",
+            truncate_error(&error.to_string())
+        )
+    })?;
+    let value = match evaluated.to_json(&mut context) {
+        Ok(json) => json,
+        Err(_) => {
+            push_warning(
+                &mut warnings,
+                "El valor devuelto por eval no se pudo serializar a JSON.".to_owned(),
+            );
+            None
+        }
+    };
+
+    let fetch_warnings = FETCH_STATE.with(|state| std::mem::take(&mut state.borrow_mut().warnings));
+    for warning in fetch_warnings {
+        push_warning(&mut warnings, warning);
+    }
+
+    let snapshot = read_snapshot(&mut context, &mut warnings);
+    for warning in read_runtime_warnings(&mut context, &mut warnings) {
+        push_warning(&mut warnings, warning);
+    }
+    let html = match snapshot {
+        Some(snapshot) if snapshot.oversized => {
+            push_warning(
+                &mut warnings,
+                "El DOM generado por JavaScript supera el límite de tamaño de Wisp.".to_owned(),
+            );
+            None
+        }
+        Some(snapshot) if snapshot.mutated => snapshot.html,
+        _ => None,
+    };
+
+    Ok(EvalResult {
+        value,
+        html,
+        warnings,
+    })
 }
 
 fn resolve_script_url(page_url: Option<&str>, src: &str) -> Option<String> {
@@ -676,37 +823,12 @@ fn evaluate_scripts(
     runtime_limits.set_stack_size_limit(MAX_STACK_SIZE);
     context.set_runtime_limits(runtime_limits);
 
-    let initial = serde_json::to_value(&initial)?;
-    let initial = JsValue::from_json(&initial, &mut context)
-        .map_err(|error| anyhow!("could not initialize Wisp's JavaScript DOM: {error}"))?;
-    register_global(
+    register_document_globals(
         &mut context,
-        "__wispDocument",
         initial,
+        page_url,
+        viewport_width,
         &mut warnings,
-        "No se pudo iniciar el DOM de JavaScript de Wisp",
-    )?;
-
-    let url = page_url_json(page_url);
-    let url = JsValue::from_json(&url, &mut context)
-        .map_err(|error| anyhow!("could not initialize Wisp's page URL: {error}"))?;
-    register_global(
-        &mut context,
-        "__wispUrl",
-        url,
-        &mut warnings,
-        "No se pudo inicializar la URL de la página",
-    )?;
-
-    let viewport = serde_json::json!({ "width": viewport_width });
-    let viewport = JsValue::from_json(&viewport, &mut context)
-        .map_err(|error| anyhow!("could not initialize Wisp's viewport: {error}"))?;
-    register_global(
-        &mut context,
-        "__wispViewport",
-        viewport,
-        &mut warnings,
-        "No se pudo inicializar el viewport de la página",
     )?;
 
     if let Err(error) = context.eval(Source::from_bytes(DOM_RUNTIME)) {
@@ -1061,6 +1183,50 @@ fn cors_allows(response: &reqwest::blocking::Response, page: &Option<url::Url>) 
         .any(|allowed| allowed.trim().eq_ignore_ascii_case(&origin))
 }
 
+/// Registra `__wispDocument`, `__wispUrl` y `__wispViewport` antes de cargar
+/// `dom.js`. Compartido por la etapa de scripts y por `eval`.
+fn register_document_globals(
+    context: &mut Context,
+    initial: InitialNode,
+    page_url: Option<&str>,
+    viewport_width: f32,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let initial = serde_json::to_value(&initial)?;
+    let initial = JsValue::from_json(&initial, context)
+        .map_err(|error| anyhow!("could not initialize Wisp's JavaScript DOM: {error}"))?;
+    register_global(
+        context,
+        "__wispDocument",
+        initial,
+        warnings,
+        "No se pudo iniciar el DOM de JavaScript de Wisp",
+    )?;
+
+    let url = page_url_json(page_url);
+    let url = JsValue::from_json(&url, context)
+        .map_err(|error| anyhow!("could not initialize Wisp's page URL: {error}"))?;
+    register_global(
+        context,
+        "__wispUrl",
+        url,
+        warnings,
+        "No se pudo inicializar la URL de la página",
+    )?;
+
+    let viewport = serde_json::json!({ "width": viewport_width });
+    let viewport = JsValue::from_json(&viewport, context)
+        .map_err(|error| anyhow!("could not initialize Wisp's viewport: {error}"))?;
+    register_global(
+        context,
+        "__wispViewport",
+        viewport,
+        warnings,
+        "No se pudo inicializar el viewport de la página",
+    )?;
+    Ok(())
+}
+
 fn register_global(
     context: &mut Context,
     name: &str,
@@ -1233,6 +1399,50 @@ mod tests {
         let snapshot = snapshot(html);
         let document = Html::parse_document(&snapshot);
         document.select(&Selector::parse(selector).unwrap()).count()
+    }
+
+    fn eval(html: &str, source: &str) -> EvalResult {
+        evaluate_expression(html, Some("https://example.com/"), 300.0, source).unwrap()
+    }
+
+    #[test]
+    fn eval_returns_the_expression_value() {
+        let result = eval("<html><body><h1>Título</h1></body></html>", "1 + 1");
+        assert_eq!(result.value, Some(serde_json::json!(2)));
+        assert!(result.html.is_none(), "leer no debe serializar el DOM");
+    }
+
+    #[test]
+    fn eval_reads_the_dom() {
+        let result = eval(
+            "<html><body><p id=\"x\">hola</p></body></html>",
+            "document.getElementById('x').textContent",
+        );
+        assert_eq!(result.value, Some(serde_json::json!("hola")));
+    }
+
+    #[test]
+    fn eval_can_mutate_the_dom() {
+        let result = eval(
+            "<html><body><p id=\"x\">hola</p></body></html>",
+            "document.getElementById('x').textContent = 'adios'; 'hecho'",
+        );
+        assert_eq!(result.value, Some(serde_json::json!("hecho")));
+        let html = result.html.expect("mutar debe serializar el DOM");
+        assert!(html.contains("adios"), "{html}");
+    }
+
+    #[test]
+    fn eval_reports_script_errors() {
+        let error = evaluate_expression("<html></html>", None, 300.0, "throw new Error('boom')")
+            .expect_err("un error de script debe propagarse");
+        assert!(error.to_string().contains("falló la evaluación"), "{error}");
+    }
+
+    #[test]
+    fn eval_returns_none_for_undefined() {
+        let result = eval("<html><body></body></html>", "var sinValor;");
+        assert_eq!(result.value, None);
     }
 
     #[test]

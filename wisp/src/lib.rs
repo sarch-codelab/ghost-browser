@@ -7,7 +7,6 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::redirect::Policy;
 use scraper::node::Node;
 use scraper::{ElementRef, Html, Selector};
-use serde::Serialize;
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -16,7 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use taffy::prelude::*;
 
-mod script;
+/// Resultado de evaluar JavaScript contra el DOM de una página.
+pub use wisp_js::EvalResult;
 
 pub const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_STYLESHEET_BYTES: usize = 4 * 1024 * 1024;
@@ -76,6 +76,12 @@ fn wisp_bold_font() -> &'static ab_glyph::FontArc {
 
 fn is_bold_weight(weight: u16) -> bool {
     weight >= 600
+}
+
+/// ¿El punto (`x`, `y`) cae dentro de `rect`? Bordes incluidos, para que un
+/// clic justo en el límite siga contando como acierto.
+fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {
+    x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
 }
 
 /// Hasher no criptográfico para las cachés de medidas: las claves son
@@ -247,101 +253,7 @@ fn transformed_text(word: &str, kind: TextTransformKind) -> Cow<'_, str> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
-pub struct Rect {
-    pub x: f32,
-    pub y: f32,
-    pub width: f32,
-    pub height: f32,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-pub struct Color {
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-    pub a: u8,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PaintCommand {
-    FillRect {
-        rect: Rect,
-        color: Color,
-        /// `border-radius` en píxeles (0 = esquinas rectas).
-        radius: f32,
-    },
-    /// Borde de una caja (`border`): trazo uniforme del color dado.
-    StrokeRect {
-        rect: Rect,
-        color: Color,
-        width: f32,
-        radius: f32,
-    },
-    Text {
-        x: f32,
-        y: f32,
-        content: String,
-        color: Color,
-        font_size: f32,
-        /// CSS `font-weight` (100–900); 400 is normal, 700+ is bold.
-        font_weight: u16,
-        href: Option<String>,
-    },
-    Image {
-        rect: Rect,
-        /// Resolved URL (or full `data:` URI) used as the key into
-        /// [`FetchedPage::images`].
-        url: String,
-        href: Option<String>,
-    },
-    /// `background-image` de una caja: imagen remota/`data:` o degradado
-    /// lineal. Se pinta detrás del contenido, sobre `background-color`.
-    BackgroundImage {
-        rect: Rect,
-        radius: f32,
-        image: BgImage,
-    },
-    /// Abre una región de recorte (`overflow: hidden|auto|scroll`): todo lo
-    /// que se pinte hasta el siguiente [`PaintCommand::ClipEnd`] queda
-    /// recortado a `rect`. Los recortes se anidan como una pila.
-    Clip { rect: Rect },
-    /// Cierra la región abierta por el último [`PaintCommand::Clip`].
-    ClipEnd,
-}
-
-/// Una capa de `background-image` (solo la primera; `background` admite
-/// varias separadas por comas).
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BgImage {
-    /// Referencia `url(...)` ya resuelta contra la URL de la página: clave
-    /// http(s) absoluta o URI `data:` completa, igual que [`PaintCommand::Image`].
-    Url(String),
-    /// `linear-gradient(...)`: `angle_deg` sigue la convención CSS
-    /// (0deg = hacia arriba, 90deg = hacia la derecha). Las paradas usan
-    /// fracción 0–1 a lo largo del eje del degradado.
-    LinearGradient {
-        angle_deg: f32,
-        stops: Vec<GradientStop>,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Serialize)]
-pub struct GradientStop {
-    /// Posición a lo largo del degradado, 0.0–1.0.
-    pub offset: f32,
-    pub color: Color,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct LayoutDocument {
-    pub viewport_width: f32,
-    pub content_height: f32,
-    pub commands: Vec<PaintCommand>,
-    pub warnings: Vec<String>,
-}
+pub use wisp_paint::{BgImage, Color, GradientStop, LayoutDocument, PaintCommand, Rect};
 
 #[derive(Clone, Debug)]
 pub struct FetchedPage {
@@ -386,6 +298,21 @@ pub struct ImageResource {
 struct PreparedDocument {
     roots: Vec<DomNode>,
     warnings: Vec<String>,
+}
+
+/// Enlace bajo un punto de la página, en coordenadas CSS del documento.
+///
+/// La lista de pintura no conserva identidad de nodo, así que un «clic»
+/// headless solo puede resolver enlaces: el texto con `href` y las imágenes
+/// con `href`. Es el mismo criterio con el que la GUI resuelve los clics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HitTarget {
+    /// `href` tal como lo escribe la página (relativo o absoluto).
+    pub href: String,
+    /// URL absoluta resuelta contra la página, solo si es http(s).
+    pub url: Option<String>,
+    /// Texto visible del enlace; `None` si el objetivo es una imagen.
+    pub text: Option<String>,
 }
 
 impl FetchedPage {
@@ -436,7 +363,7 @@ impl FetchedPage {
         self.scripted
             .get_or_init(|| {
                 let document = Html::parse_document(&self.html);
-                let script_result = script::execute_scripts(
+                let script_result = wisp_js::execute_scripts(
                     &document,
                     &self.external_scripts,
                     &self.module_scripts,
@@ -517,6 +444,95 @@ impl FetchedPage {
         let text = out.trim().to_owned();
         (!text.is_empty()).then_some(text)
     }
+
+    /// HTML serializado del documento **después** de la etapa de scripts: es el
+    /// DOM que el motor realmente maqueta, ya con las mutaciones de
+    /// `document.write` y de los scripts aplicadas. [`FetchedPage::html`] es el
+    /// cuerpo de la respuesta tal cual; este método es su versión viva.
+    pub fn document_html(&self) -> Result<String> {
+        let scripted = self
+            .scripted_document()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(scripted.html)
+    }
+
+    /// Evalúa `source` contra el DOM vivo de la página y devuelve su valor.
+    ///
+    /// El contexto de JavaScript es efímero (Boa no es `Send`): se levanta
+    /// desde el HTML ya con los scripts de la página aplicados, ejecuta la
+    /// expresión y se descarta. Por eso `eval_js` ve el DOM pero no las
+    /// variables que definió la página, y las mutaciones que haga no
+    /// sobreviven a la siguiente llamada.
+    pub fn eval_js(&self, source: &str) -> Result<EvalResult> {
+        let html = self.document_html().unwrap_or_else(|_| self.html.clone());
+        wisp_js::evaluate_expression(&html, Some(&self.final_url), SCRIPT_VIEWPORT_WIDTH, source)
+    }
+
+    /// Enlace cuyo área pintada contiene el punto (`x`, `y`) en coordenadas CSS
+    /// del documento. Se maqueta a [`READER_VIEWPORT_WIDTH`] y se recorre la
+    /// lista de pintura al revés (lo último pintado queda encima), igual que la
+    /// GUI resuelve los clics en `ui.rs`.
+    pub fn hit_test(&self, x: f32, y: f32) -> Result<Option<HitTarget>> {
+        let document = self.layout(READER_VIEWPORT_WIDTH)?;
+        let base = url::Url::parse(&self.final_url).ok();
+        for command in document.commands.iter().rev() {
+            let (rect, href, text) = match command {
+                PaintCommand::Text {
+                    x: tx,
+                    y: ty,
+                    content,
+                    font_size,
+                    font_weight,
+                    href: Some(href),
+                    ..
+                } => (
+                    Rect {
+                        x: *tx,
+                        y: *ty,
+                        width: text_width_weighted(
+                            content,
+                            *font_size,
+                            is_bold_weight(*font_weight),
+                        ),
+                        height: text_line_height(*font_size),
+                    },
+                    href.clone(),
+                    Some(content.clone()),
+                ),
+                PaintCommand::Image {
+                    rect,
+                    href: Some(href),
+                    ..
+                } => (*rect, href.clone(), None),
+                _ => continue,
+            };
+            if !rect_contains(rect, x, y) {
+                continue;
+            }
+            let url = base
+                .as_ref()
+                .and_then(|base| base.join(&href).ok())
+                .filter(|url| matches!(url.scheme(), "http" | "https"))
+                .map(|url| url.to_string());
+            return Ok(Some(HitTarget { href, url, text }));
+        }
+        Ok(None)
+    }
+
+    /// Vista Markdown del documento preparado: una conversión de lectura, no un
+    /// clon fiel del HTML. Respeta la jerarquía de bloques, los encabezados, los
+    /// enlaces, las imágenes, las listas, el código y el énfasis que el DOM ya
+    /// expone, y omite los nodos ocultos (`display:none`).
+    pub fn markdown(&self) -> Result<String> {
+        let prepared = self
+            .prepared_document(READER_VIEWPORT_WIDTH)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let mut out = String::new();
+        for root in &prepared.roots {
+            collect_markdown_block(root, &mut out);
+        }
+        Ok(trim_markdown(out))
+    }
 }
 
 fn collect_reader_text(node: &DomNode, out: &mut String) {
@@ -550,6 +566,221 @@ fn collect_reader_text(node: &DomNode, out: &mut String) {
     if block && !out.ends_with('\n') {
         out.push('\n');
     }
+}
+
+/// Aplana los espacios de un nodo de texto conservando un único espacio inicial
+/// o final cuando el original los tenía: así `Hello <b>world</b>` no pega las
+/// palabras al insertar las marcas de énfasis.
+fn collapse_dom_whitespace(text: &str) -> String {
+    let mut out = String::new();
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            pending_space = true;
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+    if pending_space {
+        out.push(' ');
+    }
+    out
+}
+
+/// Texto plano de un subárbol, sin marcas: se usa para los bloques `pre`.
+fn collect_plain_text(node: &DomNode, out: &mut String) {
+    if node.tag.is_none() {
+        out.push_str(&node.text);
+        return;
+    }
+    for child in &node.children {
+        collect_plain_text(child, out);
+    }
+}
+
+/// Markdown *inline* de un nodo: devuelve una cadena con enlaces, imágenes y
+/// énfasis resueltos, o vacía si el nodo está oculto.
+fn inline_markdown(node: &DomNode) -> String {
+    let Some(tag) = node.tag.as_deref() else {
+        return collapse_dom_whitespace(&node.text);
+    };
+    if is_hidden(node) {
+        return String::new();
+    }
+    match tag {
+        "br" => "  \n".to_owned(),
+        "img" => node
+            .image
+            .as_ref()
+            .map(|image| format!("![{}]({})", image.alt, image.src))
+            .unwrap_or_default(),
+        "a" => {
+            let text = inline_markdown_children(node);
+            match &node.href {
+                Some(href) if !text.trim().is_empty() => format!("[{}]({href})", text.trim()),
+                _ => text,
+            }
+        }
+        "strong" | "b" => wrap_inline(node, "**"),
+        "em" | "i" => wrap_inline(node, "*"),
+        "code" => wrap_inline(node, "`"),
+        _ => inline_markdown_children(node),
+    }
+}
+
+fn inline_markdown_children(node: &DomNode) -> String {
+    let mut text = String::new();
+    for child in &node.children {
+        text.push_str(&inline_markdown(child));
+    }
+    text
+}
+
+fn wrap_inline(node: &DomNode, marker: &str) -> String {
+    let text = inline_markdown_children(node);
+    if text.trim().is_empty() {
+        return text;
+    }
+    format!("{marker}{}{marker}", text.trim())
+}
+
+fn push_markdown_paragraph(node: &DomNode, out: &mut String) {
+    let text = inline_markdown(node);
+    let text = text.trim();
+    if !text.is_empty() {
+        out.push_str(text);
+        out.push_str("\n\n");
+    }
+}
+
+/// Renderiza un nodo como bloque Markdown. Los contenedores con hijos de bloque
+/// (`div`, `section`, `article`…) se recorren en profundidad; los que solo
+/// contienen contenido inline se tratan como un párrafo.
+fn collect_markdown_block(node: &DomNode, out: &mut String) {
+    let Some(tag) = node.tag.as_deref() else {
+        if !node.text.trim().is_empty() {
+            out.push_str(collapse_dom_whitespace(&node.text).trim());
+            out.push_str("\n\n");
+            return;
+        }
+        for child in &node.children {
+            collect_markdown_block(child, out);
+        }
+        return;
+    };
+    if is_hidden(node) {
+        return;
+    }
+    match tag {
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            let level = tag[1..].parse::<usize>().unwrap_or(1);
+            let text = inline_markdown(node);
+            let text = text.trim();
+            if !text.is_empty() {
+                out.push_str(&"#".repeat(level));
+                out.push(' ');
+                out.push_str(text);
+                out.push_str("\n\n");
+            }
+        }
+        "p" => push_markdown_paragraph(node, out),
+        "hr" => out.push_str("---\n\n"),
+        "ul" | "ol" => collect_markdown_list(node, out, 0),
+        "blockquote" => {
+            let mut inner = String::new();
+            for child in &node.children {
+                collect_markdown_block(child, &mut inner);
+            }
+            let quoted = inner
+                .trim()
+                .lines()
+                .map(|line| format!("> {line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !quoted.is_empty() {
+                out.push_str(&quoted);
+                out.push_str("\n\n");
+            }
+        }
+        "pre" => {
+            let mut text = String::new();
+            collect_plain_text(node, &mut text);
+            if !text.trim().is_empty() {
+                out.push_str("```\n");
+                out.push_str(text.trim_end());
+                out.push_str("\n```\n\n");
+            }
+        }
+        _ => {
+            if node.children.iter().any(is_block) {
+                for child in &node.children {
+                    collect_markdown_block(child, out);
+                }
+            } else {
+                push_markdown_paragraph(node, out);
+            }
+        }
+    }
+}
+
+fn collect_markdown_list(node: &DomNode, out: &mut String, depth: usize) {
+    let ordered = node.tag.as_deref() == Some("ol");
+    let mut number = 1;
+    for child in &node.children {
+        if child.tag.as_deref() != Some("li") || is_hidden(child) {
+            continue;
+        }
+        let indent = "  ".repeat(depth);
+        let marker = if ordered {
+            let marker = format!("{number}. ");
+            number += 1;
+            marker
+        } else {
+            "- ".to_owned()
+        };
+        let mut item = String::new();
+        let mut nested = String::new();
+        for grand in &child.children {
+            match grand.tag.as_deref() {
+                Some("ul") | Some("ol") => collect_markdown_list(grand, &mut nested, depth + 1),
+                _ => item.push_str(&inline_markdown(grand)),
+            }
+        }
+        out.push_str(&indent);
+        out.push_str(&marker);
+        out.push_str(item.trim());
+        out.push('\n');
+        if !nested.is_empty() {
+            out.push_str(&nested);
+        }
+    }
+    out.push('\n');
+}
+
+/// Colapsa líneas en blanco consecutivas y recorta el resultado: la
+/// conversión añade separadores de bloque generosos y este último pase los deja
+/// en un único salto doble entre bloques.
+fn trim_markdown(markdown: String) -> String {
+    let mut out = String::new();
+    let mut blank = 0;
+    for line in markdown.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            blank += 1;
+            if blank > 1 {
+                continue;
+            }
+        } else {
+            blank = 0;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim_end().to_owned()
 }
 
 /// Heurística de producto para el "smart engine" de Ghost: URLs con pinta de
@@ -1310,7 +1541,7 @@ pub fn layout_html_with_all_resources(
     );
 
     let document = Html::parse_document(html);
-    let script_result = script::execute_scripts(
+    let script_result = wisp_js::execute_scripts(
         &document,
         external_scripts,
         module_scripts,
@@ -7666,6 +7897,115 @@ fetch("http://{data_address}/data.json").then(function () {{
                 .reader_text()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn markdown_renders_blocks_links_lists_emphasis_and_code() {
+        let page = fetched_page(
+            "<html><body>\
+             <h1>Título</h1>\
+             <p>Hola <b>mundo</b> y <a href=\"/x\">enlace</a></p>\
+             <ul><li>uno</li><li>dos <em>dos</em></li></ul>\
+             <blockquote>nota</blockquote>\
+             <pre>let x = 1;</pre>\
+             <div style=\"display:none\">secreto</div>\
+             <script>var x=1;</script>\
+             </body></html>",
+        );
+        let markdown = page.markdown().unwrap();
+        assert!(markdown.contains("# Título"), "{markdown}");
+        assert!(
+            markdown.contains("Hola **mundo** y [enlace](/x)"),
+            "{markdown}"
+        );
+        assert!(markdown.contains("- uno"), "{markdown}");
+        assert!(markdown.contains("- dos *dos*"), "{markdown}");
+        assert!(markdown.contains("> nota"), "{markdown}");
+        assert!(markdown.contains("```\nlet x = 1;\n```"), "{markdown}");
+        assert!(!markdown.contains("secreto"), "{markdown}");
+        assert!(!markdown.contains("var x"), "{markdown}");
+    }
+
+    #[test]
+    fn document_html_returns_the_serialized_document() {
+        let page = fetched_page("<html><body><h1>Título</h1></body></html>");
+        let html = page.document_html().unwrap();
+        assert!(html.contains("Título"), "{html}");
+    }
+
+    #[test]
+    fn eval_js_reads_the_live_dom() {
+        let page = fetched_page("<html><body><p id=\"x\">hola</p></body></html>");
+        let result = page
+            .eval_js("document.getElementById('x').textContent")
+            .unwrap();
+        assert_eq!(result.value, Some(serde_json::json!("hola")));
+    }
+
+    #[test]
+    fn eval_js_reads_the_page_url() {
+        let page = fetched_page("<html><body></body></html>");
+        let result = page.eval_js("location.href").unwrap();
+        assert_eq!(
+            result.value,
+            Some(serde_json::json!("https://example.com/article"))
+        );
+    }
+
+    /// Centro aproximado del enlace de texto `label`, en coordenadas CSS del
+    /// documento, leído de la propia lista de pintura.
+    fn link_center(page: &FetchedPage, label: &str) -> (f32, f32) {
+        let document = page.layout(READER_VIEWPORT_WIDTH).unwrap();
+        document
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                PaintCommand::Text {
+                    x,
+                    y,
+                    content,
+                    font_size,
+                    ..
+                } if content.as_str() == label => {
+                    Some((*x + 1.0, *y + text_line_height(*font_size) / 2.0))
+                }
+                _ => None,
+            })
+            .expect("la página debería pintar el enlace")
+    }
+
+    #[test]
+    fn hit_test_finds_the_link_under_the_point() {
+        let page =
+            fetched_page(r#"<html><body><p><a href="/next">Siguiente</a></p></body></html>"#);
+        let (cx, cy) = link_center(&page, "Siguiente");
+        let target = page
+            .hit_test(cx, cy)
+            .unwrap()
+            .expect("debería encontrar el enlace");
+        assert_eq!(target.href, "/next");
+        assert_eq!(target.url.as_deref(), Some("https://example.com/next"));
+        assert_eq!(target.text.as_deref(), Some("Siguiente"));
+    }
+
+    #[test]
+    fn hit_test_ignores_points_outside_any_link() {
+        let page = fetched_page(r#"<html><body><a href="/next">Ir</a></body></html>"#);
+        assert_eq!(page.hit_test(0.0, 5000.0).unwrap(), None);
+    }
+
+    #[test]
+    fn hit_test_marks_non_http_links_as_not_navigable() {
+        let page = fetched_page(
+            r#"<html><body><a href="mailto:hola@example.com">Correo</a></body></html>"#,
+        );
+        let (cx, cy) = link_center(&page, "Correo");
+        let target = page
+            .hit_test(cx, cy)
+            .unwrap()
+            .expect("debería encontrar el enlace");
+        assert_eq!(target.href, "mailto:hola@example.com");
+        assert_eq!(target.url, None);
     }
 
     #[test]

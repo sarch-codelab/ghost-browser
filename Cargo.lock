@@ -1849,7 +1849,9 @@ dependencies = [
  "windows",
  "windows-core",
  "winit",
+ "wisp-cdp",
  "wisp-engine",
+ "wisp-mcp",
  "wry",
 ]
 
@@ -6449,21 +6451,65 @@ dependencies = [
 ]
 
 [[package]]
+name = "wisp-cdp"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "webview2-com",
+ "windows",
+ "windows-core",
+ "wry",
+]
+
+[[package]]
 name = "wisp-engine"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
  "base64",
- "boa_engine",
  "ego-tree",
  "imagesize",
  "reqwest",
  "scraper",
- "serde",
  "serde_json",
  "taffy",
  "url",
+ "wisp-js",
+ "wisp-paint",
+]
+
+[[package]]
+name = "wisp-idl"
+version = "0.1.0"
+
+[[package]]
+name = "wisp-js"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boa_engine",
+ "ego-tree",
+ "reqwest",
+ "scraper",
+ "serde",
+ "serde_json",
+ "url",
+ "wisp-idl",
+]
+
+[[package]]
+name = "wisp-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "wisp-paint"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

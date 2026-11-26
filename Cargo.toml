@@ -28,7 +28,9 @@ url = "2.5.8"
 wgpu = "30.0.1"
 winit = "0.30"
 wry = { version = "0.57.2", features = ["devtools"] }
+wisp-cdp = { path = "wisp/crates/wisp-cdp" }
 wisp-engine = { path = "wisp" }
+wisp-mcp = { path = "wisp/crates/wisp-mcp" }
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"

@@ -354,6 +354,26 @@
         }
     }
 
+    // Compara dos nodos como lo hace `Node.isEqualNode`: mismo tipo, mismos
+    // datos y, recursivamente, mismos hijos y atributos.
+    function nodesEqual(a, b) {
+        if (a === b) return true;
+        if (!a || !b || a._type !== b._type) return false;
+        if (a._type === 3 || a._type === 8) return a._text === b._text;
+        if (a._type === 1) {
+            if (a._tag !== b._tag) return false;
+            if (a._attributes.size !== b._attributes.size) return false;
+            for (const [name, value] of a._attributes) {
+                if (b._attributes.get(name) !== value) return false;
+            }
+        }
+        if (a._children.length !== b._children.length) return false;
+        for (let index = 0; index < a._children.length; index++) {
+            if (!nodesEqual(a._children[index], b._children[index])) return false;
+        }
+        return true;
+    }
+
     class WispNode extends WispEventTarget {
         constructor(nodeType) {
             super();
@@ -368,6 +388,25 @@
         }
 
         get nodeType() { return this._type; }
+
+        get nodeName() {
+            switch (this._type) {
+                case 1: return this._tag.toUpperCase();
+                case 3: return "#text";
+                case 8: return "#comment";
+                case 9: return "#document";
+                case 11: return "#document-fragment";
+                default: return "#node";
+            }
+        }
+
+        get nodeValue() { return this._text === undefined ? null : this._text; }
+        set nodeValue(value) {
+            if (this._text === undefined) return;
+            this._text = value === null || value === undefined ? "" : String(value);
+            bump();
+        }
+
         get parentNode() { return this._parent; }
         get parentElement() { return this._parent && this._parent._type === 1 ? this._parent : null; }
         get childNodes() { return this._children.slice(); }
@@ -471,6 +510,8 @@
             }
             return false;
         }
+
+        isEqualNode(other) { return nodesEqual(this, other); }
 
         cloneNode(deep) {
             if (this._type === 3) return new WispText(this._text);
@@ -579,6 +620,35 @@
 
         get className() { return this.getAttribute("class") || ""; }
         set className(value) { this.setAttribute("class", value); }
+
+        get title() { return this.getAttribute("title") || ""; }
+        set title(value) { this.setAttribute("title", value === null || value === undefined ? "" : String(value)); }
+
+        get lang() { return this.getAttribute("lang") || ""; }
+        set lang(value) { this.setAttribute("lang", value === null || value === undefined ? "" : String(value)); }
+
+        get dir() { return this.getAttribute("dir") || ""; }
+        set dir(value) { this.setAttribute("dir", value === null || value === undefined ? "" : String(value)); }
+
+        get accessKey() { return this.getAttribute("accesskey") || ""; }
+        set accessKey(value) { this.setAttribute("accesskey", value === null || value === undefined ? "" : String(value)); }
+
+        get hidden() { return this.hasAttribute("hidden"); }
+        set hidden(value) {
+            if (value) this.setAttribute("hidden", "");
+            else this.removeAttribute("hidden");
+        }
+
+        get outerText() { return this.textContent; }
+        set outerText(value) {
+            const text = value === null || value === undefined ? "" : String(value);
+            const parent = this._parent;
+            if (!parent) {
+                this.textContent = text;
+                return;
+            }
+            parent.replaceChild(new WispText(text), this);
+        }
 
         getAttribute(name) {
             const key = String(name).toLowerCase();
@@ -1089,7 +1159,7 @@
     class WispDocument extends WispNode {
         constructor() {
             super(9);
-            this.readyState = "loading";
+            this._readyState = "loading";
             this._title = "";
             this.currentScript = null;
             this.visibilityState = "visible";
@@ -1097,6 +1167,12 @@
         }
 
         get nodeName() { return "#document"; }
+
+        get doctype() { return null; }
+        get readyState() { return this._readyState; }
+        set readyState(value) { this._readyState = String(value); }
+        get images() { return this.getElementsByTagName("img"); }
+        get links() { return this.getElementsByTagName("a"); }
 
         get title() {
             const element = this.querySelector("title");
@@ -1210,6 +1286,27 @@
         close() {}
         execCommand() { return false; }
         queryCommandSupported() { return false; }
+    }
+
+    // Objeto global de la ventana. En Wisp el propio `globalThis` hace de
+    // ventana, así que las propiedades leen de ahí; la clase existe para
+    // describir la interfaz `Window` y para el objeto que despacha eventos.
+    class WispWindow extends WispEventTarget {
+        get window() { return globalThis; }
+        get self() { return globalThis; }
+        get document() { return documentObject; }
+        get location() { return locationObject; }
+        get innerWidth() { return viewport.width; }
+        get innerHeight() { return viewport.height; }
+        get closed() { return false; }
+        get name() { return this._name || ""; }
+        set name(value) { this._name = value === null || value === undefined ? "" : String(value); }
+        get event() { return undefined; }
+        alert() {}
+        close() {}
+        focus() {}
+        blur() {}
+        open() { return null; }
     }
 
     function parseAttributes(text, element) {
@@ -1835,7 +1932,7 @@
         return runtimeWarnings.splice(0, runtimeWarnings.length);
     }
 
-    windowTarget = new WispEventTarget();
+    windowTarget = new WispWindow();
     documentObject = new WispDocument();
 
     // Build the initial tree without marking every node as a mutation.
@@ -1875,7 +1972,9 @@
     globalThis.Node = WispNode;
     globalThis.Element = WispElement;
     globalThis.HTMLElement = WispElement;
+    globalThis.Document = WispDocument;
     globalThis.HTMLDocument = WispDocument;
+    globalThis.Window = WispWindow;
     globalThis.Text = WispText;
     globalThis.Comment = WispComment;
     globalThis.DocumentFragment = WispDocumentFragment;

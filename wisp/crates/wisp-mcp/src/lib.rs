@@ -1,42 +1,75 @@
-//! ghost-mcp: puente MCP (Model Context Protocol) sobre la API remota de
-//! Ghost. Habla JSON-RPC 2.0 por stdio — cualquier cliente MCP (Claude,
-//! Cursor, Devin, scripts propios) puede conducir el navegador como
-//! herramienta nativa.
+//! Puente MCP (Model Context Protocol) sobre el API de control local de un
+//! host Wisp/Ghost. Habla JSON-RPC 2.0 por stdio, de modo que cualquier
+//! cliente MCP (Claude, Cursor, Devin, scripts propios) puede conducir el
+//! navegador como herramienta nativa.
 //!
-//! Requiere Ghost abierto (la API escucha en 127.0.0.1:47820, o el puerto
-//! de GHOST_REMOTE_PORT).
+//! Es agnóstico del host: apunta al API de control en `WISP_REMOTE_PORT` /
+//! `GHOST_REMOTE_PORT` (por defecto `127.0.0.1:47820`), así el **mismo cliente
+//! y la misma configuración** funcionan contra Ghost o contra
+//! `wisp-agent serve`.
+
+pub mod client;
+pub mod control;
 
 use serde_json::{Value, json};
-use std::io::{BufRead, Read, Write};
-use std::net::TcpStream;
+use std::io::{BufRead, Write};
 
-const PROTOCOL_VERSION: &str = "2024-11-05";
+/// Versión del protocolo MCP anunciada si el cliente no propone otra.
+pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
-fn api_base() -> String {
-    let port = std::env::var("GHOST_REMOTE_PORT").unwrap_or_else(|_| "47820".into());
-    format!("127.0.0.1:{port}")
+/// Bucle stdio: lee JSON-RPC por línea y responde por stdout.
+pub fn run_stdio() {
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(request) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(response) = handle_request(&request) {
+            let _ = writeln!(stdout, "{response}");
+            let _ = stdout.flush();
+        }
+    }
 }
 
-/// Cliente HTTP/1.1 mínimo: una petición por conexión, `Connection: close`.
-fn http(method: &str, path: &str, body: Option<&str>) -> Result<Value, String> {
-    let mut stream =
-        TcpStream::connect(api_base()).map_err(|e| format!("Ghost no responde: {e}"))?;
-    let body = body.unwrap_or("");
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        api_base(),
-        body.len()
-    );
-    stream
-        .write_all(request.as_bytes())
-        .and_then(|_| stream.flush())
-        .map_err(|e| e.to_string())?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| e.to_string())?;
-    let json_start = response.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-    serde_json::from_str(&response[json_start..]).map_err(|e| format!("respuesta inválida: {e}"))
+/// Responde una petición JSON-RPC 2.0. `None` para notificaciones.
+pub fn handle_request(request: &Value) -> Option<Value> {
+    let id = request.get("id").cloned()?;
+    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+    let result = match method {
+        "initialize" => {
+            let version = request
+                .pointer("/params/protocolVersion")
+                .and_then(Value::as_str)
+                .unwrap_or(PROTOCOL_VERSION);
+            json!({
+                "protocolVersion": version,
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "wisp-mcp", "version": env!("CARGO_PKG_VERSION")}
+            })
+        }
+        "ping" => json!({}),
+        "tools/list" => json!({"tools": tool_definitions()}),
+        "tools/call" => {
+            let params = request.get("params").cloned().unwrap_or(json!({}));
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            let args = params.get("arguments").cloned().unwrap_or(json!({}));
+            call_tool(name, &args)
+        }
+        _ => {
+            return Some(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32601, "message": format!("método no soportado: {method}")}
+            }));
+        }
+    };
+    Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
 fn tool_result(value: Value) -> Value {
@@ -46,18 +79,19 @@ fn tool_result(value: Value) -> Value {
     })
 }
 
-fn call_tool(name: &str, args: &Value) -> Value {
+/// Ejecuta una herramienta del contrato contra el API de control.
+pub fn call_tool(name: &str, args: &Value) -> Value {
     let result = match name {
-        "ghost_health" => http("GET", "/health", None),
-        "ghost_tabs" => http("GET", "/tabs", None),
+        "ghost_health" => client::http("GET", "/health", None),
+        "ghost_tabs" => client::http("GET", "/tabs", None),
         "ghost_open_tab" => {
             let url = args.get("url").and_then(Value::as_str).unwrap_or("");
-            http("POST", "/tabs", Some(&json!({"url": url}).to_string()))
+            client::http("POST", "/tabs", Some(&json!({"url": url}).to_string()))
         }
         "ghost_navigate" => {
             let id = args.get("tab_id").and_then(Value::as_u64).unwrap_or(0);
             let url = args.get("url").and_then(Value::as_str).unwrap_or("");
-            http(
+            client::http(
                 "POST",
                 &format!("/tabs/{id}/navigate"),
                 Some(&json!({"url": url}).to_string()),
@@ -72,12 +106,12 @@ fn call_tool(name: &str, args: &Value) -> Value {
             ) {
                 return tool_result(json!({"ok": false, "error": "acción desconocida"}));
             }
-            http("POST", &format!("/tabs/{id}/{action}"), None)
+            client::http("POST", &format!("/tabs/{id}/{action}"), None)
         }
         "ghost_eval" => {
             let id = args.get("tab_id").and_then(Value::as_u64).unwrap_or(0);
             let js = args.get("js").and_then(Value::as_str).unwrap_or("");
-            http(
+            client::http(
                 "POST",
                 &format!("/tabs/{id}/eval"),
                 Some(&json!({"js": js}).to_string()),
@@ -100,7 +134,7 @@ fn call_tool(name: &str, args: &Value) -> Value {
                 "method": args.get("method"),
                 "params": args.get("params"),
             });
-            http(
+            client::http(
                 "POST",
                 &format!("/tabs/{id}/{endpoint}"),
                 Some(&body.to_string()),
@@ -118,21 +152,22 @@ fn call_tool(name: &str, args: &Value) -> Value {
     }
 }
 
-fn tool_definitions() -> Value {
+/// Definición de herramientas expuesta por `tools/list`.
+pub fn tool_definitions() -> Value {
     json!([
         {
             "name": "ghost_health",
-            "description": "Comprueba que Ghost está abierto y su API remota responde.",
+            "description": "Comprueba que el host está abierto y su API de control responde.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
             "name": "ghost_tabs",
-            "description": "Lista las pestañas de Ghost: id, título, url, motor (WebView2/Wisp), activa, cargando, suspendida.",
+            "description": "Lista las pestañas del host: id, título, url, motor (WebView2/Wisp), activa, cargando, suspendida.",
             "inputSchema": {"type": "object", "properties": {}}
         },
         {
             "name": "ghost_open_tab",
-            "description": "Abre una pestaña nueva en Ghost y navega a la URL indicada.",
+            "description": "Abre una pestaña nueva y navega a la URL indicada.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"url": {"type": "string", "description": "URL http(s)"}},
@@ -165,7 +200,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "ghost_eval",
-            "description": "Evalúa JavaScript en una pestaña WebView2 y devuelve el resultado (soporta promesas). Para Wisp usa ghost_tab_action/text.",
+            "description": "Evalúa JavaScript en una pestaña y devuelve el resultado. En Ghost (WebView2) soporta promesas; en el motor Wisp usa un contexto Boa efímero sobre el HTML de la página (ve el DOM, pero no las variables que definió la página).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -177,7 +212,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "ghost_click",
-            "description": "Clic de ratón real (CDP Input.dispatchMouseEvent) en coordenadas CSS de la página. button: left|middle|right, clicks: 1-3.",
+            "description": "Clic de ratón real (CDP Input.dispatchMouseEvent) en coordenadas CSS de la página. button: left|middle|right, clicks: 1-3. En el motor Wisp headless un clic solo resuelve enlaces: navega si hay uno bajo (x, y).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -192,7 +227,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "ghost_type",
-            "description": "Inserta texto en el elemento con foco de la página (CDP Input.insertText). Enfoca antes con ghost_click si hace falta.",
+            "description": "Inserta texto en el elemento con foco de la página (CDP Input.insertText). Enfoca antes con ghost_click si hace falta. Solo en hosts con WebView2: el motor Wisp headless no tiene foco.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -204,7 +239,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "ghost_press",
-            "description": "Pulsa una tecla: enter, tab, escape/esc, backspace, delete, space, arrowleft/up/right/down (o left/up/right/down), home, end, pageup, pagedown, insert.",
+            "description": "Pulsa una tecla: enter, tab, escape/esc, backspace, delete, space, arrowleft/up/right/down (o left/up/right/down), home, end, pageup, pagedown, insert. Solo en hosts con WebView2.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -216,7 +251,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "ghost_scroll",
-            "description": "Rueda del ratón (CDP mouseWheel). deltaY positivo baja, negativo sube; deltaX para horizontal. x/y opcionales fijan la posición.",
+            "description": "Rueda del ratón (CDP mouseWheel). deltaY positivo baja, negativo sube; deltaX para horizontal. x/y opcionales fijan la posición. Solo en hosts con WebView2: el motor Wisp headless maqueta el documento completo.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -231,7 +266,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "ghost_move",
-            "description": "Mueve el cursor del ratón a coordenadas CSS de la página (sin clicar).",
+            "description": "Mueve el cursor del ratón a coordenadas CSS de la página (sin clicar). En el motor Wisp headless informa del enlace bajo (x, y) en vez de mover un cursor real.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -268,57 +303,4 @@ fn tool_definitions() -> Value {
             }
         }
     ])
-}
-
-fn handle_request(request: &Value) -> Option<Value> {
-    let id = request.get("id").cloned()?;
-    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-    let result = match method {
-        "initialize" => {
-            let version = request
-                .pointer("/params/protocolVersion")
-                .and_then(Value::as_str)
-                .unwrap_or(PROTOCOL_VERSION);
-            json!({
-                "protocolVersion": version,
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "ghost-mcp", "version": env!("CARGO_PKG_VERSION")}
-            })
-        }
-        "ping" => json!({}),
-        "tools/list" => json!({"tools": tool_definitions()}),
-        "tools/call" => {
-            let params = request.get("params").cloned().unwrap_or(json!({}));
-            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-            let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            call_tool(name, &args)
-        }
-        _ => {
-            return Some(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": -32601, "message": format!("método no soportado: {method}")}
-            }));
-        }
-    };
-    Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
-}
-
-fn main() {
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(request) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if let Some(response) = handle_request(&request) {
-            let _ = writeln!(stdout, "{response}");
-            let _ = stdout.flush();
-        }
-    }
 }

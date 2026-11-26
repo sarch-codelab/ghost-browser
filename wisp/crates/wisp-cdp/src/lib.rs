@@ -1,9 +1,10 @@
-//! Control profundo de WebView2 vía Chrome DevTools Protocol (CDP) y
-//! captura de pantalla, usado por la API remota para que agentes de IA
-//! puedan ver y manipular la página (clicks, tecleo, scroll, screenshots).
+//! Control profundo de un host WebView2 vía Chrome DevTools Protocol (CDP) y
+//! captura de pantalla, para que agentes de IA puedan ver y manipular la
+//! página (clicks, tecleo, scroll, screenshots).
 //!
-//! Sólo existe en Windows (WebView2); en otras plataformas las funciones
-//! devuelven error para que la API remota responda limpio.
+//! Vive en el motor (no en la app) para que cualquier host que incruste
+//! WebView2 comparta la misma capa CDP. Sólo Windows compila la implementación
+//! real; en otras plataformas las funciones devuelven un error limpio.
 
 use serde_json::{Value, json};
 use std::sync::mpsc::Sender;

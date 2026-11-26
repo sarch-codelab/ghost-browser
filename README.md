@@ -171,17 +171,22 @@ curl -X POST http://127.0.0.1:47820/tabs/3/click -d '{\"x\":400,\"y\":300}'
 curl -X POST http://127.0.0.1:47820/tabs/3/screenshot -d '{}'
 ```
 
-### `ghost-mcp`: Ghost como herramienta MCP
+### `wisp-mcp`: Ghost (y el motor headless) como herramienta MCP
 
-El paquete incluye un segundo binario, `ghost-mcp`, que habla
+El puente MCP vive en el crate `wisp-mcp`, con dos binarios: `wisp-mcp` y el
+alias histórico `ghost-mcp`. Habla
 [Model Context Protocol](https://modelcontextprotocol.io) por stdio
 (JSON-RPC 2.0). Cualquier cliente MCP — Claude Desktop, Cursor, Devin,
-scripts propios — puede usar Ghost como herramienta nativa sin tocar la API
-HTTP directamente:
+scripts propios — puede usar el navegador como herramienta nativa sin tocar la
+API HTTP directamente:
 
 ```powershell
-cargo build --release --bin ghost-mcp
+cargo build --release -p wisp-mcp   # se ejecuta dentro de wisp/
 ```
+
+El **mismo binario y la misma configuración** controlan Ghost (WebView2) o el
+motor headless `wisp-agent serve`; solo cambia el puerto, que se fija con
+`WISP_REMOTE_PORT` / `GHOST_REMOTE_PORT` (por defecto `127.0.0.1:47820`).
 
 Configuración MCP de ejemplo:
 
@@ -189,7 +194,7 @@ Configuración MCP de ejemplo:
 {
   "mcpServers": {
     "ghost": {
-      "command": "C:/ruta/a/ghost-mcp.exe"
+      "command": "C:/ruta/a/wisp-mcp.exe"
     }
   }
 }
@@ -200,6 +205,10 @@ Herramientas expuestas: `ghost_health`, `ghost_tabs`, `ghost_open_tab`,
 text), `ghost_eval`, `ghost_click`, `ghost_type`, `ghost_press`,
 `ghost_scroll`, `ghost_move`, `ghost_screenshot` y `ghost_cdp` (acceso
 crudo al Chrome DevTools Protocol).
+
+> Contra `wisp-agent`, las rutas que dependen del motor nativo (eval, click,
+> type, press, scroll, move, cdp, screenshot) aún devuelven un error explícito;
+> se habilitan al completar los bloques de DOM/JS e Input del backlog.
 
 > **Aviso de seguridad**: la API no tiene autenticación porque solo escucha
 > en loopback, pero cualquier proceso local de tu equipo puede controlar el

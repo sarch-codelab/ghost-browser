@@ -2,7 +2,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod browser;
-mod cdp;
 mod logo;
 mod perf;
 mod remote;
@@ -241,7 +240,28 @@ fn parse_cli() -> CliOptions {
             _ => {}
         }
     }
+    // El flag de la CLI tiene prioridad; si no hay, `GHOST_ENGINE` fija el
+    // motor desde el entorno (útil para benchmarks y CI).
+    if options.engine.is_none() {
+        options.engine = engine_from_env();
+    }
     options
+}
+
+/// `GHOST_ENGINE=wisp|webview2|auto` fija el motor desde el entorno, igual que
+/// `--wisp`/`--webview2`. `auto` (o un valor desconocido) no fuerza nada: los
+/// ajustes y la heurística deciden.
+fn engine_from_env() -> Option<BrowserEngine> {
+    match std::env::var("GHOST_ENGINE")
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "wisp" => Some(BrowserEngine::Wisp),
+        "webview2" | "webview" | "chromium" | "chrome" => Some(BrowserEngine::WebView2),
+        _ => None,
+    }
 }
 
 struct App {
@@ -363,7 +383,9 @@ impl App {
                 .browser
                 .cli_engine
                 .unwrap_or(self.browser.store.settings.default_engine);
-            if self.browser.cli_engine.is_none()
+            if let Some(forced) = self.browser.forced_engine_for(&url) {
+                engine = forced;
+            } else if self.browser.cli_engine.is_none()
                 && self.browser.store.settings.auto_engine
                 && wisp_engine::url_suits_wisp(&url)
             {

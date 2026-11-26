@@ -603,6 +603,12 @@ impl Browser {
     /// pantalla de error. No marca `engine_manual` — el smart engine puede
     /// volver a probar Wisp en la próxima navegación.
     fn fallback_to_webview(&mut self, tab_id: u64) {
+        // Con Wisp forzado (`--wisp` o `GHOST_ENGINE=wisp`) no se cae a
+        // WebView2: el host debe mostrar el fallo de Wisp, no esconderlo
+        // creando un proceso de Chromium que el usuario no pidió.
+        if self.cli_engine == Some(BrowserEngine::Wisp) {
+            return;
+        }
         let Some(tab) = self.tab_by_id(tab_id) else {
             return;
         };
@@ -1367,6 +1373,29 @@ impl Browser {
         self.navigate_tab_by_id(id, input);
     }
 
+    /// Motor que impone un motor fijado por CLI/entorno (`--wisp`,
+    /// `--webview2` o `GHOST_ENGINE`). Con Wisp forzado toda URL http(s) se
+    /// sirve en Wisp salvo los sitios de la lista explícita que necesita
+    /// Chromium ([`wisp_engine::site_requires_chromium`]): la decisión nunca
+    /// cae en Chromium por defecto. Devuelve `None` si no hay motor forzado o
+    /// la URL no es web (p. ej. `ghost://newtab`).
+    pub fn forced_engine_for(&self, url: &str) -> Option<BrowserEngine> {
+        let forced = self.cli_engine?;
+        if !is_web_url(url) {
+            return None;
+        }
+        Some(match forced {
+            BrowserEngine::WebView2 => BrowserEngine::WebView2,
+            BrowserEngine::Wisp => {
+                if wisp_engine::site_requires_chromium(url) {
+                    BrowserEngine::WebView2
+                } else {
+                    BrowserEngine::Wisp
+                }
+            }
+        })
+    }
+
     pub fn navigate_tab_by_id(&mut self, tab_id: u64, input: &str) {
         // Navegación completa: cualquier sonda SPA pendiente queda obsoleta.
         self.spa_probe_at.remove(&tab_id);
@@ -1387,10 +1416,18 @@ impl Browser {
             self.navigate_to_newtab(tab_id);
             return;
         }
-        // Smart engine: con `auto_engine` activo y sin elección manual del
-        // usuario, la URL decide el motor — artículos/docs en Wisp (liviano),
-        // webapps en WebView2 (compatible).
-        if !engine_manual && self.store.settings.auto_engine && !webview::is_newtab_url(&url) {
+        // Motor forzado (`--wisp`/`--webview2` o `GHOST_ENGINE`) manda sobre el
+        // smart engine: con Wisp forzado se sirve todo lo http(s) salvo los
+        // sitios de la lista explícita que necesita Chromium.
+        if let Some(forced) = self.forced_engine_for(&url) {
+            if !engine_manual && forced != engine {
+                self.reset_tab_for_engine(tab_id, forced);
+                engine = forced;
+            }
+        } else if !engine_manual && self.store.settings.auto_engine {
+            // Smart engine: con `auto_engine` activo y sin elección manual del
+            // usuario, la URL decide el motor — artículos/docs en Wisp (liviano),
+            // webapps en WebView2 (compatible).
             let suggested = if wisp_engine::url_suits_wisp(&url) {
                 BrowserEngine::Wisp
             } else {
@@ -1658,20 +1695,13 @@ impl Browser {
     /// que la página devuelva el resultado por IPC.
     fn handle_remote(
         &mut self,
-        request: &crate::remote::Request,
+        request: &wisp_mcp::control::Request,
         reply: &Sender<serde_json::Value>,
     ) -> Option<serde_json::Value> {
         use serde_json::json;
-        let segments: Vec<&str> = request
-            .path
-            .split('?')
-            .next()
-            .unwrap_or("/")
-            .trim_matches('/')
-            .split('/')
-            .collect();
-        Some(match (request.method.as_str(), segments.as_slice()) {
-            ("GET", ["tabs"]) => {
+        use wisp_mcp::control::Route;
+        Some(match request.route() {
+            Route::ListTabs => {
                 let active_id = self.active_tab().map(|t| t.id);
                 let tabs: Vec<serde_json::Value> = self
                     .tabs
@@ -1690,7 +1720,7 @@ impl Browser {
                     .collect();
                 json!({"ok": true, "tabs": tabs})
             }
-            ("POST", ["tabs"]) => {
+            Route::OpenTab => {
                 let url = request.body.get("url").and_then(|u| u.as_str());
                 match url {
                     Some(url) if is_web_url(url) => {
@@ -1700,74 +1730,48 @@ impl Browser {
                     _ => json!({"ok": false, "error": "falta una 'url' http(s) válida"}),
                 }
             }
-            ("POST", ["tabs", id, "navigate"]) => {
-                let Ok(tab_id) = id.parse::<u64>() else {
-                    return Some(json!({"ok": false, "error": "id de pestaña inválido"}));
-                };
+            Route::Navigate(tab_id) => {
                 let Some(url) = request.body.get("url").and_then(|u| u.as_str()) else {
                     return Some(json!({"ok": false, "error": "falta 'url'"}));
                 };
                 self.navigate_tab_by_id(tab_id, url);
                 json!({"ok": true})
             }
-            (
-                "POST",
-                [
-                    "tabs",
-                    id,
-                    action @ ("back" | "forward" | "reload" | "close" | "activate" | "text"),
-                ],
-            ) => {
-                let Ok(tab_id) = id.parse::<u64>() else {
-                    return Some(json!({"ok": false, "error": "id de pestaña inválido"}));
-                };
-                match *action {
-                    "back" => {
-                        self.navigate_history_for_tab(tab_id, -1);
-                        json!({"ok": true})
-                    }
-                    "forward" => {
-                        self.navigate_history_for_tab(tab_id, 1);
-                        json!({"ok": true})
-                    }
-                    "reload" => {
-                        self.reload_tab_by_id(tab_id);
-                        json!({"ok": true})
-                    }
-                    "close" => {
-                        if let Some(index) = self.tab_index_of(tab_id) {
-                            self.close_tab(index);
-                        }
-                        json!({"ok": true})
-                    }
-                    "activate" => {
-                        if let Some(index) = self.tab_index_of(tab_id) {
-                            self.active = index;
-                            if let Some(t) = self.tabs.get_mut(index) {
-                                t.last_active = Instant::now();
-                            }
-                            self.needs_bounds_sync = true;
-                            self.dirty = true;
-                        }
-                        json!({"ok": true})
-                    }
-                    "text" => self.remote_tab_text(tab_id, reply.clone())?,
-                    _ => unreachable!(),
+            Route::Back(tab_id) => {
+                self.navigate_history_for_tab(tab_id, -1);
+                json!({"ok": true})
+            }
+            Route::Forward(tab_id) => {
+                self.navigate_history_for_tab(tab_id, 1);
+                json!({"ok": true})
+            }
+            Route::Reload(tab_id) => {
+                self.reload_tab_by_id(tab_id);
+                json!({"ok": true})
+            }
+            Route::Close(tab_id) => {
+                if let Some(index) = self.tab_index_of(tab_id) {
+                    self.close_tab(index);
                 }
+                json!({"ok": true})
             }
-            (
-                "POST",
-                [
-                    "tabs",
-                    id,
-                    action @ ("click" | "type" | "press" | "scroll" | "move"),
-                ],
-            ) => {
-                let Ok(tab_id) = id.parse::<u64>() else {
-                    return Some(json!({"ok": false, "error": "id de pestaña inválido"}));
-                };
-                self.remote_input(tab_id, action, &request.body)
+            Route::Activate(tab_id) => {
+                if let Some(index) = self.tab_index_of(tab_id) {
+                    self.active = index;
+                    if let Some(t) = self.tabs.get_mut(index) {
+                        t.last_active = Instant::now();
+                    }
+                    self.needs_bounds_sync = true;
+                    self.dirty = true;
+                }
+                json!({"ok": true})
             }
+            Route::Text(tab_id) => self.remote_tab_text(tab_id, reply.clone())?,
+            Route::Click(tab_id) => self.remote_input(tab_id, "click", &request.body),
+            Route::Type(tab_id) => self.remote_input(tab_id, "type", &request.body),
+            Route::Press(tab_id) => self.remote_input(tab_id, "press", &request.body),
+            Route::Scroll(tab_id) => self.remote_input(tab_id, "scroll", &request.body),
+            Route::Move(tab_id) => self.remote_input(tab_id, "move", &request.body),
             _ => json!({"ok": false, "error": "ruta desconocida"}),
         })
     }
@@ -1996,7 +2000,7 @@ impl Browser {
             _ => return json!({"ok": false, "error": "acción de entrada desconocida"}),
         };
         for (method, params) in &events {
-            if let Err(e) = crate::cdp::fire(webview, method, params) {
+            if let Err(e) = wisp_cdp::fire(webview, method, params) {
                 return json!({"ok": false, "error": e});
             }
         }
@@ -2019,7 +2023,7 @@ impl Browser {
             return;
         };
         let fallback = done.clone();
-        if let Err(e) = crate::cdp::call(webview, method, params, done) {
+        if let Err(e) = wisp_cdp::call(webview, method, params, done) {
             let _ = fallback.send(json!({"ok": false, "error": e}));
         }
     }
@@ -2050,7 +2054,7 @@ impl Browser {
                 .join(path.file_name().unwrap_or_default())
         };
         let fallback = done.clone();
-        if let Err(e) = crate::cdp::screenshot(webview, &path, done) {
+        if let Err(e) = wisp_cdp::screenshot(webview, &path, done) {
             let _ = fallback.send(json!({"ok": false, "error": e}));
         }
     }
@@ -2748,6 +2752,29 @@ mod tests {
     }
 
     #[test]
+    fn forced_wisp_serves_every_web_url_except_chromium_only() {
+        let (mut browser, _) = Browser::from_store(Store::default());
+        browser.cli_engine = Some(BrowserEngine::Wisp);
+
+        assert_eq!(
+            browser.forced_engine_for("https://es.wikipedia.org/wiki/Rust"),
+            Some(BrowserEngine::Wisp)
+        );
+        assert_eq!(
+            browser.forced_engine_for("https://www.youtube.com/watch?v=1"),
+            Some(BrowserEngine::WebView2)
+        );
+        // Una URL no web no la decide el motor forzado.
+        assert_eq!(browser.forced_engine_for("ghost://newtab"), None);
+    }
+
+    #[test]
+    fn no_forced_engine_leaves_the_decision_open() {
+        let (browser, _) = Browser::from_store(Store::default());
+        assert_eq!(browser.forced_engine_for("https://es.wikipedia.org/"), None);
+    }
+
+    #[test]
     fn el_arranque_abre_inicio_y_deja_la_sesion_suspendida() {
         let mut store = Store::default();
         store.session = vec![
@@ -3131,7 +3158,7 @@ mod tests {
 
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         browser.handle_remote_command(crate::remote::RemoteCommand::Sync {
-            request: crate::remote::Request {
+            request: wisp_mcp::control::Request {
                 method: "GET".into(),
                 path: "/tabs".into(),
                 body: serde_json::Value::Null,
@@ -3144,7 +3171,7 @@ mod tests {
 
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         browser.handle_remote_command(crate::remote::RemoteCommand::Sync {
-            request: crate::remote::Request {
+            request: wisp_mcp::control::Request {
                 method: "GET".into(),
                 path: "/nope".into(),
                 body: serde_json::Value::Null,

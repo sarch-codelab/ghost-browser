@@ -50,7 +50,7 @@ Incluye en el issue:
 - `src/webview.rs` — WebView2: init script, privacidad, bounds, memoria.
 - `src/ui.rs` — chrome de la interfaz egui y pintado de Wisp.
 - `src/remote.rs` — API HTTP localhost para control programático.
-- `src/bin/ghost-mcp.rs` — puente MCP (stdio JSON-RPC) para agentes de IA.
+- `wisp/crates/wisp-mcp/` — puente MCP (stdio JSON-RPC) para agentes de IA; sirve tanto a Ghost como a `wisp-agent`.
 - `wisp/` — motor experimental: parser HTML, CSS, Taffy, Boa, pintado.
 - `installer/ghost.iss` — Inno Setup; `ram_bench.ps1` — benchmark de RAM.
 
