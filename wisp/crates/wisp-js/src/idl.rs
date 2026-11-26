@@ -1,25 +1,6 @@
-//! Conformidad entre los descriptores WebIDL (`wisp-idl`) y el runtime DOM.
-//!
-//! Con la feature por defecto (motor propio `wisp_js::vm` + `native_dom`),
-//! contrasta los descriptores generados desde `wisp-idl` con las capacidades
-//! nativas de `NativeDomHost`. Con `legacy-boa`, conserva además la comprobación
-//! histórica de `dom.js` en Boa.
+//! Conformidad entre los descriptores WebIDL (`wisp-idl`) y el runtime DOM nativo.
 
-#[cfg(feature = "legacy-boa")]
-use crate::DOM_RUNTIME;
-#[cfg(not(feature = "legacy-boa"))]
 use anyhow::Result;
-#[cfg(feature = "legacy-boa")]
-use anyhow::{Result, anyhow};
-#[cfg(feature = "legacy-boa")]
-use boa_engine::property::Attribute;
-#[cfg(feature = "legacy-boa")]
-use boa_engine::{Context, JsValue, Source, js_string};
-#[cfg(feature = "legacy-boa")]
-use serde::Deserialize;
-
-#[cfg(feature = "legacy-boa")]
-const IDL_CHECK: &str = include_str!("idl_check.js");
 
 /// Presencia de una interfaz descrita en el IDL dentro del runtime de Wisp.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -61,7 +42,6 @@ impl IdlConformance {
     }
 }
 
-#[cfg(not(feature = "legacy-boa"))]
 /// Compara los descriptores del IDL con el runtime DOM nativo de `wisp-js`.
 pub fn idl_conformance() -> Result<IdlConformance> {
     let mut interfaces = Vec::with_capacity(wisp_idl::INTERFACES.len());
@@ -102,93 +82,6 @@ pub fn idl_conformance() -> Result<IdlConformance> {
         total_members,
         found_members,
     })
-}
-
-#[cfg(feature = "legacy-boa")]
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawReport {
-    missing_interfaces: Vec<String>,
-    missing_members: Vec<String>,
-    total_members: usize,
-    found_members: usize,
-}
-
-#[cfg(feature = "legacy-boa")]
-/// Compara los descriptores del IDL con el DOM que instala `dom.js` (Boa).
-pub fn idl_conformance() -> Result<IdlConformance> {
-    let mut context = Context::builder()
-        .build()
-        .map_err(|error| anyhow!("no se pudo crear el contexto Boa: {error}"))?;
-
-    register_json(
-        &mut context,
-        "__wispDocument",
-        serde_json::json!({ "tag": "html", "children": [] }),
-    )?;
-    register_json(&mut context, "__wispUrl", serde_json::json!({}))?;
-    register_json(
-        &mut context,
-        "__wispViewport",
-        serde_json::json!({ "width": 1024 }),
-    )?;
-
-    context
-        .eval(Source::from_bytes(DOM_RUNTIME))
-        .map_err(|error| anyhow!("no se pudo iniciar el DOM de Wisp: {error}"))?;
-
-    register_json(&mut context, "__wispIdl", descriptor_json())?;
-
-    let value = context
-        .eval(Source::from_bytes(IDL_CHECK))
-        .map_err(|error| anyhow!("falló el chequeo de conformidad: {error}"))?;
-    let json = value
-        .to_json(&mut context)
-        .map_err(|error| anyhow!("no se pudo leer el informe de conformidad: {error}"))?
-        .ok_or_else(|| anyhow!("el chequeo de conformidad no devolvió datos"))?;
-    let raw: RawReport = serde_json::from_value(json)
-        .map_err(|error| anyhow!("informe de conformidad ilegible: {error}"))?;
-
-    let interfaces = wisp_idl::INTERFACES
-        .iter()
-        .map(|iface| InterfaceStatus {
-            name: iface.name,
-            present: !raw.missing_interfaces.iter().any(|name| name == iface.name),
-        })
-        .collect();
-
-    Ok(IdlConformance {
-        interfaces,
-        missing_members: raw.missing_members,
-        total_members: raw.total_members,
-        found_members: raw.found_members,
-    })
-}
-
-#[cfg(feature = "legacy-boa")]
-fn register_json(context: &mut Context, name: &str, value: serde_json::Value) -> Result<()> {
-    let value = JsValue::from_json(&value, context)
-        .map_err(|error| anyhow!("no se pudo preparar `{name}`: {error}"))?;
-    context
-        .register_global_property(js_string!(name), value, Attribute::all())
-        .map_err(|error| anyhow!("no se pudo registrar `{name}`: {error}"))
-}
-
-#[cfg(feature = "legacy-boa")]
-/// Vista mínima de los descriptores que consume el chequeo en JavaScript.
-fn descriptor_json() -> serde_json::Value {
-    serde_json::Value::Array(
-        wisp_idl::INTERFACES
-            .iter()
-            .map(|iface| {
-                serde_json::json!({
-                    "name": iface.name,
-                    "attributes": iface.attributes.iter().map(|attr| attr.name).collect::<Vec<_>>(),
-                    "operations": iface.operations.iter().map(|op| op.name).collect::<Vec<_>>(),
-                })
-            })
-            .collect(),
-    )
 }
 
 #[cfg(test)]

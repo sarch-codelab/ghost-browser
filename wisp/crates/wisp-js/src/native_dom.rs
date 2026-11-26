@@ -9,9 +9,9 @@
 
 use crate::vm::{HostBridge, JsVal, VmRuntime};
 use crate::{
-    EvalResult, FETCH_STATE, MAX_FETCH_TOTAL_TIME, MAX_SCRIPT_WARNINGS, MAX_TREE_DEPTH,
-    ModuleEntry, fetch_json, push_warning, record_fetch_warning, resolve_script_url,
-    truncate_error,
+    ElementGeometry, EvalResult, FETCH_STATE, GeometryHook, MAX_FETCH_TOTAL_TIME,
+    MAX_SCRIPT_WARNINGS, MAX_TREE_DEPTH, ModuleEntry, fetch_json, push_warning,
+    record_fetch_warning, resolve_script_url, truncate_error,
 };
 use ego_tree::NodeRef;
 use scraper::Html;
@@ -62,7 +62,24 @@ struct Microtask {
     target_promise: usize,
 }
 
-pub struct NativeDomHost {
+#[derive(Clone, Debug)]
+struct MutationRecord {
+    kind: String,
+    target: usize,
+    attribute_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct MutationObserverState {
+    cb_fn_id: usize,
+    targets: Vec<usize>,
+    subtree: bool,
+    attributes: bool,
+    child_list: bool,
+    records: Vec<MutationRecord>,
+}
+
+pub struct NativeDomHost<'a> {
     nodes: Vec<ArenaNode>,
     doc_id: usize,
     html_id: Option<usize>,
@@ -70,7 +87,13 @@ pub struct NativeDomHost {
     body_id: Option<usize>,
     mutated: bool,
     oversized: bool,
+    layout_dirty: bool,
+    viewport_width: f32,
+    geometry_hook: Option<GeometryHook<'a>>,
+    geometry_cache: HashMap<usize, ElementGeometry>,
     page_url: Option<String>,
+    policy: wisp_net::NetworkPolicy,
+    cookie_jar: wisp_net::CookieJar,
     storage: HashMap<String, String>,
     warnings: Vec<String>,
     doc_listeners: HashMap<String, Vec<usize>>,
@@ -79,10 +102,20 @@ pub struct NativeDomHost {
     promises: Vec<PromiseState>,
     microtasks: Vec<Microtask>,
     timers: Vec<usize>,
+    observers: Vec<MutationObserverState>,
+    started_at: Instant,
+    scroll_x: f64,
+    scroll_y: f64,
 }
 
-impl NativeDomHost {
-    fn from_html(document: &Html, page_url: Option<&str>) -> Self {
+impl<'a> NativeDomHost<'a> {
+    fn from_html(
+        document: &Html,
+        page_url: Option<&str>,
+        viewport_width: f32,
+        policy: wisp_net::NetworkPolicy,
+        geometry_hook: Option<GeometryHook<'a>>,
+    ) -> Self {
         let mut host = Self {
             nodes: vec![ArenaNode {
                 kind: NodeKind::Document,
@@ -95,7 +128,17 @@ impl NativeDomHost {
             body_id: None,
             mutated: false,
             oversized: false,
+            layout_dirty: true,
+            viewport_width: if viewport_width > 0.0 {
+                viewport_width
+            } else {
+                1280.0
+            },
+            geometry_hook,
+            geometry_cache: HashMap::new(),
             page_url: page_url.map(str::to_owned),
+            policy,
+            cookie_jar: wisp_net::CookieJar::new(),
             storage: HashMap::new(),
             warnings: Vec::new(),
             doc_listeners: HashMap::new(),
@@ -104,12 +147,190 @@ impl NativeDomHost {
             promises: Vec::new(),
             microtasks: Vec::new(),
             timers: Vec::new(),
+            observers: Vec::new(),
+            started_at: Instant::now(),
+            scroll_x: 0.0,
+            scroll_y: 0.0,
         };
         for child in document.tree.root().children() {
             let _ = host.import_node(child, 0, 0);
         }
         host.refresh_landmarks();
         host
+    }
+
+    fn mark_mutated(&mut self, target: usize, kind: &str, attr_name: Option<&str>) {
+        self.mutated = true;
+        self.layout_dirty = true;
+        for obs in &mut self.observers {
+            let type_ok = match kind {
+                "attributes" => obs.attributes,
+                _ => obs.child_list,
+            };
+            if !type_ok {
+                continue;
+            }
+            let target_ok = obs.targets.iter().any(|&observed| {
+                if observed == target {
+                    return true;
+                }
+                if !obs.subtree {
+                    return false;
+                }
+                let mut cur = self.nodes.get(target).and_then(|n| n.parent);
+                while let Some(p) = cur {
+                    if p == observed {
+                        return true;
+                    }
+                    cur = self.nodes.get(p).and_then(|n| n.parent);
+                }
+                false
+            });
+            if target_ok {
+                obs.records.push(MutationRecord {
+                    kind: kind.to_owned(),
+                    target,
+                    attribute_name: attr_name.map(str::to_owned),
+                });
+            }
+        }
+    }
+
+    fn ensure_geometry(&mut self) {
+        if !self.layout_dirty {
+            return;
+        }
+        self.geometry_cache.clear();
+        let mut preorder_map = Vec::new();
+        self.collect_preorder_elements(self.doc_id, &mut preorder_map);
+        if let Some(hook) = self.geometry_hook.as_deref_mut() {
+            let html = self.serialize_html();
+            let by_preorder = hook(&html, self.viewport_width);
+            for (pre_idx, nid) in preorder_map.into_iter().enumerate() {
+                if let Some(geom) = by_preorder.get(&pre_idx) {
+                    self.geometry_cache.insert(nid, geom.clone());
+                }
+            }
+        } else {
+            self.compute_fallback_geometry();
+        }
+        self.layout_dirty = false;
+    }
+
+    fn collect_preorder_elements(&self, nid: usize, out: &mut Vec<usize>) {
+        let Some(node) = self.nodes.get(nid) else {
+            return;
+        };
+        if matches!(node.kind, NodeKind::Element { .. }) {
+            out.push(nid);
+        }
+        for &c in &node.children {
+            self.collect_preorder_elements(c, out);
+        }
+    }
+
+    fn compute_fallback_geometry(&mut self) {
+        let vw = self.viewport_width;
+        let mut y = 0.0f32;
+        self.layout_fallback_node(self.doc_id, 0.0, &mut y, vw);
+    }
+
+    fn layout_fallback_node(&mut self, nid: usize, x: f32, y: &mut f32, avail_w: f32) {
+        let Some(node) = self.nodes.get(nid).cloned() else {
+            return;
+        };
+        match &node.kind {
+            NodeKind::Document => {
+                for &c in &node.children {
+                    self.layout_fallback_node(c, x, y, avail_w);
+                }
+            }
+            NodeKind::Text(_) => {}
+            NodeKind::Element { tag, styles, .. } => {
+                let mut display = if matches!(
+                    tag.as_str(),
+                    "span" | "a" | "strong" | "em" | "b" | "i" | "label"
+                ) {
+                    "inline".to_owned()
+                } else if matches!(tag.as_str(), "head" | "script" | "style" | "meta" | "title" | "link") {
+                    "none".to_owned()
+                } else {
+                    "block".to_owned()
+                };
+                let mut visibility = "visible".to_owned();
+                let mut position = "static".to_owned();
+                let mut color = "rgb(0, 0, 0)".to_owned();
+                let mut background_color = "rgba(0, 0, 0, 0)".to_owned();
+                let mut font_size = "16px".to_owned();
+                let mut explicit_w: Option<f32> = None;
+                let mut explicit_h: Option<f32> = None;
+
+                for (k, v) in styles {
+                    match k.as_str() {
+                        "display" => display = v.to_ascii_lowercase(),
+                        "visibility" => visibility = v.to_ascii_lowercase(),
+                        "position" => position = v.to_ascii_lowercase(),
+                        "color" => color = v.clone(),
+                        "background-color" | "background" => background_color = v.clone(),
+                        "font-size" => font_size = v.clone(),
+                        "width" => explicit_w = parse_px_val(v),
+                        "height" => explicit_h = parse_px_val(v),
+                        _ => {}
+                    }
+                }
+
+                if display == "none" {
+                    self.geometry_cache.insert(
+                        nid,
+                        ElementGeometry {
+                            x: 0.0,
+                            y: 0.0,
+                            width: 0.0,
+                            height: 0.0,
+                            display,
+                            visibility,
+                            position,
+                            color,
+                            background_color,
+                            font_size,
+                        },
+                    );
+                    return;
+                }
+
+                let start_y = *y;
+                let width = explicit_w.unwrap_or(avail_w);
+                let mut child_y = start_y;
+                for &c in &node.children {
+                    self.layout_fallback_node(c, x, &mut child_y, width);
+                }
+                let mut text = String::new();
+                self.collect_text(nid, &mut text);
+                let intrinsic_h = if !text.trim().is_empty() && child_y == start_y {
+                    20.0
+                } else {
+                    (child_y - start_y).max(0.0)
+                };
+                let height = explicit_h.unwrap_or(intrinsic_h);
+                *y = start_y + height;
+
+                self.geometry_cache.insert(
+                    nid,
+                    ElementGeometry {
+                        x,
+                        y: start_y,
+                        width,
+                        height,
+                        display,
+                        visibility,
+                        position,
+                        color,
+                        background_color,
+                        font_size,
+                    },
+                );
+            }
+        }
     }
 
     fn refresh_landmarks(&mut self) {
@@ -256,6 +477,23 @@ impl NativeDomHost {
         );
         vm.globals
             .insert("Array".to_owned(), JsVal::NativeHandle("Array".to_owned()));
+        vm.globals.insert(
+            "navigator".to_owned(),
+            JsVal::NativeHandle("navigator".to_owned()),
+        );
+        vm.globals.insert(
+            "performance".to_owned(),
+            JsVal::NativeHandle("performance".to_owned()),
+        );
+        vm.globals.insert(
+            "crypto".to_owned(),
+            JsVal::NativeHandle("crypto".to_owned()),
+        );
+        if self.policy.stealth {
+            let runtime = vm.alloc_object(HashMap::new());
+            let chrome = vm.alloc_object(HashMap::from([("runtime".to_owned(), runtime)]));
+            vm.globals.insert("chrome".to_owned(), chrome);
+        }
     }
 
     fn collect_text(&self, id: usize, out: &mut String) {
@@ -711,10 +949,41 @@ impl NativeDomHost {
         }
     }
 
+    fn flush_mutation_observers(&mut self, vm: &mut VmRuntime) -> bool {
+        let mut flushed = false;
+        let mut pending = Vec::new();
+        for (idx, obs) in self.observers.iter_mut().enumerate() {
+            if !obs.records.is_empty() {
+                pending.push((idx, obs.cb_fn_id, std::mem::take(&mut obs.records)));
+            }
+        }
+        for (_idx, cb_fn_id, recs) in pending {
+            flushed = true;
+            let js_recs: Vec<JsVal> = recs
+                .into_iter()
+                .map(|r| {
+                    vm.alloc_object(HashMap::from([
+                        ("type".to_owned(), JsVal::Str(r.kind)),
+                        ("target".to_owned(), JsVal::DomNode(r.target)),
+                        (
+                            "attributeName".to_owned(),
+                            r.attribute_name.map(JsVal::Str).unwrap_or(JsVal::Null),
+                        ),
+                    ]))
+                })
+                .collect();
+            let _ = vm.invoke_fn(cb_fn_id, vec![JsVal::Array(js_recs)], self);
+        }
+        flushed
+    }
+
     fn drain_async_tasks(&mut self, vm: &mut VmRuntime) {
         let mut iters = 0usize;
         while iters < MAX_TASK_DRAIN_ITERS {
             iters += 1;
+            if self.flush_mutation_observers(vm) {
+                continue;
+            }
             if !self.microtasks.is_empty() {
                 let batch = std::mem::take(&mut self.microtasks);
                 for task in batch {
@@ -764,7 +1033,7 @@ impl NativeDomHost {
     }
 }
 
-impl HostBridge for NativeDomHost {
+impl HostBridge for NativeDomHost<'_> {
     fn get_prop(&mut self, vm: &mut VmRuntime, target: &JsVal, prop: &str) -> Result<JsVal, JsVal> {
         match target {
             JsVal::NativeHandle(handle) => match handle.as_str() {
@@ -777,6 +1046,22 @@ impl HostBridge for NativeDomHost {
                     "doctype" => Ok(JsVal::Null),
                     "readyState" => Ok(JsVal::Str("complete".to_owned())),
                     "URL" => Ok(JsVal::Str(self.page_url.clone().unwrap_or_default())),
+                    "cookie" => {
+                        let parsed = self.page_url.as_deref().and_then(|u| url::Url::parse(u).ok());
+                        let (host, path, is_https) = match parsed {
+                            Some(ref u) => (
+                                u.host_str().unwrap_or("localhost").to_owned(),
+                                u.path().to_owned(),
+                                u.scheme() == "https",
+                            ),
+                            None => ("localhost".to_owned(), "/".to_owned(), false),
+                        };
+                        Ok(JsVal::Str(
+                            self.cookie_jar
+                                .cookie_header_for(&host, &path, is_https, true)
+                                .unwrap_or_default(),
+                        ))
+                    }
                     "images" => Ok(JsVal::Array(
                         self.get_elements_by_tag_name("img")
                             .into_iter()
@@ -804,13 +1089,49 @@ impl HostBridge for NativeDomHost {
                     "document" => Ok(JsVal::NativeHandle("document".to_owned())),
                     "location" => Ok(JsVal::NativeHandle("location".to_owned())),
                     "localStorage" => Ok(JsVal::NativeHandle("localStorage".to_owned())),
-                    "innerWidth" => Ok(JsVal::Number(1280.0)),
+                    "navigator" => Ok(JsVal::NativeHandle("navigator".to_owned())),
+                    "performance" => Ok(JsVal::NativeHandle("performance".to_owned())),
+                    "crypto" => Ok(JsVal::NativeHandle("crypto".to_owned())),
+                    "chrome" => Ok(vm
+                        .globals
+                        .get("chrome")
+                        .cloned()
+                        .unwrap_or(JsVal::Undefined)),
+                    "innerWidth" => Ok(JsVal::Number(self.viewport_width as f64)),
                     "innerHeight" => Ok(JsVal::Number(720.0)),
+                    "devicePixelRatio" => Ok(JsVal::Number(1.0)),
+                    "scrollX" | "pageXOffset" => Ok(JsVal::Number(self.scroll_x)),
+                    "scrollY" | "pageYOffset" => Ok(JsVal::Number(self.scroll_y)),
                     "closed" => Ok(JsVal::Bool(false)),
                     "name" => Ok(JsVal::Str(String::new())),
                     "event" => Ok(JsVal::Undefined),
                     _ => Ok(JsVal::Undefined),
                 },
+                "navigator" => {
+                    let profile = wisp_net::StealthProfile::for_policy(&self.policy);
+                    Ok(match prop {
+                        "userAgent" => JsVal::Str(profile.user_agent.to_owned()),
+                        "language" => JsVal::Str("en-US".to_owned()),
+                        "languages" => JsVal::Array(vec![
+                            JsVal::Str("en-US".to_owned()),
+                            JsVal::Str("en".to_owned()),
+                        ]),
+                        "webdriver" => JsVal::Bool(false),
+                        "cookieEnabled" => JsVal::Bool(true),
+                        "platform" => JsVal::Str(if self.policy.stealth {
+                            "Win32".to_owned()
+                        } else {
+                            "Wisp".to_owned()
+                        }),
+                        "hardwareConcurrency" => JsVal::Number(8.0),
+                        "plugins" => JsVal::Array(if self.policy.stealth {
+                            vec![JsVal::Str("PDF Viewer".to_owned())]
+                        } else {
+                            Vec::new()
+                        }),
+                        _ => JsVal::Undefined,
+                    })
+                }
                 "location" => Ok(JsVal::Str(location_part(self.page_url.as_deref(), prop))),
                 _ if handle.starts_with("url:") => {
                     let raw = &handle[4..];
@@ -835,9 +1156,62 @@ impl HostBridge for NativeDomHost {
                     };
                     Ok(JsVal::Str(val))
                 }
+                _ if handle.starts_with("cstyle:") => {
+                    let Ok(nid) = handle[7..].parse::<usize>() else {
+                        return Ok(JsVal::Undefined);
+                    };
+                    self.ensure_geometry();
+                    let kebab = camel_to_kebab(prop);
+                    if let Some(geom) = self.geometry_cache.get(&nid) {
+                        let val = match kebab.as_str() {
+                            "display" => geom.display.clone(),
+                            "visibility" => geom.visibility.clone(),
+                            "position" => geom.position.clone(),
+                            "color" => geom.color.clone(),
+                            "background-color" => geom.background_color.clone(),
+                            "font-size" => geom.font_size.clone(),
+                            "width" => format!("{}px", geom.width),
+                            "height" => format!("{}px", geom.height),
+                            "top" => format!("{}px", geom.y),
+                            "left" => format!("{}px", geom.x),
+                            _ => match &self.nodes.get(nid).map(|n| &n.kind) {
+                                Some(NodeKind::Element { styles, .. }) => styles
+                                    .iter()
+                                    .find(|(k, _)| k == &kebab)
+                                    .map(|(_, v)| v.clone())
+                                    .unwrap_or_default(),
+                                _ => String::new(),
+                            },
+                        };
+                        return Ok(JsVal::Str(val));
+                    }
+                    Ok(JsVal::Str(String::new()))
+                }
                 _ => Ok(JsVal::Undefined),
             },
             JsVal::DomNode(nid) => {
+                if matches!(
+                    prop,
+                    "offsetWidth"
+                        | "offsetHeight"
+                        | "offsetTop"
+                        | "offsetLeft"
+                        | "clientWidth"
+                        | "clientHeight"
+                        | "scrollWidth"
+                        | "scrollHeight"
+                ) {
+                    self.ensure_geometry();
+                    let geom = self.geometry_cache.get(nid).cloned().unwrap_or_default();
+                    let num = match prop {
+                        "offsetWidth" | "clientWidth" | "scrollWidth" => geom.width as f64,
+                        "offsetHeight" | "clientHeight" | "scrollHeight" => geom.height as f64,
+                        "offsetTop" => geom.y as f64,
+                        "offsetLeft" => geom.x as f64,
+                        _ => 0.0,
+                    };
+                    return Ok(JsVal::Number(num));
+                }
                 let Some(node) = self.nodes.get(*nid) else {
                     return Ok(JsVal::Undefined);
                 };
@@ -973,7 +1347,18 @@ impl HostBridge for NativeDomHost {
     ) -> Result<(), JsVal> {
         match target {
             JsVal::NativeHandle(handle) => {
-                if handle == "document" && prop == "title" {
+                if handle == "document" && prop == "cookie" {
+                    let raw = value.to_string();
+                    let parsed = self.page_url.as_deref().and_then(|u| url::Url::parse(u).ok());
+                    let (host, path) = match parsed {
+                        Some(ref u) => (
+                            u.host_str().unwrap_or("localhost").to_owned(),
+                            u.path().to_owned(),
+                        ),
+                        None => ("localhost".to_owned(), "/".to_owned()),
+                    };
+                    self.cookie_jar.set_from_header(&raw, &host, &path);
+                } else if handle == "document" && prop == "title" {
                     let title_text = value.to_string();
                     if let Some(tid) = self.find_first_tag(self.doc_id, "title") {
                         self.set_text_content(tid, title_text);
@@ -988,7 +1373,7 @@ impl HostBridge for NativeDomHost {
                         let parent = self.head_id.or(self.html_id).unwrap_or(self.doc_id);
                         self.attach_child(parent, title_el);
                     }
-                    self.mutated = true;
+                    self.mark_mutated(self.doc_id, "childList", None);
                 } else if let Some(rest) = handle.strip_prefix("style:")
                     && let Ok(nid) = rest.parse::<usize>()
                     && let Some(node) = self.nodes.get_mut(nid)
@@ -1001,18 +1386,24 @@ impl HostBridge for NativeDomHost {
                     } else {
                         styles.push((key, val));
                     }
-                    self.mutated = true;
+                    self.mark_mutated(nid, "attributes", Some("style"));
                 }
             }
             JsVal::DomNode(nid) => match prop {
-                "textContent" | "innerText" => self.set_text_content(*nid, value.to_string()),
-                "innerHTML" => self.set_inner_html(*nid, &value.to_string()),
+                "textContent" | "innerText" => {
+                    self.set_text_content(*nid, value.to_string());
+                    self.mark_mutated(*nid, "childList", None);
+                }
+                "innerHTML" => {
+                    self.set_inner_html(*nid, &value.to_string());
+                    self.mark_mutated(*nid, "childList", None);
+                }
                 "id" => {
                     if let Some(node) = self.nodes.get_mut(*nid)
                         && let NodeKind::Element { attrs, .. } = &mut node.kind
                     {
                         attrs.insert("id".to_owned(), value.to_string());
-                        self.mutated = true;
+                        self.mark_mutated(*nid, "attributes", Some("id"));
                     }
                 }
                 "className" => {
@@ -1020,7 +1411,7 @@ impl HostBridge for NativeDomHost {
                         && let NodeKind::Element { attrs, .. } = &mut node.kind
                     {
                         attrs.insert("class".to_owned(), value.to_string());
-                        self.mutated = true;
+                        self.mark_mutated(*nid, "attributes", Some("class"));
                     }
                 }
                 _ => {}
@@ -1127,7 +1518,47 @@ impl HostBridge for NativeDomHost {
                         }
                         Ok(JsVal::Undefined)
                     }
-                    "removeEventListener" | "dispatchEvent" => Ok(JsVal::Bool(true)),
+                    "removeEventListener" => Ok(JsVal::Bool(true)),
+                    "dispatchEvent" => {
+                        let ev = args.into_iter().next().unwrap_or(JsVal::Undefined);
+                        let ev_type = match &ev {
+                            JsVal::Object(id) => vm
+                                .objects
+                                .get(*id)
+                                .and_then(|o| o.get("type"))
+                                .map(ToString::to_string)
+                                .unwrap_or_default(),
+                            _ => String::new(),
+                        };
+                        if let Some(fns) = self.doc_listeners.get(&ev_type).cloned() {
+                            for fn_id in fns {
+                                let _ = vm.invoke_fn(fn_id, vec![ev.clone()], self);
+                            }
+                        }
+                        Ok(JsVal::Bool(true))
+                    }
+                    "elementFromPoint" => {
+                        let x = args.first().map(JsVal::to_number).unwrap_or(0.0) as f32;
+                        let y = args.get(1).map(JsVal::to_number).unwrap_or(0.0) as f32;
+                        self.ensure_geometry();
+                        let mut preorder = Vec::new();
+                        self.collect_preorder_elements(self.doc_id, &mut preorder);
+                        let mut hit = None;
+                        for nid in preorder {
+                            if let Some(geom) = self.geometry_cache.get(&nid)
+                                && geom.display != "none"
+                                && geom.width > 0.0
+                                && geom.height > 0.0
+                                && x >= geom.x
+                                && x <= geom.x + geom.width
+                                && y >= geom.y
+                                && y <= geom.y + geom.height
+                            {
+                                hit = Some(nid);
+                            }
+                        }
+                        Ok(hit.map(JsVal::DomNode).unwrap_or(JsVal::Null))
+                    }
                     _ => Err(JsVal::Str(format!("document.{method} no soportado"))),
                 },
                 "window" => match method {
@@ -1142,9 +1573,75 @@ impl HostBridge for NativeDomHost {
                         }
                         Ok(JsVal::Undefined)
                     }
-                    "removeEventListener" | "dispatchEvent" => Ok(JsVal::Bool(true)),
+                    "removeEventListener" => Ok(JsVal::Bool(true)),
+                    "dispatchEvent" => {
+                        let ev = args.into_iter().next().unwrap_or(JsVal::Undefined);
+                        let ev_type = match &ev {
+                            JsVal::Object(id) => vm
+                                .objects
+                                .get(*id)
+                                .and_then(|o| o.get("type"))
+                                .map(ToString::to_string)
+                                .unwrap_or_default(),
+                            _ => String::new(),
+                        };
+                        if let Some(fns) = self.win_listeners.get(&ev_type).cloned() {
+                            for fn_id in fns {
+                                let _ = vm.invoke_fn(fn_id, vec![ev.clone()], self);
+                            }
+                        }
+                        Ok(JsVal::Bool(true))
+                    }
+                    "getComputedStyle" => {
+                        if let Some(JsVal::DomNode(nid)) = args.first() {
+                            Ok(JsVal::NativeHandle(format!("cstyle:{nid}")))
+                        } else {
+                            Ok(vm.alloc_object(HashMap::new()))
+                        }
+                    }
+                    "scrollTo" | "scroll" => {
+                        self.scroll_x = args.first().map(JsVal::to_number).unwrap_or(0.0);
+                        self.scroll_y = args.get(1).map(JsVal::to_number).unwrap_or(0.0);
+                        Ok(JsVal::Undefined)
+                    }
                     "alert" | "close" | "focus" | "blur" => Ok(JsVal::Undefined),
                     "open" => Ok(JsVal::Null),
+                    _ => Ok(JsVal::Undefined),
+                },
+                "performance" => match method {
+                    "now" => Ok(JsVal::Number(self.started_at.elapsed().as_secs_f64() * 1000.0)),
+                    _ => Ok(JsVal::Undefined),
+                },
+                "crypto" => match method {
+                    "getRandomValues" => {
+                        if let Some(arg) = args.first() {
+                            if let Some(mut buf) = vm.read_uint8_array(arg) {
+                                fill_random_bytes(&mut buf);
+                                let _ = vm.write_uint8_array(arg, &buf);
+                                return Ok(arg.clone());
+                            }
+                            if let JsVal::Array(items) = arg {
+                                let mut buf = vec![0u8; items.len()];
+                                fill_random_bytes(&mut buf);
+                                return Ok(JsVal::Array(
+                                    buf.into_iter().map(|b| JsVal::Number(b as f64)).collect(),
+                                ));
+                            }
+                        }
+                        Ok(JsVal::Undefined)
+                    }
+                    "randomUUID" => {
+                        let mut b = [0u8; 16];
+                        fill_random_bytes(&mut b);
+                        b[6] = (b[6] & 0x0f) | 0x40;
+                        b[8] = (b[8] & 0x3f) | 0x80;
+                        let uuid = format!(
+                            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                            b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+                        );
+                        Ok(JsVal::Str(uuid))
+                    }
                     _ => Ok(JsVal::Undefined),
                 },
                 "localStorage" => match method {
@@ -1204,17 +1701,28 @@ impl HostBridge for NativeDomHost {
                 },
                 "Array" => match method {
                     "isArray" => Ok(JsVal::Bool(matches!(args.first(), Some(JsVal::Array(_))))),
+                    "from" => match args.first() {
+                        Some(JsVal::Array(items)) => Ok(JsVal::Array(items.clone())),
+                        Some(JsVal::Str(s)) => Ok(JsVal::Array(
+                            s.chars().map(|c| JsVal::Str(c.to_string())).collect(),
+                        )),
+                        Some(other) => {
+                            if let Some(buf) = vm.read_uint8_array(other) {
+                                Ok(JsVal::Array(
+                                    buf.into_iter().map(|b| JsVal::Number(b as f64)).collect(),
+                                ))
+                            } else {
+                                Ok(JsVal::Array(Vec::new()))
+                            }
+                        }
+                        None => Ok(JsVal::Array(Vec::new())),
+                    },
                     _ => Ok(JsVal::Undefined),
                 },
                 "TextEncoder" => match method {
                     "encode" => {
                         let s = args.first().map(ToString::to_string).unwrap_or_default();
-                        let bytes = s
-                            .into_bytes()
-                            .into_iter()
-                            .map(|b| JsVal::Number(b as f64))
-                            .collect();
-                        Ok(JsVal::Array(bytes))
+                        Ok(vm.alloc_uint8_array(s.into_bytes()))
                     }
                     _ => Ok(JsVal::Undefined),
                 },
@@ -1224,7 +1732,8 @@ impl HostBridge for NativeDomHost {
                             Some(JsVal::Array(items)) => {
                                 items.iter().map(|v| v.to_number() as u8).collect()
                             }
-                            _ => Vec::new(),
+                            Some(other) => vm.read_uint8_array(other).unwrap_or_default(),
+                            None => Vec::new(),
                         };
                         Ok(JsVal::Str(String::from_utf8_lossy(&bytes).into_owned()))
                     }
@@ -1386,46 +1895,136 @@ impl HostBridge for NativeDomHost {
                         return Ok(JsVal::Undefined);
                     };
                     let cls = args.first().map(ToString::to_string).unwrap_or_default();
-                    let Some(node) = self.nodes.get_mut(nid) else {
-                        return Ok(JsVal::Undefined);
-                    };
-                    let NodeKind::Element { attrs, .. } = &mut node.kind else {
-                        return Ok(JsVal::Undefined);
-                    };
-                    let mut list: Vec<String> = attrs
-                        .get("class")
-                        .map(|s| s.split_whitespace().map(str::to_owned).collect())
-                        .unwrap_or_default();
-                    match method {
-                        "add" => {
-                            if !cls.is_empty() && !list.contains(&cls) {
-                                list.push(cls);
+                    let mut class_mutated = false;
+                    let result = {
+                        let Some(node) = self.nodes.get_mut(nid) else {
+                            return Ok(JsVal::Undefined);
+                        };
+                        let NodeKind::Element { attrs, .. } = &mut node.kind else {
+                            return Ok(JsVal::Undefined);
+                        };
+                        let mut list: Vec<String> = attrs
+                            .get("class")
+                            .map(|s| s.split_whitespace().map(str::to_owned).collect())
+                            .unwrap_or_default();
+                        match method {
+                            "add" => {
+                                if !cls.is_empty() && !list.contains(&cls) {
+                                    list.push(cls);
+                                    attrs.insert("class".to_owned(), list.join(" "));
+                                    class_mutated = true;
+                                }
+                                JsVal::Undefined
+                            }
+                            "remove" => {
+                                list.retain(|c| c != &cls);
                                 attrs.insert("class".to_owned(), list.join(" "));
-                                self.mutated = true;
+                                class_mutated = true;
+                                JsVal::Undefined
+                            }
+                            "contains" => JsVal::Bool(list.contains(&cls)),
+                            "toggle" => {
+                                let added = if list.contains(&cls) {
+                                    list.retain(|c| c != &cls);
+                                    false
+                                } else {
+                                    list.push(cls);
+                                    true
+                                };
+                                attrs.insert("class".to_owned(), list.join(" "));
+                                class_mutated = true;
+                                JsVal::Bool(added)
+                            }
+                            _ => JsVal::Undefined,
+                        }
+                    };
+                    if class_mutated {
+                        self.mark_mutated(nid, "attributes", Some("class"));
+                    }
+                    Ok(result)
+                }
+                _ if handle.starts_with("observer:") => {
+                    let Ok(oid) = handle[9..].parse::<usize>() else {
+                        return Ok(JsVal::Undefined);
+                    };
+                    match method {
+                        "observe" => {
+                            if let Some(JsVal::DomNode(target_nid)) = args.first() {
+                                let (subtree, attributes, child_list) = match args.get(1) {
+                                    Some(JsVal::Object(obj_id)) => {
+                                        let obj = vm.objects.get(*obj_id);
+                                        let sub = obj
+                                            .and_then(|m| m.get("subtree"))
+                                            .is_some_and(JsVal::is_truthy);
+                                        let attrs = obj
+                                            .and_then(|m| m.get("attributes"))
+                                            .is_some_and(JsVal::is_truthy);
+                                        let cl = obj
+                                            .and_then(|m| m.get("childList"))
+                                            .is_some_and(JsVal::is_truthy);
+                                        (sub, attrs, cl || !attrs)
+                                    }
+                                    _ => (false, false, true),
+                                };
+                                if let Some(obs) = self.observers.get_mut(oid) {
+                                    if !obs.targets.contains(target_nid) {
+                                        obs.targets.push(*target_nid);
+                                    }
+                                    obs.subtree |= subtree;
+                                    obs.attributes |= attributes;
+                                    obs.child_list |= child_list;
+                                }
                             }
                             Ok(JsVal::Undefined)
                         }
-                        "remove" => {
-                            list.retain(|c| c != &cls);
-                            attrs.insert("class".to_owned(), list.join(" "));
-                            self.mutated = true;
+                        "disconnect" => {
+                            if let Some(obs) = self.observers.get_mut(oid) {
+                                obs.targets.clear();
+                                obs.records.clear();
+                            }
                             Ok(JsVal::Undefined)
                         }
-                        "contains" => Ok(JsVal::Bool(list.contains(&cls))),
-                        "toggle" => {
-                            let added = if list.contains(&cls) {
-                                list.retain(|c| c != &cls);
-                                false
-                            } else {
-                                list.push(cls);
-                                true
-                            };
-                            attrs.insert("class".to_owned(), list.join(" "));
-                            self.mutated = true;
-                            Ok(JsVal::Bool(added))
+                        "takeRecords" => {
+                            let recs = self
+                                .observers
+                                .get_mut(oid)
+                                .map(|obs| std::mem::take(&mut obs.records))
+                                .unwrap_or_default();
+                            let js_recs: Vec<JsVal> = recs
+                                .into_iter()
+                                .map(|r| {
+                                    vm.alloc_object(HashMap::from([
+                                        ("type".to_owned(), JsVal::Str(r.kind)),
+                                        ("target".to_owned(), JsVal::DomNode(r.target)),
+                                        (
+                                            "attributeName".to_owned(),
+                                            r.attribute_name.map(JsVal::Str).unwrap_or(JsVal::Null),
+                                        ),
+                                    ]))
+                                })
+                                .collect();
+                            Ok(JsVal::Array(js_recs))
                         }
                         _ => Ok(JsVal::Undefined),
                     }
+                }
+                _ if handle.starts_with("cstyle:") => {
+                    let Ok(nid) = handle[7..].parse::<usize>() else {
+                        return Ok(JsVal::Undefined);
+                    };
+                    if method == "getPropertyValue" {
+                        let key = args
+                            .first()
+                            .map(ToString::to_string)
+                            .unwrap_or_default()
+                            .to_ascii_lowercase();
+                        return self.get_prop(
+                            vm,
+                            &JsVal::NativeHandle(format!("cstyle:{nid}")),
+                            &key,
+                        );
+                    }
+                    Ok(JsVal::Undefined)
                 }
                 _ if handle.starts_with("style:") => {
                     let Ok(nid) = handle[6..].parse::<usize>() else {
@@ -1439,6 +2038,7 @@ impl HostBridge for NativeDomHost {
                                 .unwrap_or_default()
                                 .to_ascii_lowercase();
                             let val = args.get(1).map(ToString::to_string).unwrap_or_default();
+                            let mut changed = false;
                             if let Some(node) = self.nodes.get_mut(nid)
                                 && let NodeKind::Element { styles, .. } = &mut node.kind
                             {
@@ -1449,7 +2049,10 @@ impl HostBridge for NativeDomHost {
                                 } else {
                                     styles.push((key, val));
                                 }
-                                self.mutated = true;
+                                changed = true;
+                            }
+                            if changed {
+                                self.mark_mutated(nid, "attributes", Some("style"));
                             }
                             Ok(JsVal::Undefined)
                         }
@@ -1486,21 +2089,29 @@ impl HostBridge for NativeDomHost {
                 "setAttribute" => {
                     let name = args.first().map(ToString::to_string).unwrap_or_default();
                     let val = args.get(1).map(ToString::to_string).unwrap_or_default();
+                    let mut changed = false;
                     if let Some(node) = self.nodes.get_mut(*nid)
                         && let NodeKind::Element { attrs, .. } = &mut node.kind
                     {
-                        attrs.insert(name, val);
-                        self.mutated = true;
+                        attrs.insert(name.clone(), val);
+                        changed = true;
+                    }
+                    if changed {
+                        self.mark_mutated(*nid, "attributes", Some(&name));
                     }
                     Ok(JsVal::Undefined)
                 }
                 "removeAttribute" => {
                     let name = args.first().map(ToString::to_string).unwrap_or_default();
+                    let mut changed = false;
                     if let Some(node) = self.nodes.get_mut(*nid)
                         && let NodeKind::Element { attrs, .. } = &mut node.kind
                     {
                         attrs.remove(&name);
-                        self.mutated = true;
+                        changed = true;
+                    }
+                    if changed {
+                        self.mark_mutated(*nid, "attributes", Some(&name));
                     }
                     Ok(JsVal::Undefined)
                 }
@@ -1516,25 +2127,29 @@ impl HostBridge for NativeDomHost {
                     let name = args.first().map(ToString::to_string).unwrap_or_default();
                     let force = args.get(1).map(JsVal::is_truthy);
                     let mut present = false;
+                    let mut changed = false;
                     if let Some(node) = self.nodes.get_mut(*nid)
                         && let NodeKind::Element { attrs, .. } = &mut node.kind
                     {
                         let had = attrs.contains_key(&name);
                         let want = force.unwrap_or(!had);
                         if want {
-                            attrs.entry(name).or_default();
+                            attrs.entry(name.clone()).or_default();
                             present = true;
                         } else {
                             attrs.remove(&name);
                         }
-                        self.mutated = true;
+                        changed = true;
+                    }
+                    if changed {
+                        self.mark_mutated(*nid, "attributes", Some(&name));
                     }
                     Ok(JsVal::Bool(present))
                 }
                 "appendChild" => {
                     if let Some(JsVal::DomNode(child)) = args.first() {
                         self.attach_child(*nid, *child);
-                        self.mutated = true;
+                        self.mark_mutated(*nid, "childList", None);
                         Ok(JsVal::DomNode(*child))
                     } else {
                         Ok(JsVal::Null)
@@ -1543,7 +2158,7 @@ impl HostBridge for NativeDomHost {
                 "insertBefore" => {
                     if let Some(JsVal::DomNode(new_child)) = args.first() {
                         self.attach_child(*nid, *new_child);
-                        self.mutated = true;
+                        self.mark_mutated(*nid, "childList", None);
                         Ok(JsVal::DomNode(*new_child))
                     } else {
                         Ok(JsVal::Null)
@@ -1555,7 +2170,7 @@ impl HostBridge for NativeDomHost {
                     {
                         self.detach_node(*old_c);
                         self.attach_child(*nid, *new_c);
-                        self.mutated = true;
+                        self.mark_mutated(*nid, "childList", None);
                         Ok(JsVal::DomNode(*old_c))
                     } else {
                         Ok(JsVal::Null)
@@ -1610,20 +2225,90 @@ impl HostBridge for NativeDomHost {
                     Ok(hit.map(JsVal::DomNode).unwrap_or(JsVal::Null))
                 }
                 "focus" | "blur" => Ok(JsVal::Undefined),
-                "removeEventListener" | "dispatchEvent" => Ok(JsVal::Bool(true)),
+                "removeEventListener" => Ok(JsVal::Bool(true)),
+                "getBoundingClientRect" => {
+                    self.ensure_geometry();
+                    let geom = self.geometry_cache.get(nid).cloned().unwrap_or_default();
+                    let rect = vm.alloc_object(HashMap::from([
+                        ("x".to_owned(), JsVal::Number(geom.x as f64)),
+                        ("y".to_owned(), JsVal::Number(geom.y as f64)),
+                        ("left".to_owned(), JsVal::Number(geom.x as f64)),
+                        ("top".to_owned(), JsVal::Number(geom.y as f64)),
+                        ("width".to_owned(), JsVal::Number(geom.width as f64)),
+                        ("height".to_owned(), JsVal::Number(geom.height as f64)),
+                        (
+                            "right".to_owned(),
+                            JsVal::Number((geom.x + geom.width) as f64),
+                        ),
+                        (
+                            "bottom".to_owned(),
+                            JsVal::Number((geom.y + geom.height) as f64),
+                        ),
+                    ]));
+                    Ok(rect)
+                }
+                "dispatchEvent" => {
+                    let ev = args.into_iter().next().unwrap_or(JsVal::Undefined);
+                    let (ev_type, bubbles) = match &ev {
+                        JsVal::Object(id) => {
+                            let obj = vm.objects.get(*id);
+                            let t = obj
+                                .and_then(|o| o.get("type"))
+                                .map(ToString::to_string)
+                                .unwrap_or_default();
+                            let b = obj
+                                .and_then(|o| o.get("bubbles"))
+                                .is_some_and(JsVal::is_truthy);
+                            (t, b)
+                        }
+                        _ => (String::new(), false),
+                    };
+                    if let JsVal::Object(id) = &ev
+                        && let Some(obj) = vm.objects.get_mut(*id)
+                    {
+                        obj.insert("target".to_owned(), JsVal::DomNode(*nid));
+                    }
+                    let mut cur = Some(*nid);
+                    while let Some(c) = cur {
+                        if let Some(fns) = self.node_listeners.get(&(c, ev_type.clone())).cloned() {
+                            if let JsVal::Object(id) = &ev
+                                && let Some(obj) = vm.objects.get_mut(*id)
+                            {
+                                obj.insert("currentTarget".to_owned(), JsVal::DomNode(c));
+                            }
+                            for fn_id in fns {
+                                let _ = vm.invoke_fn(fn_id, vec![ev.clone()], self);
+                            }
+                        }
+                        if !bubbles {
+                            break;
+                        }
+                        cur = self.nodes.get(c).and_then(|n| n.parent);
+                    }
+                    if bubbles && let Some(fns) = self.doc_listeners.get(&ev_type).cloned() {
+                        for fn_id in fns {
+                            let _ = vm.invoke_fn(fn_id, vec![ev.clone()], self);
+                        }
+                    }
+                    Ok(JsVal::Bool(true))
+                }
                 "prepend" => {
+                    let mut changed = false;
                     for arg in args.into_iter().rev() {
                         if let JsVal::DomNode(child) = arg {
                             self.prepend_child(*nid, child);
-                            self.mutated = true;
+                            changed = true;
                         }
+                    }
+                    if changed {
+                        self.mark_mutated(*nid, "childList", None);
                     }
                     Ok(JsVal::Undefined)
                 }
                 "removeChild" => {
                     if let Some(JsVal::DomNode(child)) = args.first() {
                         self.detach_node(*child);
-                        self.mutated = true;
+                        self.mark_mutated(*nid, "childList", None);
                         Ok(JsVal::DomNode(*child))
                     } else {
                         Ok(JsVal::Null)
@@ -1633,6 +2318,7 @@ impl HostBridge for NativeDomHost {
                     let pos = args.first().map(ToString::to_string).unwrap_or_default();
                     let html = args.get(1).map(ToString::to_string).unwrap_or_default();
                     self.insert_adjacent_html(*nid, &pos, &html);
+                    self.mark_mutated(*nid, "childList", None);
                     Ok(JsVal::Undefined)
                 }
                 "querySelector" => {
@@ -1897,6 +2583,46 @@ impl HostBridge for NativeDomHost {
             }
             "TextEncoder" => Ok(JsVal::NativeHandle("TextEncoder".to_owned())),
             "TextDecoder" => Ok(JsVal::NativeHandle("TextDecoder".to_owned())),
+            "MutationObserver" => {
+                let Some(JsVal::Function(cb_fn_id)) = args.first() else {
+                    return Err(JsVal::Str(
+                        "MutationObserver requiere una función callback".to_owned(),
+                    ));
+                };
+                let oid = self.observers.len();
+                self.observers.push(MutationObserverState {
+                    cb_fn_id: *cb_fn_id,
+                    targets: Vec::new(),
+                    subtree: false,
+                    attributes: false,
+                    child_list: true,
+                    records: Vec::new(),
+                });
+                Ok(JsVal::NativeHandle(format!("observer:{oid}")))
+            }
+            "Event" | "CustomEvent" => {
+                let ev_type = args.first().map(ToString::to_string).unwrap_or_default();
+                let mut map = HashMap::from([
+                    ("type".to_owned(), JsVal::Str(ev_type)),
+                    ("bubbles".to_owned(), JsVal::Bool(false)),
+                    ("cancelable".to_owned(), JsVal::Bool(false)),
+                    ("detail".to_owned(), JsVal::Null),
+                ]);
+                if let Some(JsVal::Object(opt_id)) = args.get(1)
+                    && let Some(opts) = vm.objects.get(*opt_id)
+                {
+                    if let Some(b) = opts.get("bubbles") {
+                        map.insert("bubbles".to_owned(), b.clone());
+                    }
+                    if let Some(c) = opts.get("cancelable") {
+                        map.insert("cancelable".to_owned(), c.clone());
+                    }
+                    if let Some(d) = opts.get("detail") {
+                        map.insert("detail".to_owned(), d.clone());
+                    }
+                }
+                Ok(vm.alloc_object(map))
+            }
             _ => Err(JsVal::Str(format!("constructor no definido `{ctor}`"))),
         }
     }
@@ -1908,12 +2634,20 @@ pub(crate) fn run_scripts_native(
     modules: Vec<ModuleEntry>,
     module_scripts: &HashMap<String, String>,
     page_url: Option<String>,
-    policy: wisp_net::NetworkPolicy,
+    viewport_width: f32,
+    policy: &wisp_net::NetworkPolicy,
+    geometry_hook: Option<GeometryHook<'_>>,
 ) -> (Option<String>, Vec<String>) {
     let mut warnings = Vec::new();
-    init_fetch_state(page_url.as_deref(), policy);
+    init_fetch_state(page_url.as_deref(), *policy);
 
-    let mut host = NativeDomHost::from_html(document, page_url.as_deref());
+    let mut host = NativeDomHost::from_html(
+        document,
+        page_url.as_deref(),
+        viewport_width,
+        *policy,
+        geometry_hook,
+    );
     let mut vm = VmRuntime::new();
     host.init_globals(&mut vm);
 
@@ -1984,13 +2718,21 @@ pub(crate) fn run_scripts_native(
 pub(crate) fn evaluate_expression_native(
     document: &Html,
     page_url: Option<&str>,
+    viewport_width: f32,
     source: &str,
     policy: wisp_net::NetworkPolicy,
+    geometry_hook: Option<GeometryHook<'_>>,
 ) -> anyhow::Result<EvalResult> {
     let mut warnings = Vec::new();
     init_fetch_state(page_url, policy);
 
-    let mut host = NativeDomHost::from_html(document, page_url);
+    let mut host = NativeDomHost::from_html(
+        document,
+        page_url,
+        viewport_width,
+        policy,
+        geometry_hook,
+    );
     let mut vm = VmRuntime::new();
     host.init_globals(&mut vm);
 
@@ -2290,6 +3032,11 @@ pub(crate) fn native_idl_supports_member(iface: &str, member: &str) -> bool {
                 | "querySelectorAll"
                 | "closest"
                 | "insertAdjacentHTML"
+                | "getBoundingClientRect"
+                | "clientWidth"
+                | "clientHeight"
+                | "scrollWidth"
+                | "scrollHeight"
         ),
         "HTMLElement" => matches!(
             member,
@@ -2303,6 +3050,10 @@ pub(crate) fn native_idl_supports_member(iface: &str, member: &str) -> bool {
                 | "click"
                 | "focus"
                 | "blur"
+                | "offsetWidth"
+                | "offsetHeight"
+                | "offsetTop"
+                | "offsetLeft"
         ),
         "Document" => matches!(
             member,
@@ -2310,6 +3061,7 @@ pub(crate) fn native_idl_supports_member(iface: &str, member: &str) -> bool {
                 | "documentElement"
                 | "title"
                 | "URL"
+                | "cookie"
                 | "readyState"
                 | "images"
                 | "links"
@@ -2319,6 +3071,7 @@ pub(crate) fn native_idl_supports_member(iface: &str, member: &str) -> bool {
                 | "getElementsByClassName"
                 | "querySelector"
                 | "querySelectorAll"
+                | "elementFromPoint"
                 | "createElement"
                 | "createTextNode"
                 | "createDocumentFragment"
@@ -2332,8 +3085,16 @@ pub(crate) fn native_idl_supports_member(iface: &str, member: &str) -> bool {
                 | "self"
                 | "document"
                 | "location"
+                | "navigator"
+                | "performance"
+                | "crypto"
                 | "innerWidth"
                 | "innerHeight"
+                | "devicePixelRatio"
+                | "scrollX"
+                | "scrollY"
+                | "scrollTo"
+                | "getComputedStyle"
                 | "closed"
                 | "name"
                 | "event"
@@ -2411,3 +3172,122 @@ fn parse_selector_chain(sel: &str) -> Vec<(Combinator, String)> {
     }
     out
 }
+
+fn parse_px_val(raw: &str) -> Option<f32> {
+    let trimmed = raw.trim();
+    if let Some(num) = trimmed.strip_suffix("px") {
+        num.trim().parse::<f32>().ok()
+    } else {
+        trimmed.parse::<f32>().ok()
+    }
+}
+
+fn fill_random_bytes(out: &mut [u8]) {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::SystemTime;
+
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let rs = RandomState::new();
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut chunk_idx = 0usize;
+    while chunk_idx < out.len() {
+        let mut h = rs.build_hasher();
+        h.write_u64(nanos);
+        h.write_u64(SEQ.fetch_add(1, Ordering::Relaxed));
+        h.write_usize(chunk_idx);
+        let word = h.finish().to_le_bytes();
+        for b in word {
+            if chunk_idx >= out.len() {
+                break;
+            }
+            out[chunk_idx] = b;
+            chunk_idx += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn geometry_computed_style_and_element_from_point() {
+        let html = r#"<html><body><div id="box" style="width: 240px; height: 80px; color: red;">Hola</div></body></html>"#;
+        let res = crate::evaluate_expression(
+            html,
+            Some("https://example.com/"),
+            1280.0,
+            r#"(() => {
+                const el = document.getElementById("box");
+                const r = el.getBoundingClientRect();
+                const cs = window.getComputedStyle(el);
+                const hit = document.elementFromPoint(10, 10);
+                return [r.width, r.height, el.offsetWidth, cs.color, hit && hit.id];
+            })()"#,
+        )
+        .expect("eval ok");
+        assert_eq!(
+            res.value,
+            Some(serde_json::json!([240.0, 80.0, 240.0, "red", "box"]))
+        );
+    }
+
+    #[test]
+    fn mutation_observer_custom_event_performance_and_crypto() {
+        let html = r#"<html><body><div id="root"></div></body></html>"#;
+        let res = crate::evaluate_expression(
+            html,
+            Some("https://example.com/"),
+            1280.0,
+            r#"(() => {
+                const root = document.getElementById("root");
+                let observed = 0;
+                const obs = new MutationObserver((recs) => { observed += recs.length; });
+                obs.observe(root, { childList: true, attributes: true });
+                root.setAttribute("data-ok", "1");
+                const recs = obs.takeRecords();
+                let gotDetail = null;
+                root.addEventListener("ping", (e) => { gotDetail = e.detail.n; });
+                root.dispatchEvent(new CustomEvent("ping", { detail: { n: 42 }, bubbles: true }));
+                const uuid = crypto.randomUUID();
+                const arr = crypto.getRandomValues(new Uint8Array(4));
+                const t = performance.now();
+                return [recs.length, gotDetail, uuid.length, arr.length, t >= 0];
+            })()"#,
+        )
+        .expect("eval ok");
+        assert_eq!(
+            res.value,
+            Some(serde_json::json!([1, 42, 36, 4, true]))
+        );
+    }
+
+    #[test]
+    fn stealth_navigator_and_document_cookie() {
+        let policy = wisp_net::NetworkPolicy {
+            stealth: true,
+            ..Default::default()
+        };
+        let res = crate::evaluate_expression_with_policy(
+            "<html><body></body></html>",
+            Some("https://example.com/"),
+            1280.0,
+            r#"(() => {
+                document.cookie = "sid=abc123; Path=/";
+                return [navigator.webdriver, navigator.userAgent.includes("Chrome/"), !!window.chrome, document.cookie];
+            })()"#,
+            &policy,
+        )
+        .expect("eval ok");
+        assert_eq!(
+            res.value,
+            Some(serde_json::json!([false, true, true, "sid=abc123"]))
+        );
+    }
+}
+

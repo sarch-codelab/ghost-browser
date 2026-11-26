@@ -674,7 +674,8 @@ fn render_victory_table(report: &Value) -> String {
          | 4 workers | — | 40 pg/s, 112 MB | **> 40 pg/s, < 112 MB** | {workers} |\n\
          | Corpus real | — | 94/98, 5,2 s | **> 94/98, < 5,2 s** | {corpus} |\n\
          | 1.500 URLs | — | 0 crashes, 0 panics | **0 crashes, 0 panics** | {rel} |\n\
-         | Motor propio | Sí | No (usa V8) | **Sí (sin V8 ni Boa)** | Sí (`wisp-js::vm` por defecto; `legacy-boa` opcional desactivado) |\n",
+         | Motor propio | Sí | No (usa V8) | **Sí (sin V8 ni Boa)** | Sí (`wisp-js::vm` nativo en Rust puro; sin V8 ni Boa) |\n\n\
+         > Nota metodológica: los tracks de `wisp-benchmark` miden suites y fixtures sintéticos/embebidos propios de Wisp (no ejecutan el repositorio externo completo de WPT ni el corpus vivo de red de Obscura en CI offline).\n",
         sample_str("react"),
         sample_str("preact"),
         sample_str("vue"),

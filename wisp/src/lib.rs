@@ -276,6 +276,7 @@ pub struct FetchedPage {
     /// el JavaScript.
     prepared: Arc<Mutex<HashMap<u32, Arc<PreparedDocument>>>>,
     network_policy: wisp_net::NetworkPolicy,
+    cookies: wisp_net::CookieJar,
 }
 
 #[derive(Clone, Debug)]
@@ -340,7 +341,12 @@ impl FetchedPage {
             scripted: Arc::new(OnceLock::new()),
             prepared: Arc::new(Mutex::new(HashMap::new())),
             network_policy: wisp_net::NetworkPolicy::allow_private(),
+            cookies: wisp_net::CookieJar::new(),
         }
+    }
+
+    pub fn cookies(&self) -> &wisp_net::CookieJar {
+        &self.cookies
     }
 
     /// Runs the script stage once per page and re-runs only CSS + DOM
@@ -365,13 +371,19 @@ impl FetchedPage {
         self.scripted
             .get_or_init(|| {
                 let document = Html::parse_document(&self.html);
-                let script_result = wisp_js::execute_scripts_with_policy(
+                let stylesheets = self.stylesheets.clone();
+                let final_url = self.final_url.clone();
+                let mut hook = |live_html: &str, vw: f32| {
+                    compute_dom_geometry(live_html, &stylesheets, Some(&final_url), vw)
+                };
+                let script_result = wisp_js::execute_scripts_with_geometry(
                     &document,
                     &self.external_scripts,
                     &self.module_scripts,
                     Some(&self.final_url),
                     SCRIPT_VIEWPORT_WIDTH,
                     &self.network_policy,
+                    Some(&mut hook),
                 )
                 .map_err(|error| error.to_string())?;
                 Ok(ScriptedDocument {
@@ -468,12 +480,18 @@ impl FetchedPage {
     /// sobreviven a la siguiente llamada.
     pub fn eval_js(&self, source: &str) -> Result<EvalResult> {
         let html = self.document_html().unwrap_or_else(|_| self.html.clone());
-        wisp_js::evaluate_expression_with_policy(
+        let stylesheets = self.stylesheets.clone();
+        let final_url = self.final_url.clone();
+        let mut hook = |live_html: &str, vw: f32| {
+            compute_dom_geometry(live_html, &stylesheets, Some(&final_url), vw)
+        };
+        wisp_js::evaluate_expression_with_geometry(
             &html,
             Some(&self.final_url),
             SCRIPT_VIEWPORT_WIDTH,
             source,
             &self.network_policy,
+            Some(&mut hook),
         )
     }
 
@@ -1200,6 +1218,9 @@ struct DomNode {
     /// es `Copy` y no puede portar stops de degradado).
     background_image: Option<BgImage>,
     children: Vec<DomNode>,
+    /// Pre-order element index (0, 1, 2, ...) used when collecting live JS
+    /// bounding boxes/computed styles; `None` in normal layout passes.
+    preorder_index: Option<usize>,
     /// Computed style memoized on first use: it never depends on the viewport
     /// width, so it stays valid across every resize and every Taffy measure.
     style_cache: OnceLock<Style>,
@@ -1215,6 +1236,7 @@ impl Clone for DomNode {
             image: self.image.clone(),
             background_image: self.background_image.clone(),
             children: self.children.clone(),
+            preorder_index: self.preorder_index,
             style_cache: {
                 let cache = OnceLock::new();
                 if let Some(style) = self.style_cache.get() {
@@ -1865,6 +1887,15 @@ fn layout_roots(
     viewport_width: f32,
     images: &HashMap<String, ImageResource>,
 ) -> Result<LayoutDocument> {
+    layout_roots_with_geometry(roots, viewport_width, images, None)
+}
+
+fn layout_roots_with_geometry(
+    roots: &[DomNode],
+    viewport_width: f32,
+    images: &HashMap<String, ImageResource>,
+    geometry_out: Option<&mut HashMap<usize, wisp_js::ElementGeometry>>,
+) -> Result<LayoutDocument> {
     let mut commands = vec![PaintCommand::FillRect {
         rect: Rect {
             x: 0.0,
@@ -1882,6 +1913,7 @@ fn layout_roots(
         commands: &mut commands,
         measure_only: false,
         measure_cache: &mut measure_cache,
+        geometry_out,
     };
     for root in roots {
         if is_block(root) {
@@ -1907,6 +1939,44 @@ fn layout_roots(
         commands,
         warnings: Vec::new(),
     })
+}
+
+fn collect_preorder_node_ids(node: NodeRef<'_, Node>, next_idx: &mut usize, out: &mut HashMap<NodeId, usize>) {
+    if matches!(node.value(), Node::Element(_)) {
+        out.insert(node.id(), *next_idx);
+        *next_idx += 1;
+    }
+    for child in node.children() {
+        collect_preorder_node_ids(child, next_idx, out);
+    }
+}
+
+/// Computes real CSS-cascaded Taffy/block box geometry for every DOM element in
+/// `html`, keyed by DFS pre-order element index (`0, 1, 2, ...`).
+pub fn compute_dom_geometry(
+    html: &str,
+    stylesheets: &[String],
+    page_url: Option<&str>,
+    viewport_width: f32,
+) -> HashMap<usize, wisp_js::ElementGeometry> {
+    let document = Html::parse_document(html);
+    let mut preorder_map = HashMap::new();
+    let mut next_idx = 0usize;
+    collect_preorder_node_ids(document.tree.root(), &mut next_idx, &mut preorder_map);
+    let node_styles = collect_node_styles(&document, stylesheets, viewport_width);
+    let mut roots = Vec::new();
+    for child in document.tree.root().children() {
+        if let Ok(Some(node)) =
+            convert_node_with_preorder(child, 0, &node_styles, page_url, Some(&preorder_map))
+        {
+            roots.push(node);
+        }
+    }
+    resolve_custom_properties(&mut roots);
+    let empty_images = HashMap::new();
+    let mut out = HashMap::new();
+    let _ = layout_roots_with_geometry(&roots, viewport_width, &empty_images, Some(&mut out));
+    out
 }
 
 #[derive(Default)]
@@ -1935,6 +2005,9 @@ fn begin_network_budget_with_policy(policy: wisp_net::NetworkPolicy) {
 
 fn subresource_allowed(url: &str) -> Result<(), String> {
     let policy = NETWORK_BUDGET.with(|budget| budget.borrow().policy);
+    if policy.block_trackers && wisp_net::is_tracker_url(url) {
+        return Err(format!("Blocked tracker URL: {url}"));
+    }
     wisp_net::validate_url(url, &policy).map(|_| ())
 }
 
@@ -1942,6 +2015,8 @@ fn redirect_policy_for(policy: wisp_net::NetworkPolicy, max_hops: usize) -> Poli
     Policy::custom(move |attempt| {
         if attempt.previous().len() >= max_hops {
             attempt.stop()
+        } else if policy.block_trackers && wisp_net::is_tracker_url(attempt.url().as_str()) {
+            attempt.error("Blocked tracker redirect")
         } else if wisp_net::validate_url(attempt.url().as_str(), &policy).is_err() {
             attempt.error("SSRF blocked redirect")
         } else {
@@ -1982,12 +2057,55 @@ fn take_network_warning() -> Option<String> {
     })
 }
 
+/// High-level fetch options combining `wisp_net::NetworkPolicy` with an
+/// optional outbound proxy (`WISP_PROXY` or CLI `--proxy`).
+#[derive(Clone, Debug, Default)]
+pub struct FetchOptions {
+    pub policy: wisp_net::NetworkPolicy,
+    pub proxy_url: Option<String>,
+}
+
+impl FetchOptions {
+    pub fn from_env() -> Self {
+        let proxy_url = std::env::var("WISP_PROXY")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
+        Self {
+            policy: wisp_net::NetworkPolicy::from_env(),
+            proxy_url,
+        }
+    }
+}
+
 pub fn fetch_url(url: &str) -> Result<FetchedPage> {
-    fetch_url_with_policy(url, &wisp_net::NetworkPolicy::allow_private())
+    let options = FetchOptions {
+        policy: wisp_net::NetworkPolicy::allow_private(),
+        proxy_url: std::env::var("WISP_PROXY")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty()),
+    };
+    fetch_url_with_options(url, &options)
 }
 
 pub fn fetch_url_with_policy(url: &str, policy: &wisp_net::NetworkPolicy) -> Result<FetchedPage> {
+    let options = FetchOptions {
+        policy: *policy,
+        proxy_url: std::env::var("WISP_PROXY")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty()),
+    };
+    fetch_url_with_options(url, &options)
+}
+
+pub fn fetch_url_with_options(url: &str, options: &FetchOptions) -> Result<FetchedPage> {
+    let policy = &options.policy;
     begin_network_budget_with_policy(*policy);
+    if policy.block_trackers && wisp_net::is_tracker_url(url) {
+        anyhow::bail!("URL blocked by tracker filter: {url}");
+    }
     wisp_net::validate_url(url, policy).map_err(|error| anyhow::anyhow!(error))?;
     let url = url::Url::parse(url)?;
     ensure!(
@@ -2000,12 +2118,38 @@ pub fn fetch_url_with_policy(url: &str, policy: &wisp_net::NetworkPolicy) -> Res
     );
 
     let timeout = Duration::from_millis(policy.fetch_deadline_ms.max(1000));
-    let client = Client::builder()
+    let stealth = wisp_net::StealthProfile::for_policy(policy);
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    if let Ok(val) = reqwest::header::HeaderValue::from_str(stealth.accept_language) {
+        default_headers.insert("Accept-Language", val);
+    }
+    if policy.stealth {
+        if let Some(ch_ua) = stealth.sec_ch_ua
+            && let Ok(val) = reqwest::header::HeaderValue::from_str(ch_ua)
+        {
+            default_headers.insert("Sec-CH-UA", val);
+        }
+        if let Some(ch_mob) = stealth.sec_ch_ua_mobile
+            && let Ok(val) = reqwest::header::HeaderValue::from_str(ch_mob)
+        {
+            default_headers.insert("Sec-CH-UA-Mobile", val);
+        }
+        if let Some(ch_plat) = stealth.sec_ch_ua_platform
+            && let Ok(val) = reqwest::header::HeaderValue::from_str(ch_plat)
+        {
+            default_headers.insert("Sec-CH-UA-Platform", val);
+        }
+    }
+    let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(timeout)
         .redirect(redirect_policy_for(*policy, 10))
-        .user_agent("GhostWisp/0.1")
-        .build()?;
+        .user_agent(stealth.user_agent)
+        .default_headers(default_headers);
+    if let Some(proxy_url) = options.proxy_url.as_deref() {
+        builder = builder.proxy(reqwest::Proxy::all(proxy_url)?);
+    }
+    let client = builder.build()?;
     let response = client
         .get(url)
         .header(ACCEPT, "text/html,application/xhtml+xml")
@@ -2017,6 +2161,16 @@ pub fn fetch_url_with_policy(url: &str, policy: &wisp_net::NetworkPolicy) -> Res
     );
     let final_url = response.url().to_string();
     wisp_net::validate_url(&final_url, policy).map_err(|error| anyhow::anyhow!(error))?;
+    let mut cookie_jar = wisp_net::CookieJar::new();
+    if let Ok(parsed_final) = url::Url::parse(&final_url) {
+        let host = parsed_final.host_str().unwrap_or_default();
+        let path = parsed_final.path();
+        for hv in response.headers().get_all(reqwest::header::SET_COOKIE) {
+            if let Ok(raw) = hv.to_str() {
+                cookie_jar.set_from_header(raw, host, path);
+            }
+        }
+    }
     if let Some(content_type) = response.headers().get(CONTENT_TYPE) {
         let mime = content_type
             .to_str()?
@@ -2070,6 +2224,7 @@ pub fn fetch_url_with_policy(url: &str, policy: &wisp_net::NetworkPolicy) -> Res
         warnings,
     );
     page.network_policy = *policy;
+    page.cookies = cookie_jar;
     Ok(page)
 }
 
@@ -3983,6 +4138,16 @@ fn convert_node(
     node_styles: &HashMap<NodeId, String>,
     page_url: Option<&str>,
 ) -> Result<Option<DomNode>> {
+    convert_node_with_preorder(node, depth, node_styles, page_url, None)
+}
+
+fn convert_node_with_preorder(
+    node: NodeRef<'_, Node>,
+    depth: usize,
+    node_styles: &HashMap<NodeId, String>,
+    page_url: Option<&str>,
+    preorder_map: Option<&HashMap<NodeId, usize>>,
+) -> Result<Option<DomNode>> {
     ensure!(
         depth <= MAX_TREE_DEPTH,
         "HTML nesting exceeds Wisp's depth limit"
@@ -4001,6 +4166,7 @@ fn convert_node(
                 image: None,
                 background_image: None,
                 children: Vec::new(),
+                preorder_index: None,
                 style_cache: OnceLock::new(),
             }))
         }
@@ -4042,7 +4208,13 @@ fn convert_node(
             let background_image = node_background_image(&inline_style, page_url);
             let mut children = Vec::new();
             for child in element.children() {
-                if let Some(child) = convert_node(child, depth + 1, node_styles, page_url)? {
+                if let Some(child) = convert_node_with_preorder(
+                    child,
+                    depth + 1,
+                    node_styles,
+                    page_url,
+                    preorder_map,
+                )? {
                     children.push(child);
                 }
             }
@@ -4054,13 +4226,20 @@ fn convert_node(
                 image,
                 background_image,
                 children,
+                preorder_index: preorder_map.and_then(|m| m.get(&node.id()).copied()),
                 style_cache: OnceLock::new(),
             }))
         }
         Node::Document | Node::Fragment => {
             let mut children = Vec::new();
             for child in node.children() {
-                if let Some(child) = convert_node(child, depth + 1, node_styles, page_url)? {
+                if let Some(child) = convert_node_with_preorder(
+                    child,
+                    depth + 1,
+                    node_styles,
+                    page_url,
+                    preorder_map,
+                )? {
                     children.push(child);
                 }
             }
@@ -4072,6 +4251,7 @@ fn convert_node(
                 image: None,
                 background_image: None,
                 children,
+                preorder_index: None,
                 style_cache: OnceLock::new(),
             }))
         }
@@ -4273,6 +4453,7 @@ struct LayoutCtx<'a> {
     commands: &'a mut Vec<PaintCommand>,
     measure_only: bool,
     measure_cache: &'a mut MeasureCache,
+    geometry_out: Option<&'a mut HashMap<usize, wisp_js::ElementGeometry>>,
 }
 
 /// Pinta un hijo `position: absolute`: se coloca respecto al caja de
@@ -4312,6 +4493,7 @@ fn layout_absolute_child(
             commands: &mut scratch,
             measure_only: true,
             measure_cache: ctx.measure_cache,
+            geometry_out: None,
         };
         layout_block(
             child,
@@ -4509,6 +4691,48 @@ fn layout_block(
         box_height = box_height.max(to_content_height(min));
     }
     let border_box_height = border[0] + padding[0] + box_height + padding[2] + border[2];
+    if !ctx.measure_only
+        && let Some(preorder_idx) = node.preorder_index
+        && let Some(out) = ctx.geometry_out.as_deref_mut()
+    {
+        out.insert(
+            preorder_idx,
+            wisp_js::ElementGeometry {
+                x: outer_x,
+                y: box_y,
+                width: outer_width,
+                height: border_box_height,
+                display: match style.display {
+                    Display::Block => "block",
+                    Display::Inline => "inline",
+                    Display::Flex => "flex",
+                    Display::Grid => "grid",
+                    Display::None => "none",
+                }
+                .to_owned(),
+                visibility: match style.visibility {
+                    VisibilityKind::Visible => "visible",
+                    VisibilityKind::Hidden => "hidden",
+                }
+                .to_owned(),
+                position: match style.position {
+                    PositionKind::Static => "static",
+                    PositionKind::Relative => "relative",
+                    PositionKind::Absolute => "absolute",
+                }
+                .to_owned(),
+                color: format!(
+                    "rgb({}, {}, {})",
+                    style.color.r, style.color.g, style.color.b
+                ),
+                background_color: match style.background {
+                    Some(bg) => format!("rgba({}, {}, {}, {})", bg.r, bg.g, bg.b, bg.a),
+                    None => "rgba(0, 0, 0, 0)".to_owned(),
+                },
+                font_size: format!("{}px", style.font_size),
+            },
+        );
+    }
     if !ctx.measure_only && style.visibility == VisibilityKind::Visible {
         let radius = resolve_radius(style.border_radius, outer_width, border_box_height);
         let box_rect = Rect {
@@ -4928,6 +5152,7 @@ fn layout_taffy_children(
                         commands: &mut scratch,
                         measure_only: true,
                         measure_cache,
+                        geometry_out: None,
                     };
                     measure_taffy_item(
                         &items[index],
@@ -9045,5 +9270,36 @@ fetch("http://{data_address}/data.json").then(function () {{
         begin_network_budget_with_policy(wisp_net::NetworkPolicy::strict());
         assert!(subresource_allowed("http://169.254.169.254/latest/meta-data/").is_err());
         assert!(subresource_allowed("http://127.0.0.1:8080/secret.js").is_err());
+
+        let tracker_policy = wisp_net::NetworkPolicy {
+            block_trackers: true,
+            ..wisp_net::NetworkPolicy::strict()
+        };
+        begin_network_budget_with_policy(tracker_policy);
+        assert!(subresource_allowed("https://www.google-analytics.com/analytics.js").is_err());
+    }
+
+    #[test]
+    fn taffy_flex_geometry_feeds_get_bounding_client_rect() {
+        let page = FetchedPage::new(
+            "https://example.com/".to_owned(),
+            "Layout".to_owned(),
+            r#"<html><body><div style="display: flex; width: 400px;"><div id="a" style="width: 100px; height: 50px;">A</div><div id="b" style="width: 120px; height: 50px;">B</div></div></body></html>"#.to_owned(),
+            vec![],
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            vec![],
+        );
+        let res = page
+            .eval_js(
+                r#"(() => {
+                    const a = document.getElementById("a").getBoundingClientRect();
+                    const b = document.getElementById("b").getBoundingClientRect();
+                    return [a.x, a.width, b.x, b.width];
+                })()"#,
+            )
+            .expect("eval ok");
+        assert_eq!(res.value, Some(serde_json::json!([0.0, 100.0, 100.0, 120.0])));
     }
 }

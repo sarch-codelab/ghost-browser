@@ -747,32 +747,40 @@ impl Browser {
             return;
         }
 
-        let event_tx = self.event_tx.clone();
-        let event_proxy = self.event_proxy.clone();
-        let request_url = url.clone();
-        let spawn = thread::Builder::new()
-            .name(format!("wisp-load-{tab_id}"))
-            .spawn(move || {
-                let result =
-                    wisp_engine::fetch_url(&request_url).map_err(|error| format!("{error:#}"));
-                let event = TabEvent::WispPageLoaded {
-                    tab: tab_id,
+        #[cfg(test)]
+        {
+            let _ = (tab_id, request_id, url);
+            return;
+        }
+        #[cfg(not(test))]
+        {
+            let event_tx = self.event_tx.clone();
+            let event_proxy = self.event_proxy.clone();
+            let request_url = url.clone();
+            let spawn = thread::Builder::new()
+                .name(format!("wisp-load-{tab_id}"))
+                .spawn(move || {
+                    let result =
+                        wisp_engine::fetch_url(&request_url).map_err(|error| format!("{error:#}"));
+                    let event = TabEvent::WispPageLoaded {
+                        tab: tab_id,
+                        request_id,
+                        result: Box::new(result),
+                    };
+                    if event_tx.send(event).is_ok()
+                        && let Some(proxy) = event_proxy
+                    {
+                        let _ = proxy.send_event(());
+                    }
+                });
+            if let Err(error) = spawn {
+                log::error!("No se pudo iniciar la carga de Wisp para la pestaña {tab_id}: {error}");
+                self.deliver_wisp_result(
+                    tab_id,
                     request_id,
-                    result: Box::new(result),
-                };
-                if event_tx.send(event).is_ok()
-                    && let Some(proxy) = event_proxy
-                {
-                    let _ = proxy.send_event(());
-                }
-            });
-        if let Err(error) = spawn {
-            log::error!("No se pudo iniciar la carga de Wisp para la pestaña {tab_id}: {error}");
-            self.deliver_wisp_result(
-                tab_id,
-                request_id,
-                Box::new(Err(format!("No se pudo iniciar la carga: {error}"))),
-            );
+                    Box::new(Err(format!("No se pudo iniciar la carga: {error}"))),
+                );
+            }
         }
     }
 

@@ -73,7 +73,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Run tests (root)
-        run: cargo test --locked -- --test-threads=1
+        run: cargo test --locked
 
   wisp-windows:
     name: Wisp (Windows)
@@ -98,11 +98,15 @@ jobs:
           workspaces: wisp -> wisp/target
           key: ${{ runner.os }}-wisp-cargo-${{ hashFiles('wisp/Cargo.lock') }}
 
-      - name: Verify no Boa or UI crates in default wisp-agent tree
+      - name: Verify no Boa anywhere and no UI crates in wisp-agent
         shell: bash
         run: |
-          if cargo tree --manifest-path wisp/Cargo.toml -p wisp-agent | grep -E "boa_|egui|wgpu|wry|webview2-com"; then
-            echo "Forbidden dependency found in wisp-agent default tree"
+          if cargo tree --manifest-path wisp/Cargo.toml --workspace --all-features | grep -E "boa_"; then
+            echo "Forbidden boa_ dependency found in wisp workspace"
+            exit 1
+          fi
+          if cargo tree --manifest-path wisp/Cargo.toml -p wisp-agent --all-features | grep -E "boa_|egui|wgpu|wry|webview2-com"; then
+            echo "Forbidden dependency found in wisp-agent tree"
             exit 1
           fi
 
@@ -188,6 +192,14 @@ jobs:
                           ev = json.loads(r.read())
                           assert ev["ok"] is True and ev["result"] == "Example Domain", ev
 
+                      with urllib.request.urlopen(f"http://127.0.0.1:{api_port}/json/version", timeout=5) as r:
+                          ver = json.loads(r.read())
+                          assert ver["webSocketDebuggerUrl"].startswith(f"ws://127.0.0.1:{api_port}/devtools/browser/"), ver
+
+                      with urllib.request.urlopen(f"http://127.0.0.1:{api_port}/json/list", timeout=5) as r:
+                          targets = json.loads(r.read())
+                          assert isinstance(targets, list) and len(targets) >= 1, targets
+
                       bad = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs/active/eval", data=b'{"js": "broken', method="POST")
                       try:
                           urllib.request.urlopen(bad, timeout=5)
@@ -228,7 +240,7 @@ jobs:
           '@ | python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload Wisp benchmark artifacts
+      - name: Upload Wisp benchmark & wisp-agent artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wisp-results-windows
@@ -236,6 +248,7 @@ jobs:
             target/wisp-benchmark.json
             target/wisp-benchmark.md
             WISP_RESULTS.md
+            wisp/target/release/wisp-agent.exe
 
   wisp-linux:
     name: Wisp (Linux)
@@ -260,10 +273,14 @@ jobs:
           workspaces: wisp -> wisp/target
           key: ${{ runner.os }}-wisp-cargo-${{ hashFiles('wisp/Cargo.lock') }}
 
-      - name: Verify no Boa or UI crates in default wisp-agent tree
+      - name: Verify no Boa anywhere and no UI crates in wisp-agent
         run: |
-          if cargo tree --manifest-path wisp/Cargo.toml -p wisp-agent | grep -E "boa_|egui|wgpu|wry|webview2-com"; then
-            echo "Forbidden dependency found in wisp-agent default tree"
+          if cargo tree --manifest-path wisp/Cargo.toml --workspace --all-features | grep -E "boa_"; then
+            echo "Forbidden boa_ dependency found in wisp workspace"
+            exit 1
+          fi
+          if cargo tree --manifest-path wisp/Cargo.toml -p wisp-agent --all-features | grep -E "boa_|egui|wgpu|wry|webview2-com"; then
+            echo "Forbidden dependency found in wisp-agent tree"
             exit 1
           fi
 
@@ -297,7 +314,7 @@ jobs:
           assert data["rss_mb"] is not None and data["rss_mb"] > 0, data
           PY
 
-      - name: Upload Wisp benchmark artifacts
+      - name: Upload Wisp benchmark & wisp-agent artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wisp-results-linux
@@ -305,3 +322,4 @@ jobs:
             target/wisp-benchmark.json
             target/wisp-benchmark.md
             WISP_RESULTS.md
+            wisp/target/release/wisp-agent

@@ -9,14 +9,14 @@
 use anyhow::{Context, Result, bail};
 use std::env;
 use std::path::PathBuf;
-use wisp_engine::wisp_net::NetworkPolicy;
-use wisp_engine::{LayoutDocument, PaintCommand, fetch_url_with_policy};
+use wisp_engine::{FetchOptions, LayoutDocument, PaintCommand, fetch_url_with_options};
 
 mod cdp;
 mod pdf;
 mod png;
 mod render;
 mod serve;
+mod ws;
 
 pub(crate) const DEFAULT_VIEWPORT_WIDTH: f32 = 1280.0;
 
@@ -41,7 +41,7 @@ fn fetch(args: &[String]) -> Result<()> {
     let mut url: Option<String> = None;
     let mut dump = String::from("text");
     let mut width = DEFAULT_VIEWPORT_WIDTH;
-    let mut policy = NetworkPolicy::from_env();
+    let mut options = FetchOptions::from_env();
 
     let mut index = 0;
     while index < args.len() {
@@ -62,7 +62,21 @@ fn fetch(args: &[String]) -> Result<()> {
                     .context("`--width` must be a number")?;
             }
             "--allow-private-network" => {
-                policy.allow_private_network = true;
+                options.policy.allow_private_network = true;
+            }
+            "--stealth" => {
+                options.policy.stealth = true;
+            }
+            "--block-trackers" => {
+                options.policy.block_trackers = true;
+            }
+            "--proxy" => {
+                index += 1;
+                options.proxy_url = Some(
+                    args.get(index)
+                        .context("`--proxy` needs a URL")?
+                        .to_owned(),
+                );
             }
             flag if flag.starts_with("--") => bail!("unknown flag `{flag}`"),
             value => {
@@ -73,7 +87,7 @@ fn fetch(args: &[String]) -> Result<()> {
     }
 
     let url = url.context("a URL is required, e.g. `wisp-agent fetch https://example.com`")?;
-    let page = fetch_url_with_policy(&url, &policy)?;
+    let page = fetch_url_with_options(&url, &options)?;
     for warning in &page.warnings {
         eprintln!("warning: {warning}");
     }
@@ -113,7 +127,7 @@ fn screenshot(args: &[String]) -> Result<()> {
     let mut url: Option<String> = None;
     let mut width = DEFAULT_VIEWPORT_WIDTH;
     let mut out: Option<PathBuf> = None;
-    let mut policy = NetworkPolicy::from_env();
+    let mut options = FetchOptions::from_env();
 
     let mut index = 0;
     while index < args.len() {
@@ -133,7 +147,21 @@ fn screenshot(args: &[String]) -> Result<()> {
                 ));
             }
             "--allow-private-network" => {
-                policy.allow_private_network = true;
+                options.policy.allow_private_network = true;
+            }
+            "--stealth" => {
+                options.policy.stealth = true;
+            }
+            "--block-trackers" => {
+                options.policy.block_trackers = true;
+            }
+            "--proxy" => {
+                index += 1;
+                options.proxy_url = Some(
+                    args.get(index)
+                        .context("`--proxy` needs a URL")?
+                        .to_owned(),
+                );
             }
             flag if flag.starts_with("--") => bail!("unknown flag `{flag}`"),
             value => ensure_single_url(&mut url, value)?,
@@ -142,7 +170,7 @@ fn screenshot(args: &[String]) -> Result<()> {
     }
 
     let url = url.context("a URL is required, e.g. `wisp-agent screenshot https://example.com`")?;
-    let page = fetch_url_with_policy(&url, &policy)?;
+    let page = fetch_url_with_options(&url, &options)?;
     for warning in &page.warnings {
         eprintln!("warning: {warning}");
     }
@@ -217,12 +245,12 @@ fn print_assets(page: &wisp_engine::FetchedPage) {
 fn print_usage() {
     eprintln!("wisp-agent — headless Wisp engine");
     eprintln!(
-        "Usage: wisp-agent fetch <url> [--dump original|html|text|links|markdown|assets] [--width <px>] [--allow-private-network]"
+        "Usage: wisp-agent fetch <url> [--dump original|html|text|links|markdown|assets] [--width <px>] [--allow-private-network] [--stealth] [--block-trackers] [--proxy <url>]"
     );
     eprintln!(
-        "       wisp-agent screenshot <url> [--width <px>] [--out <png>] [--allow-private-network]"
+        "       wisp-agent screenshot <url> [--width <px>] [--out <png>] [--allow-private-network] [--stealth] [--block-trackers] [--proxy <url>]"
     );
     eprintln!(
-        "       wisp-agent serve [--port <n>] [--allow-private-network] [--workers <n>] [--worker-max-rss <mb>] [--worker-max-age <s>] [--worker-drain-timeout <s>]"
+        "       wisp-agent serve [--port <n>] [--allow-private-network] [--stealth] [--block-trackers] [--proxy <url>] [--workers <n>] [--worker-max-rss <mb>] [--worker-max-age <s>] [--worker-drain-timeout <s>]"
     );
 }

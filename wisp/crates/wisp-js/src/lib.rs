@@ -1,45 +1,19 @@
 //! Etapa de JavaScript de Wisp: ejecuta los scripts de una página en el
-//! motor propio `wisp_js::vm` con DOM nativo en Rust (y soporte opcional
-//! `legacy-boa` desactivado por defecto), exponiendo el DOM a la página y
-//! devolviendo el documento serializado cuando los scripts lo modifican.
+//! motor propio `wisp_js::vm` con DOM nativo en Rust, exponiendo el DOM a la
+//! página y devolviendo el documento serializado cuando los scripts lo modifican.
 
-#[cfg(not(feature = "legacy-boa"))]
 use anyhow::Result;
-#[cfg(feature = "legacy-boa")]
-use anyhow::{Result, anyhow, ensure};
-#[cfg(feature = "legacy-boa")]
-use boa_engine::builtins::promise::PromiseState;
-#[cfg(feature = "legacy-boa")]
-use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
-#[cfg(feature = "legacy-boa")]
-use boa_engine::native_function::NativeFunction;
-#[cfg(feature = "legacy-boa")]
-use boa_engine::{
-    Context, JsNativeError, JsObject, JsResult, JsString, JsValue, Module, Source, js_string,
-    property::Attribute,
-};
-#[cfg(feature = "legacy-boa")]
-use ego_tree::NodeRef;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE};
 use reqwest::redirect::Policy;
-#[cfg(feature = "legacy-boa")]
-use scraper::node::Node;
 use scraper::{Html, Selector};
-#[cfg(feature = "legacy-boa")]
-use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Read;
-#[cfg(feature = "legacy-boa")]
-use std::path::PathBuf;
-#[cfg(feature = "legacy-boa")]
-use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-/// Conformidad entre los descriptores WebIDL (`wisp-idl`) y el DOM de `dom.js`.
+/// Conformidad entre los descriptores WebIDL (`wisp-idl`) y el DOM nativo.
 pub mod idl;
-#[cfg(not(feature = "legacy-boa"))]
 mod native_dom;
 /// Motor JS propio de Wisp (lexer -> parser -> AST -> bytecode -> VM).
 pub mod vm;
@@ -51,20 +25,8 @@ const MAX_EXTERNAL_SCRIPT_BYTES: usize = 512 * 1024;
 const MAX_TOTAL_EXTERNAL_SCRIPT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EXECUTED_SCRIPTS: usize = 48;
 const MAX_MODULES: usize = 32;
-#[cfg(feature = "legacy-boa")]
-const MAX_LOOP_ITERATIONS: u64 = 100_000;
-#[cfg(feature = "legacy-boa")]
-const MAX_RECURSION_DEPTH: usize = 128;
-#[cfg(feature = "legacy-boa")]
-const MAX_STACK_SIZE: usize = 4096;
 const MAX_TREE_DEPTH: usize = 256;
-#[cfg(all(feature = "legacy-boa", not(debug_assertions)))]
-const MAX_SCRIPT_EXECUTION_TIME: Duration = Duration::from_millis(120);
-#[cfg(all(feature = "legacy-boa", debug_assertions))]
-const MAX_SCRIPT_EXECUTION_TIME: Duration = Duration::from_secs(3);
 const MAX_SCRIPT_WARNINGS: usize = 8;
-#[cfg(feature = "legacy-boa")]
-const SCRIPT_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 /// `fetch()`: tamaño máximo de una respuesta, peticiones por página y tiempo
 /// máximo. Son los mismos espíritu que el resto de límites de Wisp: la página
 /// nunca puede bloquear ni llenar la memoria del navegador.
@@ -93,9 +55,6 @@ thread_local! {
     static FETCH_STATE: RefCell<FetchState> = RefCell::new(FetchState::default());
 }
 
-#[cfg(feature = "legacy-boa")]
-const DOM_RUNTIME: &str = include_str!("dom.js");
-
 #[derive(Default)]
 pub struct ScriptResult {
     /// Serialized document produced when page scripts changed the tree.
@@ -104,31 +63,23 @@ pub struct ScriptResult {
     pub warnings: Vec<String>,
 }
 
-#[cfg(feature = "legacy-boa")]
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InitialNode {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tag: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    attributes: HashMap<String, String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    children: Vec<InitialNode>,
+/// Geometría computada para un elemento del DOM (por índice de elemento en preorden).
+#[derive(Debug, Clone, Default)]
+pub struct ElementGeometry {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub display: String,
+    pub visibility: String,
+    pub position: String,
+    pub color: String,
+    pub background_color: String,
+    pub font_size: String,
 }
 
-#[cfg(feature = "legacy-boa")]
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DomSnapshot {
-    #[serde(default)]
-    html: Option<String>,
-    #[serde(default)]
-    mutated: bool,
-    #[serde(default)]
-    oversized: bool,
-}
+/// Hook opcional para consultar geometría real de layout (p. ej. Taffy desde `wisp-engine`).
+pub type GeometryHook<'a> = &'a mut dyn FnMut(&str, f32) -> HashMap<usize, ElementGeometry>;
 
 struct ModuleEntry {
     label: String,
@@ -162,6 +113,26 @@ pub fn execute_scripts_with_policy(
     page_url: Option<&str>,
     viewport_width: f32,
     policy: &wisp_net::NetworkPolicy,
+) -> Result<ScriptResult> {
+    execute_scripts_with_geometry(
+        document,
+        external_scripts,
+        module_scripts,
+        page_url,
+        viewport_width,
+        policy,
+        None,
+    )
+}
+
+pub fn execute_scripts_with_geometry(
+    document: &Html,
+    external_scripts: &HashMap<String, String>,
+    module_scripts: &HashMap<String, String>,
+    page_url: Option<&str>,
+    viewport_width: f32,
+    policy: &wisp_net::NetworkPolicy,
+    geometry_hook: Option<GeometryHook<'_>>,
 ) -> Result<ScriptResult> {
     let page_url_owned = page_url.map(str::to_owned);
     let policy = *policy;
@@ -388,30 +359,16 @@ pub fn execute_scripts_with_policy(
         });
     }
 
-    #[cfg(not(feature = "legacy-boa"))]
     let (html, script_warnings) = native_dom::run_scripts_native(
         document,
         classic,
         modules,
         module_scripts,
         page_url_owned,
+        viewport_width,
         policy,
+        geometry_hook,
     );
-    #[cfg(feature = "legacy-boa")]
-    let (html, script_warnings) = {
-        let initial = build_initial_document(document)?;
-        run_scripts_on_thread(
-            initial,
-            classic,
-            modules,
-            module_scripts,
-            page_url_owned,
-            viewport_width,
-            policy,
-        )?
-    };
-    #[cfg(not(feature = "legacy-boa"))]
-    let _ = viewport_width;
     for warning in script_warnings {
         push_warning(&mut warnings, warning);
     }
@@ -454,136 +411,26 @@ pub fn evaluate_expression_with_policy(
     source: &str,
     policy: &wisp_net::NetworkPolicy,
 ) -> Result<EvalResult> {
-    let document = Html::parse_document(html);
-    #[cfg(not(feature = "legacy-boa"))]
-    {
-        let _ = viewport_width;
-        native_dom::evaluate_expression_native(&document, page_url, source, *policy)
-    }
-    #[cfg(feature = "legacy-boa")]
-    {
-        let initial = build_initial_document(&document)?;
-        let page_url = page_url.map(str::to_owned);
-        let source = source.to_owned();
-        let policy = *policy;
-        // Boa puede necesitar más pila nativa que la que da el hilo llamante.
-        std::thread::scope(|scope| {
-            let handle = std::thread::Builder::new()
-                .name("wisp-eval".to_owned())
-                .stack_size(SCRIPT_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    evaluate_expression_on_thread(
-                        initial,
-                        page_url.as_deref(),
-                        viewport_width,
-                        &source,
-                        policy,
-                    )
-                })
-                .map_err(|error| anyhow!("could not start Wisp's evaluator: {error}"))?;
-            match handle.join() {
-                Ok(result) => result,
-                Err(_) => Err(anyhow!("Wisp's evaluator failed unexpectedly")),
-            }
-        })
-    }
+    evaluate_expression_with_geometry(html, page_url, viewport_width, source, policy, None)
 }
 
-#[cfg(feature = "legacy-boa")]
-fn evaluate_expression_on_thread(
-    initial: InitialNode,
+pub fn evaluate_expression_with_geometry(
+    html: &str,
     page_url: Option<&str>,
     viewport_width: f32,
     source: &str,
-    policy: wisp_net::NetworkPolicy,
+    policy: &wisp_net::NetworkPolicy,
+    geometry_hook: Option<GeometryHook<'_>>,
 ) -> Result<EvalResult> {
-    let mut warnings = Vec::new();
-    let mut context = Context::builder()
-        .build()
-        .map_err(|error| anyhow!("could not start Wisp's evaluator: {error}"))?;
-    FETCH_STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        state.page_url = page_url.and_then(|url| url::Url::parse(url).ok());
-        state.policy = policy;
-        state.used = 0;
-        state.deadline = Some(Instant::now() + MAX_FETCH_TOTAL_TIME);
-        state.warnings.clear();
-    });
-    if let Err(error) = context.register_global_callable(
-        js_string!("__wispFetchSync"),
-        2,
-        NativeFunction::from_fn_ptr(wisp_fetch_sync),
-    ) {
-        push_warning(
-            &mut warnings,
-            format!("No se pudo exponer fetch() en Wisp: {error}"),
-        );
-    }
-
-    let mut runtime_limits = context.runtime_limits();
-    runtime_limits.set_loop_iteration_limit(MAX_LOOP_ITERATIONS);
-    runtime_limits.set_recursion_limit(MAX_RECURSION_DEPTH);
-    runtime_limits.set_stack_size_limit(MAX_STACK_SIZE);
-    context.set_runtime_limits(runtime_limits);
-
-    register_document_globals(
-        &mut context,
-        initial,
+    let document = Html::parse_document(html);
+    native_dom::evaluate_expression_native(
+        &document,
         page_url,
         viewport_width,
-        &mut warnings,
-    )?;
-
-    if let Err(error) = context.eval(Source::from_bytes(DOM_RUNTIME)) {
-        return Err(anyhow!(
-            "no se pudo iniciar el DOM de JavaScript de Wisp: {}",
-            truncate_error(&error.to_string())
-        ));
-    }
-
-    let evaluated = context.eval(Source::from_bytes(source)).map_err(|error| {
-        anyhow!(
-            "falló la evaluación: {}",
-            truncate_error(&error.to_string())
-        )
-    })?;
-    let value = match evaluated.to_json(&mut context) {
-        Ok(json) => json,
-        Err(_) => {
-            push_warning(
-                &mut warnings,
-                "El valor devuelto por eval no se pudo serializar a JSON.".to_owned(),
-            );
-            None
-        }
-    };
-
-    let fetch_warnings = FETCH_STATE.with(|state| std::mem::take(&mut state.borrow_mut().warnings));
-    for warning in fetch_warnings {
-        push_warning(&mut warnings, warning);
-    }
-
-    let snapshot = read_snapshot(&mut context, &mut warnings);
-    for warning in read_runtime_warnings(&mut context, &mut warnings) {
-        push_warning(&mut warnings, warning);
-    }
-    let html = match snapshot {
-        Some(snapshot) if snapshot.oversized => {
-            push_warning(
-                &mut warnings,
-                "El DOM generado por JavaScript supera el límite de tamaño de Wisp.".to_owned(),
-            );
-            None
-        }
-        Some(snapshot) if snapshot.mutated => snapshot.html,
-        _ => None,
-    };
-
-    Ok(EvalResult {
-        value,
-        html,
-        warnings,
-    })
+        source,
+        *policy,
+        geometry_hook,
+    )
 }
 
 fn resolve_script_url(page_url: Option<&str>, src: &str) -> Option<String> {
@@ -596,527 +443,6 @@ fn resolve_script_url(page_url: Option<&str>, src: &str) -> Option<String> {
         return None;
     }
     Some(url.to_string())
-}
-
-#[cfg(feature = "legacy-boa")]
-fn build_initial_document(document: &Html) -> Result<InitialNode> {
-    let root = document
-        .tree
-        .root()
-        .children()
-        .find(|node| matches!(node.value(), Node::Element(element) if element.name() == "html"))
-        .ok_or_else(|| anyhow!("the parsed document has no <html> element"))?;
-    convert_initial_node(root, 0)?
-        .ok_or_else(|| anyhow!("the parsed document has no serializable root"))
-}
-
-#[cfg(feature = "legacy-boa")]
-fn convert_initial_node(node: NodeRef<'_, Node>, depth: usize) -> Result<Option<InitialNode>> {
-    ensure!(
-        depth <= MAX_TREE_DEPTH,
-        "HTML nesting exceeds Wisp's depth limit"
-    );
-    match node.value() {
-        Node::Text(text) => Ok(Some(InitialNode {
-            tag: None,
-            text: Some(text.text.to_string()),
-            attributes: HashMap::new(),
-            children: Vec::new(),
-        })),
-        Node::Element(element) => {
-            let attributes = element
-                .attrs()
-                .map(|(name, value)| (name.to_owned(), value.to_owned()))
-                .collect::<HashMap<_, _>>();
-            let mut children = Vec::new();
-            for child in node.children() {
-                if let Some(child) = convert_initial_node(child, depth + 1)? {
-                    children.push(child);
-                }
-            }
-            Ok(Some(InitialNode {
-                tag: Some(element.name().to_owned()),
-                text: None,
-                attributes,
-                children,
-            }))
-        }
-        Node::Document | Node::Fragment => {
-            let mut children = Vec::new();
-            for child in node.children() {
-                if let Some(child) = convert_initial_node(child, depth + 1)? {
-                    children.push(child);
-                }
-            }
-            if children.len() == 1 {
-                Ok(children.pop())
-            } else {
-                Ok(None)
-            }
-        }
-        Node::Doctype(_) | Node::Comment(_) | Node::ProcessingInstruction(_) => Ok(None),
-    }
-}
-
-#[cfg(feature = "legacy-boa")]
-fn page_url_json(url: Option<&str>) -> serde_json::Value {
-    let Some(parsed) = url.and_then(|url| url::Url::parse(url).ok()) else {
-        return serde_json::json!({
-            "href": "about:blank",
-            "origin": "null",
-            "protocol": "about:",
-            "host": "",
-            "hostname": "",
-            "port": "",
-            "pathname": "",
-            "search": "",
-            "hash": ""
-        });
-    };
-
-    let host = match parsed.host_str() {
-        Some(host) => match parsed.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_owned(),
-        },
-        None => String::new(),
-    };
-    let origin = if host.is_empty() {
-        "null".to_owned()
-    } else {
-        format!("{}://{host}", parsed.scheme())
-    };
-
-    serde_json::json!({
-        "href": parsed.as_str(),
-        "origin": origin,
-        "protocol": format!("{}:", parsed.scheme()),
-        "host": host,
-        "hostname": parsed.host_str().unwrap_or_default(),
-        "port": parsed.port().map(|port| port.to_string()).unwrap_or_default(),
-        "pathname": parsed.path(),
-        "search": parsed.query().map(|query| format!("?{query}")).unwrap_or_default(),
-        "hash": parsed.fragment().map(|fragment| format!("#{fragment}")).unwrap_or_default()
-    })
-}
-
-/// Resolves ES module specifiers against Wisp's pre-fetched module graph.
-///
-/// Boa's built-in loaders treat specifiers as filesystem paths, which does not
-/// match the URLs browsers use. Wisp stores every module under its resolved
-/// absolute URL, so this loader joins relative specifiers with the referrer URL
-/// and looks the result up in that map.
-#[cfg(feature = "legacy-boa")]
-struct WispModuleLoader {
-    modules: RefCell<HashMap<String, Module>>,
-    sources: HashMap<String, String>,
-    page_url: Option<String>,
-    module_urls: RefCell<HashMap<String, String>>,
-}
-
-#[cfg(feature = "legacy-boa")]
-impl WispModuleLoader {
-    fn new(sources: &HashMap<String, String>, page_url: Option<&str>) -> Self {
-        Self {
-            modules: RefCell::new(HashMap::new()),
-            sources: sources.clone(),
-            page_url: page_url.map(str::to_owned),
-            module_urls: RefCell::new(HashMap::new()),
-        }
-    }
-
-    fn register(&self, url: &str, module: Module) {
-        self.modules.borrow_mut().insert(url.to_owned(), module);
-    }
-
-    fn register_url(&self, path: &str, url: &str) {
-        self.module_urls
-            .borrow_mut()
-            .insert(path.to_owned(), url.to_owned());
-    }
-}
-
-#[cfg(feature = "legacy-boa")]
-impl ModuleLoader for WispModuleLoader {
-    fn load_imported_module(
-        self: Rc<Self>,
-        referrer: Referrer,
-        request: ModuleRequest,
-        context: &RefCell<&mut Context>,
-    ) -> impl std::future::Future<Output = boa_engine::JsResult<Module>> {
-        let specifier = request.specifier().to_std_string_escaped();
-        let referrer_url = referrer
-            .path()
-            .map(|path| path.to_string_lossy().into_owned());
-        let result = (|| {
-            let base = referrer_url
-                .as_deref()
-                .or(self.page_url.as_deref())
-                .ok_or_else(|| {
-                    JsNativeError::typ()
-                        .with_message("Wisp cannot resolve a module without a page URL")
-                })?;
-            let base = base.split('#').next().unwrap_or(base);
-            let url = resolve_module_url(base, &specifier).ok_or_else(|| {
-                JsNativeError::typ().with_message(format!(
-                    "Wisp cannot load the module `{specifier}`: only URL-like specifiers are supported"
-                ))
-            })?;
-            if let Some(module) = self.modules.borrow().get(&url) {
-                return Ok(module.clone());
-            }
-            let source = self.sources.get(&url).ok_or_else(|| {
-                JsNativeError::typ().with_message(format!("Wisp did not fetch the module `{url}`"))
-            })?;
-            let path = PathBuf::from(&url);
-            let mut borrow = context.borrow_mut();
-            let context = &mut **borrow;
-            let module = Module::parse(
-                Source::from_bytes(source.as_str()).with_path(&path),
-                None,
-                context,
-            )?;
-            self.register_url(&path.to_string_lossy(), &url);
-            self.modules.borrow_mut().insert(url, module.clone());
-            Ok(module)
-        })();
-        std::future::ready(result)
-    }
-
-    fn init_import_meta(
-        self: Rc<Self>,
-        import_meta: &JsObject,
-        module: &Module,
-        context: &mut Context,
-    ) {
-        let path = module
-            .path()
-            .map(|path| path.to_string_lossy().into_owned());
-        let url = if let Some(p) = path {
-            if let Some(mapped_url) = self.module_urls.borrow().get(&p) {
-                mapped_url.clone()
-            } else {
-                p
-            }
-        } else {
-            self.page_url.clone().unwrap_or_default()
-        };
-        let _ = import_meta.create_data_property_or_throw(
-            js_string!("url"),
-            js_string!(url.as_str()),
-            context,
-        );
-    }
-}
-
-#[cfg(feature = "legacy-boa")]
-fn resolve_module_url(base_url: &str, specifier: &str) -> Option<String> {
-    if !(specifier.starts_with('/')
-        || specifier.starts_with("./")
-        || specifier.starts_with("../")
-        || specifier.contains("://"))
-    {
-        return None;
-    }
-    let base = url::Url::parse(base_url).ok()?;
-    let url = base.join(specifier).ok()?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return None;
-    }
-    Some(url.to_string())
-}
-
-#[cfg(feature = "legacy-boa")]
-fn run_scripts_on_thread(
-    initial: InitialNode,
-    scripts: Vec<(String, String)>,
-    modules: Vec<ModuleEntry>,
-    module_scripts: &HashMap<String, String>,
-    page_url: Option<String>,
-    viewport_width: f32,
-    policy: wisp_net::NetworkPolicy,
-) -> Result<(Option<String>, Vec<String>)> {
-    // Boa can need more native stack than the Windows main thread provides.
-    std::thread::scope(|scope| {
-        let handle = match std::thread::Builder::new()
-            .name("wisp-script".to_owned())
-            .stack_size(SCRIPT_THREAD_STACK_BYTES)
-            .spawn_scoped(scope, move || {
-                evaluate_scripts(
-                    initial,
-                    scripts,
-                    modules,
-                    module_scripts,
-                    page_url.as_deref(),
-                    viewport_width,
-                    policy,
-                )
-            }) {
-            Ok(handle) => handle,
-            Err(error) => {
-                return Ok((
-                    None,
-                    vec![format!(
-                        "No se pudo iniciar el motor de JavaScript de Wisp: {error}"
-                    )],
-                ));
-            }
-        };
-        match handle.join() {
-            Ok(result) => result,
-            Err(_) => Ok((
-                None,
-                vec!["El motor de JavaScript de Wisp falló inesperadamente.".to_owned()],
-            )),
-        }
-    })
-}
-
-#[cfg(feature = "legacy-boa")]
-fn evaluate_scripts(
-    initial: InitialNode,
-    scripts: Vec<(String, String)>,
-    modules: Vec<ModuleEntry>,
-    module_scripts: &HashMap<String, String>,
-    page_url: Option<&str>,
-    viewport_width: f32,
-    policy: wisp_net::NetworkPolicy,
-) -> Result<(Option<String>, Vec<String>)> {
-    let mut warnings = Vec::new();
-    let loader = Rc::new(WispModuleLoader::new(module_scripts, page_url));
-    let mut context = Context::builder()
-        .module_loader(loader.clone())
-        .build()
-        .map_err(|error| anyhow!("could not start Wisp's ES module loader: {error}"))?;
-    FETCH_STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        state.page_url = page_url.and_then(|url| url::Url::parse(url).ok());
-        state.policy = policy;
-        state.used = 0;
-        state.deadline = Some(Instant::now() + MAX_FETCH_TOTAL_TIME);
-        state.warnings.clear();
-    });
-    if let Err(error) = context.register_global_callable(
-        js_string!("__wispFetchSync"),
-        2,
-        NativeFunction::from_fn_ptr(wisp_fetch_sync),
-    ) {
-        push_warning(
-            &mut warnings,
-            format!("No se pudo exponer fetch() en Wisp: {error}"),
-        );
-    }
-
-    let mut runtime_limits = context.runtime_limits();
-    runtime_limits.set_loop_iteration_limit(MAX_LOOP_ITERATIONS);
-    runtime_limits.set_recursion_limit(MAX_RECURSION_DEPTH);
-    runtime_limits.set_stack_size_limit(MAX_STACK_SIZE);
-    context.set_runtime_limits(runtime_limits);
-
-    register_document_globals(
-        &mut context,
-        initial,
-        page_url,
-        viewport_width,
-        &mut warnings,
-    )?;
-
-    if let Err(error) = context.eval(Source::from_bytes(DOM_RUNTIME)) {
-        push_warning(
-            &mut warnings,
-            format!(
-                "No se pudo iniciar el DOM de JavaScript de Wisp: {}",
-                truncate_error(&error.to_string())
-            ),
-        );
-        return Ok((None, warnings));
-    }
-
-    // El presupuesto empieza tras inicializar el runtime DOM: ese eval es
-    // infraestructura de Wisp, no script de la página.
-    let deadline = Instant::now() + MAX_SCRIPT_EXECUTION_TIME;
-    let mut time_budget_exhausted = false;
-
-    for (label, source) in scripts {
-        if Instant::now() >= deadline {
-            if !time_budget_exhausted {
-                time_budget_exhausted = true;
-                push_warning(
-                    &mut warnings,
-                    format!(
-                        "Se omitieron scripts por el límite de {} ms de JavaScript de Wisp.",
-                        MAX_SCRIPT_EXECUTION_TIME.as_millis()
-                    ),
-                );
-            }
-            continue;
-        }
-        if let Err(error) = context.eval(Source::from_bytes(&source)) {
-            push_warning(
-                &mut warnings,
-                format!("Falló {label}: {}", truncate_error(&error.to_string())),
-            );
-        }
-        if let Err(error) = context.run_jobs() {
-            push_warning(
-                &mut warnings,
-                format!(
-                    "Falló una tarea asíncrona de {label}: {}",
-                    truncate_error(&error.to_string())
-                ),
-            );
-        }
-    }
-
-    for module in modules {
-        if Instant::now() >= deadline {
-            if !time_budget_exhausted {
-                time_budget_exhausted = true;
-                push_warning(
-                    &mut warnings,
-                    format!(
-                        "Se omitieron módulos por el límite de {} ms de JavaScript de Wisp.",
-                        MAX_SCRIPT_EXECUTION_TIME.as_millis()
-                    ),
-                );
-            }
-            continue;
-        }
-        let path = PathBuf::from(&module.url);
-        let parsed = match Module::parse(
-            Source::from_bytes(module.source.as_str()).with_path(&path),
-            None,
-            &mut context,
-        ) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                push_warning(
-                    &mut warnings,
-                    format!(
-                        "No se pudo analizar {}: {}",
-                        module.label,
-                        truncate_error(&error.to_string())
-                    ),
-                );
-                continue;
-            }
-        };
-        loader.register_url(&path.to_string_lossy(), &module.url);
-        loader.register(&module.url, parsed.clone());
-        let promise = parsed.load_link_evaluate(&mut context);
-        if let Err(error) = context.run_jobs() {
-            push_warning(
-                &mut warnings,
-                format!(
-                    "Falló una tarea asíncrona de {}: {}",
-                    module.label,
-                    truncate_error(&error.to_string())
-                ),
-            );
-        }
-        match promise.state() {
-            PromiseState::Rejected(reason) => {
-                let message = reason
-                    .to_string(&mut context)
-                    .map(|text| text.to_std_string_escaped())
-                    .unwrap_or_else(|_| "error desconocido".to_owned());
-                push_warning(
-                    &mut warnings,
-                    format!("Falló {}: {}", module.label, truncate_error(&message)),
-                );
-            }
-            PromiseState::Pending => {
-                push_warning(
-                    &mut warnings,
-                    format!("{} no terminó de evaluarse.", module.label),
-                );
-            }
-            PromiseState::Fulfilled(_) => {}
-        }
-    }
-
-    if let Err(error) = context.run_jobs() {
-        push_warning(
-            &mut warnings,
-            format!(
-                "Falló una tarea asíncrona tras evaluar módulos: {}",
-                truncate_error(&error.to_string())
-            ),
-        );
-    }
-
-    if let Err(error) = context.eval(Source::from_bytes("__wispFinish()")) {
-        push_warning(
-            &mut warnings,
-            format!(
-                "Falló el ciclo de vida de la página: {}",
-                truncate_error(&error.to_string())
-            ),
-        );
-    }
-    if let Err(error) = context.run_jobs() {
-        push_warning(
-            &mut warnings,
-            format!(
-                "Falló una tarea asíncrona del ciclo de vida: {}",
-                truncate_error(&error.to_string())
-            ),
-        );
-    }
-
-    let fetch_warnings = FETCH_STATE.with(|state| std::mem::take(&mut state.borrow_mut().warnings));
-    for warning in fetch_warnings {
-        push_warning(&mut warnings, warning);
-    }
-
-    let snapshot = read_snapshot(&mut context, &mut warnings);
-    for warning in read_runtime_warnings(&mut context, &mut warnings) {
-        push_warning(&mut warnings, warning);
-    }
-
-    let html = match snapshot {
-        Some(snapshot) if snapshot.oversized => {
-            push_warning(
-                &mut warnings,
-                "El DOM generado por JavaScript supera el límite de tamaño de Wisp.".to_owned(),
-            );
-            None
-        }
-        Some(snapshot) if snapshot.mutated => snapshot.html,
-        _ => None,
-    };
-
-    Ok((html, warnings))
-}
-
-/// Puente nativo de `fetch()`: hace la petición HTTP de forma síncrona (el
-/// motor de scripts ya corre en su propio hilo) y devuelve un JSON con el
-/// cuerpo y los metadatos, o `null` si falla o la bloquea CORS.
-#[cfg(feature = "legacy-boa")]
-fn wisp_fetch_sync(_this: &JsValue, args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
-    let Some(request) = args.first().and_then(|value| value.as_string()) else {
-        return Ok(JsValue::null());
-    };
-    let request = request.to_std_string_escaped();
-    let method = args
-        .get(1)
-        .and_then(|value| value.as_string())
-        .map(|value| value.to_std_string_escaped())
-        .unwrap_or_else(|| "GET".to_owned());
-    Ok(match fetch_json(&request, &method) {
-        Ok(json) => JsValue::from(JsString::from(json)),
-        Err(error) => {
-            record_fetch_warning(&error);
-            // La página recibe un objeto con `error` en vez de un `null` mudo:
-            // `dom.js` lo convierte en un rechazo de `fetch()` con el motivo.
-            JsValue::from(JsString::from(
-                serde_json::json!({ "error": error }).to_string(),
-            ))
-        }
-    })
 }
 
 /// Guarda el primer aviso de cada motivo (CORS, límites, red) para que Ghost
@@ -1179,6 +505,12 @@ fn fetch_json(request: &str, method: &str) -> Result<String, String> {
     {
         return Err("fetch(): sólo se permiten URL HTTP(S) sin credenciales.".to_owned());
     }
+    if policy.block_trackers && wisp_net::is_tracker_url(target.as_str()) {
+        return Err(format!(
+            "fetch(): bloqueado por --block-trackers: {}",
+            target.host_str().unwrap_or_default()
+        ));
+    }
     wisp_net::validate_url(target.as_str(), &policy)
         .map_err(|error| format!("fetch(): {error}"))?;
     FETCH_STATE.with(|state| state.borrow_mut().used += 1);
@@ -1190,6 +522,7 @@ fn fetch_json(request: &str, method: &str) -> Result<String, String> {
     if timeout.is_zero() {
         return Err(budget_exhausted());
     }
+    let stealth_profile = wisp_net::StealthProfile::for_policy(&policy);
     let redirect_policy = policy;
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(3).min(timeout))
@@ -1203,14 +536,27 @@ fn fetch_json(request: &str, method: &str) -> Result<String, String> {
                 attempt.follow()
             }
         }))
-        .user_agent("GhostWisp/0.1")
+        .user_agent(stealth_profile.user_agent)
         .build()
         .map_err(|error| format!("fetch(): no se pudo preparar la petición: {error}"))?;
-    let request_builder = if method == "HEAD" {
+    let mut request_builder = if method == "HEAD" {
         client.head(target.clone())
     } else {
         client.get(target.clone())
     };
+    if policy.stealth {
+        request_builder = request_builder
+            .header("Accept-Language", stealth_profile.accept_language);
+        if let Some(ch_ua) = stealth_profile.sec_ch_ua {
+            request_builder = request_builder.header("Sec-CH-UA", ch_ua);
+        }
+        if let Some(ch_mob) = stealth_profile.sec_ch_ua_mobile {
+            request_builder = request_builder.header("Sec-CH-UA-Mobile", ch_mob);
+        }
+        if let Some(ch_plat) = stealth_profile.sec_ch_ua_platform {
+            request_builder = request_builder.header("Sec-CH-UA-Platform", ch_plat);
+        }
+    }
     let response = request_builder.send().map_err(|error| {
         if error.is_timeout() {
             format!(
@@ -1291,146 +637,6 @@ fn cors_allows(response: &reqwest::blocking::Response, page: &Option<url::Url>) 
     value
         .split(',')
         .any(|allowed| allowed.trim().eq_ignore_ascii_case(&origin))
-}
-
-/// Registra `__wispDocument`, `__wispUrl` y `__wispViewport` antes de cargar
-/// `dom.js`. Compartido por la etapa de scripts y por `eval`.
-#[cfg(feature = "legacy-boa")]
-fn register_document_globals(
-    context: &mut Context,
-    initial: InitialNode,
-    page_url: Option<&str>,
-    viewport_width: f32,
-    warnings: &mut Vec<String>,
-) -> Result<()> {
-    let initial = serde_json::to_value(&initial)?;
-    let initial = JsValue::from_json(&initial, context)
-        .map_err(|error| anyhow!("could not initialize Wisp's JavaScript DOM: {error}"))?;
-    register_global(
-        context,
-        "__wispDocument",
-        initial,
-        warnings,
-        "No se pudo iniciar el DOM de JavaScript de Wisp",
-    )?;
-
-    let url = page_url_json(page_url);
-    let url = JsValue::from_json(&url, context)
-        .map_err(|error| anyhow!("could not initialize Wisp's page URL: {error}"))?;
-    register_global(
-        context,
-        "__wispUrl",
-        url,
-        warnings,
-        "No se pudo inicializar la URL de la página",
-    )?;
-
-    let viewport = serde_json::json!({ "width": viewport_width });
-    let viewport = JsValue::from_json(&viewport, context)
-        .map_err(|error| anyhow!("could not initialize Wisp's viewport: {error}"))?;
-    register_global(
-        context,
-        "__wispViewport",
-        viewport,
-        warnings,
-        "No se pudo inicializar el viewport de la página",
-    )?;
-    Ok(())
-}
-
-#[cfg(feature = "legacy-boa")]
-fn register_global(
-    context: &mut Context,
-    name: &str,
-    value: JsValue,
-    warnings: &mut Vec<String>,
-    failure: &str,
-) -> Result<()> {
-    if let Err(error) = context.register_global_property(js_string!(name), value, Attribute::all())
-    {
-        push_warning(warnings, format!("{failure}: {error}"));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "legacy-boa")]
-fn read_snapshot(context: &mut Context, warnings: &mut Vec<String>) -> Option<DomSnapshot> {
-    let value = match context.eval(Source::from_bytes("__wispSnapshot()")) {
-        Ok(value) => value,
-        Err(error) => {
-            push_warning(
-                warnings,
-                format!(
-                    "No se pudo leer el DOM de JavaScript de Wisp: {}",
-                    truncate_error(&error.to_string())
-                ),
-            );
-            return None;
-        }
-    };
-    match value.to_json(context) {
-        Ok(Some(value)) => match serde_json::from_value(value) {
-            Ok(snapshot) => Some(snapshot),
-            Err(error) => {
-                push_warning(
-                    warnings,
-                    format!(
-                        "No se pudo interpretar el DOM de JavaScript de Wisp: {}",
-                        truncate_error(&error.to_string())
-                    ),
-                );
-                None
-            }
-        },
-        Ok(None) => {
-            push_warning(
-                warnings,
-                "El DOM de JavaScript de Wisp no devolvió ninguna instantánea.".to_owned(),
-            );
-            None
-        }
-        Err(error) => {
-            push_warning(
-                warnings,
-                format!(
-                    "No se pudo leer el DOM de JavaScript de Wisp: {}",
-                    truncate_error(&error.to_string())
-                ),
-            );
-            None
-        }
-    }
-}
-
-#[cfg(feature = "legacy-boa")]
-fn read_runtime_warnings(context: &mut Context, warnings: &mut Vec<String>) -> Vec<String> {
-    let value = match context.eval(Source::from_bytes("__wispTakeWarnings()")) {
-        Ok(value) => value,
-        Err(error) => {
-            push_warning(
-                warnings,
-                format!(
-                    "No se pudieron leer los avisos de JavaScript de Wisp: {}",
-                    truncate_error(&error.to_string())
-                ),
-            );
-            return Vec::new();
-        }
-    };
-    match value.to_json(context) {
-        Ok(Some(value)) => serde_json::from_value::<Vec<String>>(value).unwrap_or_default(),
-        Ok(None) => Vec::new(),
-        Err(error) => {
-            push_warning(
-                warnings,
-                format!(
-                    "No se pudieron leer los avisos de JavaScript de Wisp: {}",
-                    truncate_error(&error.to_string())
-                ),
-            );
-            Vec::new()
-        }
-    }
 }
 
 fn push_warning(warnings: &mut Vec<String>, warning: String) {
@@ -1722,40 +928,6 @@ mod tests {
                 .any(|warning| warning.contains("Falló el script inline 1"))
         );
         assert_eq!(snapshot_text(html, "#out"), "after");
-    }
-
-    #[cfg(feature = "legacy-boa")]
-    #[test]
-    fn custom_elements_receive_connected_callback() {
-        let html = r##"<my-card id="one" data-label="uno">inicio</my-card>
-            <script>
-                class MyCard extends HTMLElement {
-                    connectedCallback() {
-                        this.textContent = "tarjeta:" + (this.getAttribute("data-label") || "");
-                    }
-                }
-                customElements.define("my-card", MyCard);
-                const second = document.createElement("my-card");
-                second.id = "two";
-                second.setAttribute("data-label", "dos");
-                document.body.appendChild(second);
-            </script>"##;
-        assert_eq!(snapshot_text(html, "#one"), "tarjeta:uno");
-        assert_eq!(snapshot_text(html, "#two"), "tarjeta:dos");
-    }
-
-    #[cfg(feature = "legacy-boa")]
-    #[test]
-    fn custom_elements_report_invalid_names() {
-        let html = r##"<p id="out">antes</p>
-            <script>
-                try {
-                    customElements.define("singuion", class extends HTMLElement {});
-                } catch (error) {
-                    document.getElementById("out").textContent = "error";
-                }
-            </script>"##;
-        assert_eq!(snapshot_text(html, "#out"), "error");
     }
 
     #[test]
