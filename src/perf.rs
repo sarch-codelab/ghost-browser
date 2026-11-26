@@ -39,10 +39,6 @@ pub fn report_memory_usage() {
             log_line(&format!("memory\tWS={}MB\tPB={}MB", ws_mb, pb_mb));
         }
     }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-    }
 }
 
 /// Marca el inicio del proceso. Solo escribe si GHOST_TIMING_LOG está definido.

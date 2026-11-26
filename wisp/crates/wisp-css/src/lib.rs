@@ -555,12 +555,14 @@ pub fn supports_query_matches(condition: &str, supported_properties: &[&str]) ->
     if let Some(inner) = trimmed.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
         if let Some((prop, _val)) = inner.split_once(':') {
             let prop = prop.trim();
-            if prop.starts_with("--") {
-                return true;
+            if !prop.is_empty() && prop.bytes().all(is_ident_byte) {
+                if prop.starts_with("--") {
+                    return true;
+                }
+                return supported_properties
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case(prop));
             }
-            return supported_properties
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(prop));
         }
         return supports_query_matches(inner, supported_properties);
     }
