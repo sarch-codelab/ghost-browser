@@ -283,8 +283,9 @@ jobs:
 
       - name: Run tests (wisp)
         run: |
-          if ! out=$(cargo test --manifest-path wisp/Cargo.toml --workspace --locked 2>&1); then
-            python3 -c 'import sys; txt=sys.stdin.read(); print("::error::" + txt.replace("\n", " | ")[-3500:])' <<< "$out"
+          cargo test --manifest-path wisp/Cargo.toml --workspace --locked --no-run
+          if ! out=$(timeout 60s cargo test --manifest-path wisp/Cargo.toml --workspace --locked -- --test-threads=1 2>&1); then
+            python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | ")[-3500:]; print("::error::" + txt)' <<< "$out"
             exit 1
           fi
 

@@ -3669,11 +3669,11 @@ mod tests {
                 history_index: 0,
             },
             SessionTab {
-                url: "https://accounts.google.com/".into(),
+                url: "https://youtube.com/".into(),
                 engine: BrowserEngine::WebView2,
-                title: "Google".into(),
+                title: "YouTube".into(),
                 zoom: 1.0,
-                navigation_history: vec!["https://accounts.google.com/".into()],
+                navigation_history: vec!["https://youtube.com/".into()],
                 history_index: 0,
             },
         ];
@@ -3687,12 +3687,12 @@ mod tests {
             .unwrap();
         assert_eq!(ex.engine, BrowserEngine::Wisp);
 
-        let google = browser
+        let yt = browser
             .tabs
             .iter()
-            .find(|t| t.url == "https://accounts.google.com/")
+            .find(|t| t.url == "https://youtube.com/")
             .unwrap();
-        assert_eq!(google.engine, BrowserEngine::WebView2);
+        assert_eq!(yt.engine, BrowserEngine::WebView2);
 
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         browser.handle_remote_command(crate::remote::RemoteCommand::Sync {
