@@ -64,7 +64,11 @@ jobs:
           key: ${{ runner.os }}-root-cargo-${{ hashFiles('Cargo.lock', 'wisp/Cargo.lock') }}
 
       - name: Check formatting (root)
-        run: cargo fmt --all -- --check
+        run: |
+          if ! out=$(cargo fmt --all -- --check 2>&1); then
+            echo "$out" | head -n 40 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
 
       - name: Clippy (root)
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -73,7 +77,11 @@ jobs:
         run: cargo build --release --locked
 
       - name: Run tests (root)
-        run: cargo test --locked
+        run: |
+          if ! out=$(cargo test --locked 2>&1); then
+            echo "$out" | tail -n 50 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
 
   wisp-windows:
     name: Wisp (Windows)
@@ -249,7 +257,11 @@ jobs:
           fi
 
       - name: Check formatting (wisp)
-        run: cargo fmt --manifest-path wisp/Cargo.toml --all -- --check
+        run: |
+          if ! out=$(cargo fmt --manifest-path wisp/Cargo.toml --all -- --check 2>&1); then
+            echo "$out" | head -n 40 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
 
       - name: Clippy (wisp)
         run: cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features -- -D warnings
@@ -258,7 +270,11 @@ jobs:
         run: cargo build --manifest-path wisp/Cargo.toml --workspace --release --locked
 
       - name: Run tests (wisp)
-        run: cargo test --manifest-path wisp/Cargo.toml --workspace --locked
+        run: |
+          if ! out=$(cargo test --manifest-path wisp/Cargo.toml --workspace --locked 2>&1); then
+            echo "$out" | tail -n 50 | while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          fi
 
       - name: Smoke E2E & Benchmarks (Linux)
         run: |
