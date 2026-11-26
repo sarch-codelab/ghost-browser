@@ -1330,7 +1330,10 @@ impl HostBridge for NativeDomHost {
                     Ok(JsVal::Undefined)
                 }
                 "click" => {
-                    if let Some(fns) = self.node_listeners.get(&(*nid, "click".to_owned())).cloned()
+                    if let Some(fns) = self
+                        .node_listeners
+                        .get(&(*nid, "click".to_owned()))
+                        .cloned()
                     {
                         let ev = vm.alloc_object(HashMap::from([
                             ("type".to_owned(), JsVal::Str("click".to_owned())),
@@ -1412,9 +1415,8 @@ impl HostBridge for NativeDomHost {
                     Some(b) => url::Url::parse(&b)
                         .and_then(|u| u.join(&raw))
                         .map_err(|e| JsVal::Str(format!("URL inválida: {e}")))?,
-                    None => {
-                        url::Url::parse(&raw).map_err(|e| JsVal::Str(format!("URL inválida: {e}")))?
-                    }
+                    None => url::Url::parse(&raw)
+                        .map_err(|e| JsVal::Str(format!("URL inválida: {e}")))?,
                 };
                 Ok(JsVal::NativeHandle(format!("url:{parsed}")))
             }
@@ -1725,10 +1727,7 @@ fn location_part(url: Option<&str>, prop: &str) -> String {
         "hostname" => host_only.to_owned(),
         "port" => parsed.port().map(|p| p.to_string()).unwrap_or_default(),
         "pathname" => parsed.path().to_owned(),
-        "search" => parsed
-            .query()
-            .map(|q| format!("?{q}"))
-            .unwrap_or_default(),
+        "search" => parsed.query().map(|q| format!("?{q}")).unwrap_or_default(),
         "hash" => parsed
             .fragment()
             .map(|f| format!("#{f}"))

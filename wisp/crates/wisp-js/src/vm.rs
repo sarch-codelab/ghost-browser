@@ -102,12 +102,7 @@ impl fmt::Display for JsVal {
 
 /// Puente hacia objetos y APIs del host (DOM, `fetch`, `URL`, `console`, etc.).
 pub trait HostBridge {
-    fn get_prop(
-        &mut self,
-        vm: &mut VmRuntime,
-        target: &JsVal,
-        prop: &str,
-    ) -> Result<JsVal, JsVal>;
+    fn get_prop(&mut self, vm: &mut VmRuntime, target: &JsVal, prop: &str) -> Result<JsVal, JsVal>;
 
     fn set_prop(
         &mut self,
@@ -1453,11 +1448,7 @@ impl VmRuntime {
         JsVal::Object(id)
     }
 
-    pub fn eval_script(
-        &mut self,
-        src: &str,
-        host: &mut dyn HostBridge,
-    ) -> Result<JsVal, String> {
+    pub fn eval_script(&mut self, src: &str, host: &mut dyn HostBridge) -> Result<JsVal, String> {
         let toks = tokenize(src)?;
         let stmts = Parser::new(toks).parse_program()?;
         let base_fn_id = self.functions.len();
@@ -1711,24 +1702,15 @@ impl VmRuntime {
                     Op::Call(name, argc) => {
                         let split = stack.len().saturating_sub(*argc);
                         let args = stack.split_off(split);
-                        let local_fn = locals
-                            .get(name)
-                            .or_else(|| self.globals.get(name))
-                            .cloned();
+                        let local_fn = locals.get(name).or_else(|| self.globals.get(name)).cloned();
                         let ret = if let Some(JsVal::Function(fn_id)) = local_fn {
                             self.call_fn_id(fn_id, args, host)?
                         } else if let Some(&fn_id) = self.fn_names.get(name) {
                             self.call_fn_id(fn_id, args, host)?
                         } else if name == "String" {
-                            JsVal::Str(
-                                args.first()
-                                    .map(ToString::to_string)
-                                    .unwrap_or_default(),
-                            )
+                            JsVal::Str(args.first().map(ToString::to_string).unwrap_or_default())
                         } else if name == "Number" {
-                            JsVal::Number(
-                                args.first().map_or(0.0, JsVal::to_number),
-                            )
+                            JsVal::Number(args.first().map_or(0.0, JsVal::to_number))
                         } else if name == "Boolean" {
                             JsVal::Bool(args.first().is_some_and(JsVal::is_truthy))
                         } else if let Some(res) = host.call_global(self, name, args) {
