@@ -82,8 +82,8 @@ jobs:
 
       - name: Run tests (root)
         run: |
-          if ! out=$(cargo test --locked 2>&1); then
-            python3 -c 'import sys; txt=sys.stdin.read(); print("::error::" + txt.replace("\n", " | ")[-3500:])' <<< "$out"
+          if ! out=$(RUST_BACKTRACE=1 cargo test --locked -- --nocapture 2>&1); then
+            python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | "); txt=txt[-14000:]; [print("::error::" + txt[i:i+3500]) for i in range(0, len(txt), 3500)]' <<< "$out"
             exit 1
           fi
 
@@ -129,7 +129,7 @@ jobs:
         shell: bash
         run: |
           python - << 'PY'
-          import http.server, json, os, socketserver, subprocess, tempfile, threading, time, urllib.error, urllib.request
+          import http.server, json, os, socketserver, subprocess, threading, time, traceback, urllib.error, urllib.request
 
           class Handler(http.server.BaseHTTPRequestHandler):
               def do_GET(self):
@@ -142,66 +142,70 @@ jobs:
               def log_message(self, *args):
                   pass
 
-          with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
-              port = httpd.server_address[1]
-              t = threading.Thread(target=httpd.serve_forever, daemon=True)
-              t.start()
-              agent = "wisp/target/release/wisp-agent.exe" if os.name == "nt" else "wisp/target/release/wisp-agent"
+          try:
+              with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
+                  port = httpd.server_address[1]
+                  t = threading.Thread(target=httpd.serve_forever, daemon=True)
+                  t.start()
+                  agent = "wisp/target/release/wisp-agent.exe" if os.path.exists("wisp/target/release/wisp-agent.exe") else "wisp/target/release/wisp-agent"
 
-              # 1. SSRF must block loopback by default
-              blocked = subprocess.run([agent, "fetch", f"http://127.0.0.1:{port}/"], capture_output=True, text=True)
-              assert blocked.returncode != 0, blocked.stdout
-              assert "SSRF" in blocked.stderr or "SSRF" in blocked.stdout, blocked.stderr + blocked.stdout
+                  # 1. SSRF must block loopback by default
+                  blocked = subprocess.run([agent, "fetch", f"http://127.0.0.1:{port}/"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+                  assert blocked.returncode != 0, blocked.stdout
+                  assert "SSRF" in blocked.stderr or "SSRF" in blocked.stdout, blocked.stderr + blocked.stdout
 
-              # 2. Fetch with --allow-private-network succeeds
-              fetched = subprocess.run([agent, "fetch", f"http://127.0.0.1:{port}/", "--allow-private-network", "--dump", "markdown"], capture_output=True, text=True, check=True)
-              assert "Example Domain" in fetched.stdout, fetched.stdout
+                  # 2. Fetch with --allow-private-network succeeds
+                  fetched = subprocess.run([agent, "fetch", f"http://127.0.0.1:{port}/", "--allow-private-network", "--dump", "markdown"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=True)
+                  assert "Example Domain" in fetched.stdout, fetched.stdout
 
-              # 3. Serve API + /tabs/active/* + malformed JSON 400
-              api_port = 47829
-              srv = subprocess.Popen([agent, "serve", "--port", str(api_port), "--allow-private-network"])
-              try:
-                  for _ in range(40):
-                      try:
-                          with urllib.request.urlopen(f"http://127.0.0.1:{api_port}/health", timeout=1) as r:
-                              health = json.loads(r.read())
-                              assert health["ok"] is True
-                              assert health["rss_mb"] is not None
-                              break
-                      except Exception:
-                          time.sleep(0.2)
-                  else:
-                      raise RuntimeError("wisp-agent serve did not become healthy")
-
-                  req = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs", data=json.dumps({"url": f"http://127.0.0.1:{port}/"}).encode(), method="POST")
-                  with urllib.request.urlopen(req, timeout=5) as r:
-                      assert json.loads(r.read())["ok"] is True
-
-                  with urllib.request.urlopen(f"http://127.0.0.1:{api_port}/tabs?engine=wisp", timeout=5) as r:
-                      tabs = json.loads(r.read())
-                      assert tabs["ok"] is True and len(tabs["tabs"]) == 1
-
-                  req = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs/active/snapshot", data=b"{}", method="POST")
-                  with urllib.request.urlopen(req, timeout=5) as r:
-                      snap = json.loads(r.read())
-                      assert snap["ok"] is True and len(snap.get("refs", [])) >= 1
-
-                  req = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs/active/eval", data=b'{"js":"document.title"}', method="POST")
-                  with urllib.request.urlopen(req, timeout=5) as r:
-                      ev = json.loads(r.read())
-                      assert ev["ok"] is True and ev["result"] == "Example Domain", ev
-
-                  bad = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs/active/eval", data=b'{"js": "broken', method="POST")
+                  # 3. Serve API + /tabs/active/* + malformed JSON 400
+                  api_port = 47829
+                  srv = subprocess.Popen([agent, "serve", "--port", str(api_port), "--allow-private-network"])
                   try:
-                      urllib.request.urlopen(bad, timeout=5)
-                      raise AssertionError("expected 400 Bad Request")
-                  except urllib.error.HTTPError as err:
-                      assert err.code == 400
-                      payload = json.loads(err.read())
-                      assert "JSON inválido" in payload["error"], payload
-              finally:
-                  srv.terminate()
-                  srv.wait(timeout=5)
+                      for _ in range(40):
+                          try:
+                              with urllib.request.urlopen(f"http://127.0.0.1:{api_port}/health", timeout=1) as r:
+                                  health = json.loads(r.read())
+                                  assert health["ok"] is True, health
+                                  assert health["rss_mb"] is not None, health
+                                  break
+                          except Exception:
+                              time.sleep(0.2)
+                      else:
+                          raise RuntimeError(f"wisp-agent serve did not become healthy; rc={srv.poll()}")
+
+                      req = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs", data=json.dumps({"url": f"http://127.0.0.1:{port}/"}).encode(), method="POST")
+                      with urllib.request.urlopen(req, timeout=5) as r:
+                          assert json.loads(r.read())["ok"] is True
+
+                      with urllib.request.urlopen(f"http://127.0.0.1:{api_port}/tabs?engine=wisp", timeout=5) as r:
+                          tabs = json.loads(r.read())
+                          assert tabs["ok"] is True and len(tabs["tabs"]) == 1, tabs
+
+                      req = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs/active/snapshot", data=b"{}", method="POST")
+                      with urllib.request.urlopen(req, timeout=5) as r:
+                          snap = json.loads(r.read())
+                          assert snap["ok"] is True and len(snap.get("refs", [])) >= 1, snap
+
+                      req = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs/active/eval", data=b'{"js":"document.title"}', method="POST")
+                      with urllib.request.urlopen(req, timeout=5) as r:
+                          ev = json.loads(r.read())
+                          assert ev["ok"] is True and ev["result"] == "Example Domain", ev
+
+                      bad = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs/active/eval", data=b'{"js": "broken', method="POST")
+                      try:
+                          urllib.request.urlopen(bad, timeout=5)
+                          raise AssertionError("expected 400 Bad Request")
+                      except urllib.error.HTTPError as err:
+                          assert err.code == 400, err.code
+                          payload = json.loads(err.read())
+                          assert "JSON inválido" in payload["error"], payload
+                  finally:
+                      srv.terminate()
+                      srv.wait(timeout=5)
+          except Exception:
+              print("::error::" + traceback.format_exc().replace("\n", " | ")[:3500])
+              raise
           PY
 
       - name: Run benchmarks & update WISP_RESULTS.md
