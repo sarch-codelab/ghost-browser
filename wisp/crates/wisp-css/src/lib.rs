@@ -265,10 +265,7 @@ fn at_prelude<'a>(prelude: &'a str, keyword: &str) -> Option<&'a str> {
         return None;
     }
     let rest = &trimmed[keyword.len()..];
-    if rest.is_empty()
-        || rest.starts_with(char::is_whitespace)
-        || rest.starts_with('(')
-    {
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('(') {
         Some(rest.trim())
     } else {
         None
@@ -567,10 +564,7 @@ pub fn supports_query_matches(condition: &str, supported_properties: &[&str]) ->
         }
         return supports_query_matches(inner, supported_properties);
     }
-    if trimmed
-        .get(..8)
-        .is_some_and(|p| p.eq_ignore_ascii_case("selector"))
-    {
+    if trimmed.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("selector")) {
         return trimmed.contains('(') && trimmed.ends_with(')');
     }
     false
@@ -624,11 +618,7 @@ pub fn resolve_var_references(value: &str, custom_props: &HashMap<String, String
     resolve_var_depth(value, custom_props, 0)
 }
 
-fn resolve_var_depth(
-    value: &str,
-    custom_props: &HashMap<String, String>,
-    depth: usize,
-) -> String {
+fn resolve_var_depth(value: &str, custom_props: &HashMap<String, String>, depth: usize) -> String {
     if depth >= 16 || !value.contains("var(") {
         return value.to_owned();
     }

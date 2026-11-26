@@ -364,7 +364,11 @@ impl Parser {
                 self.next();
                 let name = match self.next() {
                     Tok::Ident(n) => n,
-                    other => return Err(format!("se esperaba identificador tras declaración, no {other:?}")),
+                    other => {
+                        return Err(format!(
+                            "se esperaba identificador tras declaración, no {other:?}"
+                        ));
+                    }
                 };
                 let init = if self.eat(&Tok::Eq) {
                     Some(self.parse_expr()?)

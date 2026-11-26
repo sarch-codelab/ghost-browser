@@ -706,12 +706,7 @@ fn handle_cdp(state: &Arc<Mutex<State>>, tab_id: u64, body: &Value) -> Value {
     }
 }
 
-fn dispatch_tab_cdp(
-    tab: &mut Tab,
-    method: &str,
-    params: &Value,
-    policy: &NetworkPolicy,
-) -> Value {
+fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, policy: &NetworkPolicy) -> Value {
     match method {
         "Page.navigate" => {
             let url = params.get("url").and_then(Value::as_str).unwrap_or("");
@@ -952,12 +947,7 @@ fn eval_in_tab(tab: &mut Tab, js: &str) -> Value {
     }
 }
 
-fn fill_control(
-    tab: &mut Tab,
-    ref_id: Option<&str>,
-    name: Option<&str>,
-    value: &str,
-) -> Value {
+fn fill_control(tab: &mut Tab, ref_id: Option<&str>, name: Option<&str>, value: &str) -> Value {
     let Some(page) = &tab.page else {
         return page_missing_error(tab);
     };
@@ -975,12 +965,10 @@ fn fill_control(
     let Some(field_name) = target_name else {
         return json!({"ok": false, "error": "el control no tiene atributo name/id para rellenar"});
     };
+    let q_name = serde_json::to_string(&field_name).unwrap_or_else(|_| "\"\"".into());
+    let q_val = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into());
     let js = format!(
-        "(function(){{ var el = document.querySelector('[name=' + {} + ']') || document.getElementById({}); if (!el) return false; el.value = {}; el.setAttribute('value', {}); return true; }})()",
-        serde_json::to_string(&field_name).unwrap_or_else(|_| "\"\"".into()),
-        serde_json::to_string(&field_name).unwrap_or_else(|_| "\"\"".into()),
-        serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
-        serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
+        "(function(){{ var el = document.querySelector('[name=' + {q_name} + ']') || document.getElementById({q_name}); if (!el) return false; el.value = {q_val}; el.setAttribute('value', {q_val}); return true; }})()"
     );
     match page.eval_js(&js) {
         Ok(res) => {

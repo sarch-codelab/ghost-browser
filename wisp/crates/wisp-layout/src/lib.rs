@@ -140,10 +140,16 @@ pub fn collapse_margins(prev_bottom: f32, next_top: f32) -> f32 {
 
 /// Normaliza un contenedor de bloque: si mezcla cajas de bloque e inline,
 /// envuelve las secuencias contiguas de hijos inline en `BoxKind::AnonymousBlock`.
-pub fn normalize_block_children(children: Vec<LayoutNode>, next_anon_id: &mut usize) -> Vec<LayoutNode> {
-    let has_block = children
-        .iter()
-        .any(|c| matches!(c.kind, BoxKind::Block | BoxKind::Flex | BoxKind::Table | BoxKind::AnonymousBlock));
+pub fn normalize_block_children(
+    children: Vec<LayoutNode>,
+    next_anon_id: &mut usize,
+) -> Vec<LayoutNode> {
+    let has_block = children.iter().any(|c| {
+        matches!(
+            c.kind,
+            BoxKind::Block | BoxKind::Flex | BoxKind::Table | BoxKind::AnonymousBlock
+        )
+    });
     let has_inline = children
         .iter()
         .any(|c| matches!(c.kind, BoxKind::Inline | BoxKind::TextRun));
@@ -223,8 +229,12 @@ fn layout_block(
     let outer_x = origin_x + node.margin[3];
     let outer_y = origin_y + node.margin[0];
 
-    let horizontal_chrome =
-        node.margin[1] + node.margin[3] + node.padding[1] + node.padding[3] + node.border[1] + node.border[3];
+    let horizontal_chrome = node.margin[1]
+        + node.margin[3]
+        + node.padding[1]
+        + node.padding[3]
+        + node.border[1]
+        + node.border[3];
     let border_width = node
         .width
         .map(|w| w + node.padding[1] + node.padding[3] + node.border[1] + node.border[3])
@@ -238,8 +248,17 @@ fn layout_block(
 
     let children = normalize_block_children(node.children.clone(), next_anon_id);
     let inner_height = match node.formatting_context {
-        FormattingContext::Flex => layout_flex_children(&children, content_x, content_y, content_width, next_anon_id, state),
-        FormattingContext::Table => layout_table_children(&children, content_x, content_y, content_width, next_anon_id, state),
+        FormattingContext::Flex => {
+            layout_flex_children(&children, content_x, content_y, content_width, next_anon_id, state)
+        }
+        FormattingContext::Table => layout_table_children(
+            &children,
+            content_x,
+            content_y,
+            content_width,
+            next_anon_id,
+            state,
+        ),
         FormattingContext::Inline => {
             let lines = break_inline_lines(&children, content_width);
             lines.iter().map(|l| l.height).sum()
@@ -277,7 +296,8 @@ fn layout_block(
     };
 
     let content_height = node.height.unwrap_or(inner_height);
-    let border_height = content_height + node.padding[0] + node.padding[2] + node.border[0] + node.border[2];
+    let border_height =
+        content_height + node.padding[0] + node.padding[2] + node.border[0] + node.border[2];
 
     state.record(
         node.id,
@@ -348,7 +368,8 @@ fn layout_table_children(
 ) -> f32 {
     let mut y = content_y;
     for row in rows {
-        let row_h = layout_flex_children(&row.children, content_x, y, content_width, next_anon_id, state);
+        let row_h =
+            layout_flex_children(&row.children, content_x, y, content_width, next_anon_id, state);
         y += row_h;
     }
     (y - content_y).max(0.0)

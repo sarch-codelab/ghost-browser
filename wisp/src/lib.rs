@@ -1892,7 +1892,15 @@ fn layout_roots(
     };
     for root in roots {
         if is_block(root) {
-            cursor_y += layout_block(root, 0.0, cursor_y, viewport_width, Style::default(), 0, &mut ctx)?;
+            cursor_y += layout_block(
+                root,
+                0.0,
+                cursor_y,
+                viewport_width,
+                Style::default(),
+                0,
+                &mut ctx,
+            )?;
         }
     }
 
@@ -1919,7 +1927,8 @@ thread_local! {
     /// Presupuesto de red de la página que se descarga en este hilo. `fetch_url`
     /// corre en un hilo por carga, así que el thread-local acota exactamente
     /// una página aunque el usuario abra varias a la vez.
-    static NETWORK_BUDGET: RefCell<NetworkBudgetState> = RefCell::new(NetworkBudgetState::default());
+    static NETWORK_BUDGET: RefCell<NetworkBudgetState> =
+        RefCell::new(NetworkBudgetState::default());
 }
 
 fn begin_network_budget_with_policy(policy: wisp_net::NetworkPolicy) {

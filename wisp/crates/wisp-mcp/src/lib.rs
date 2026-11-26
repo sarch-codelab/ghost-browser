@@ -121,10 +121,7 @@ pub fn call_tool(name: &str, args: &Value) -> Value {
         "ghost_tab_action" => {
             let id = args.get("tab_id").and_then(Value::as_u64).unwrap_or(0);
             let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-            if !matches!(
-                action,
-                "back" | "forward" | "reload" | "close" | "activate" | "text"
-            ) {
+            if !matches!(action, "back" | "forward" | "reload" | "close" | "activate" | "text") {
                 return tool_result(json!({"ok": false, "error": "acción desconocida"}));
             }
             client::http("POST", &format!("/tabs/{id}/{action}"), None)

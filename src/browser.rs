@@ -1767,12 +1767,11 @@ impl Browser {
                 json!({"ok": true})
             }
             Route::Text(tab_id) => self.remote_tab_text(tab_id, reply.clone())?,
-            Route::Snapshot(tab_id) => self.remote_tab_snapshot(tab_id, &request.body, reply.clone())?,
+            Route::Snapshot(tab_id) => {
+                self.remote_tab_snapshot(tab_id, &request.body, reply.clone())?
+            }
             Route::Click(tab_id) => {
-                if self
-                    .tab_by_id(tab_id)
-                    .is_some_and(|t| t.engine == BrowserEngine::Wisp)
-                {
+                if self.tab_by_id(tab_id).is_some_and(|t| t.engine == BrowserEngine::Wisp) {
                     self.remote_wisp_click(tab_id, &request.body)
                 } else {
                     self.remote_input(tab_id, "click", &request.body)
@@ -1785,10 +1784,7 @@ impl Browser {
             Route::Press(tab_id) => self.remote_input(tab_id, "press", &request.body),
             Route::Scroll(tab_id) => self.remote_input(tab_id, "scroll", &request.body),
             Route::Move(tab_id) => {
-                if self
-                    .tab_by_id(tab_id)
-                    .is_some_and(|t| t.engine == BrowserEngine::Wisp)
-                {
+                if self.tab_by_id(tab_id).is_some_and(|t| t.engine == BrowserEngine::Wisp) {
                     self.remote_wisp_move(tab_id, &request.body)
                 } else {
                     self.remote_input(tab_id, "move", &request.body)
@@ -1964,7 +1960,8 @@ impl Browser {
                 Err(error) => return json!({"ok": false, "error": error.to_string()}),
             };
             let Some(el) = snap.find_ref(ref_id).cloned() else {
-                return json!({"ok": false, "error": format!("referencia `{ref_id}` no encontrada")});
+                let msg = format!("referencia `{ref_id}` no encontrada");
+                return json!({"ok": false, "error": msg});
             };
             if let Some(url) = el.url.clone() {
                 self.navigate_tab_by_id(tab_id, &url);
@@ -2040,12 +2037,10 @@ impl Browser {
             let Some(field_name) = field_name else {
                 return json!({"ok": false, "error": "falta name/id o @ref para rellenar"});
             };
+            let q_name = serde_json::to_string(&field_name).unwrap_or_else(|_| "\"\"".into());
+            let q_val = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into());
             let js = format!(
-                "(function(){{ var el = document.querySelector('[name=' + {} + ']') || document.getElementById({}); if (!el) return false; el.value = {}; el.setAttribute('value', {}); return true; }})()",
-                serde_json::to_string(&field_name).unwrap_or_else(|_| "\"\"".into()),
-                serde_json::to_string(&field_name).unwrap_or_else(|_| "\"\"".into()),
-                serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
-                serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
+                "(function(){{ var el = document.querySelector('[name=' + {q_name} + ']') || document.getElementById({q_name}); if (!el) return false; el.value = {q_val}; el.setAttribute('value', {q_val}); return true; }})()"
             );
             return match page.eval_js(&js) {
                 Ok(res) => {
@@ -2071,11 +2066,10 @@ impl Browser {
         }
         if let Some(webview) = self.remote_webview(tab_id) {
             let target = name.or(ref_id).unwrap_or("");
+            let q_target = serde_json::to_string(target).unwrap_or_else(|_| "\"\"".into());
+            let q_val = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into());
             let js = format!(
-                "(function(){{ var el = document.querySelector('[name=' + {} + ']') || document.getElementById({}); if (el) {{ el.focus(); el.value = {}; el.dispatchEvent(new Event('input', {{bubbles:true}})); }} }})();",
-                serde_json::to_string(target).unwrap_or_else(|_| "\"\"".into()),
-                serde_json::to_string(target).unwrap_or_else(|_| "\"\"".into()),
-                serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
+                "(function(){{ var el = document.querySelector('[name=' + {q_target} + ']') || document.getElementById({q_target}); if (el) {{ el.focus(); el.value = {q_val}; el.dispatchEvent(new Event('input', {{bubbles:true}})); }} }})();"
             );
             let _ = webview.evaluate_script(&js);
             return json!({"ok": true, "field": target, "value": value});

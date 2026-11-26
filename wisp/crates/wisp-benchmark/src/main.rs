@@ -142,7 +142,8 @@ fn run_track(track: &str) -> Value {
                 "body { margin: 0; } .card > p { color: #222; }",
                 wisp_css::Origin::Author,
             );
-            let computer = wisp_style::StyleComputer::from_sheets(&[sheet], 1280.0, &["margin", "color"]);
+            let computer =
+                wisp_style::StyleComputer::from_sheets(&[sheet], 1280.0, &["margin", "color"]);
             let el = wisp_style::SimpleElement {
                 tag: "p".into(),
                 parent: Some(Box::new(wisp_style::SimpleElement {
