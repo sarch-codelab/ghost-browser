@@ -3680,8 +3680,16 @@ fn b64_encode(bytes: &[u8]) -> String {
         let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
         out.push(TABLE[b0 >> 2] as char);
         out.push(TABLE[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
-        out.push(if chunk.len() > 1 { TABLE[((b1 & 0x0f) << 2) | (b2 >> 6)] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[b2 & 0x3f] as char } else { '=' });
+        if chunk.len() > 1 {
+            out.push(TABLE[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[b2 & 0x3f] as char);
+        } else {
+            out.push('=');
+        }
     }
     out
 }
@@ -3803,7 +3811,13 @@ fn parse_re_branch(pat: &str) -> Vec<RePiece> {
 }
 
 fn atom_matches(atom: &ReAtom, ch: char, ci: bool) -> bool {
-    let eq = |a: char, b: char| if ci { a.eq_ignore_ascii_case(&b) } else { a == b };
+    let eq = |a: char, b: char| {
+        if ci {
+            a.eq_ignore_ascii_case(&b)
+        } else {
+            a == b
+        }
+    };
     match atom {
         ReAtom::Any => ch != '\n',
         ReAtom::Lit(c) => eq(*c, ch),
