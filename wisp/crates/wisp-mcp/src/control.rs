@@ -353,6 +353,7 @@ mod tests {
             other => panic!("expected InvalidJson, got {other:?}"),
         }
 
+        drop(server_stream);
         let resp = handle.join().expect("join");
         assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "{resp}");
         assert!(resp.contains("JSON inválido"), "{resp}");
