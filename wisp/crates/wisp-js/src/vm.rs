@@ -903,7 +903,7 @@ fn exec_chunk(
                 };
                 let chunk = &functions[fn_id];
                 let mut fn_locals = HashMap::new();
-                for (param, arg) in chunk.params.iter().zip(args.into_iter()) {
+                for (param, arg) in chunk.params.iter().zip(args) {
                     fn_locals.insert(param.clone(), arg);
                 }
                 let ret = exec_chunk(
