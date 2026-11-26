@@ -184,13 +184,24 @@ fn worker_loop(
             guard.recv()
         };
         let Ok(mut stream) = stream else { break };
-        if let Some(request) = control::read_request(&mut stream) {
-            let response = handle(&request, &state);
-            let _ = control::write_response(&mut stream, &response);
+        match control::read_request_checked(&mut stream) {
+            control::ReadRequest::Ok(request) => {
+                let response = handle(&request, &state);
+                let _ = control::write_response(&mut stream, &response);
+            }
+            control::ReadRequest::InvalidJson(message) => {
+                let _ = control::write_status_response(
+                    &mut stream,
+                    400,
+                    "Bad Request",
+                    &json!({"ok": false, "error": message}),
+                );
+            }
+            control::ReadRequest::Eof => continue,
         }
         let mut s = lock(&state);
         s.requests_served += 1;
-        let rss_mb = current_rss_mb();
+        let rss_mb = sample_rss_mb().unwrap_or(0);
         if worker_born.elapsed().as_secs() >= cfg.worker_max_age_secs
             || (cfg.worker_max_rss_mb > 0 && rss_mb >= cfg.worker_max_rss_mb)
         {
@@ -200,18 +211,78 @@ fn worker_loop(
     }
 }
 
-fn current_rss_mb() -> u64 {
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct ProcessMemoryCountersEx {
+    cb: u32,
+    page_fault_count: u32,
+    peak_working_set_size: usize,
+    working_set_size: usize,
+    quota_peak_paged_pool_usage: usize,
+    quota_paged_pool_usage: usize,
+    quota_peak_non_paged_pool_usage: usize,
+    quota_non_paged_pool_usage: usize,
+    pagefile_usage: usize,
+    peak_pagefile_usage: usize,
+    private_usage: usize,
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> *mut core::ffi::c_void;
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "psapi")]
+unsafe extern "system" {
+    fn GetProcessMemoryInfo(
+        process: *mut core::ffi::c_void,
+        ppsmem_counters: *mut ProcessMemoryCountersEx,
+        cb: u32,
+    ) -> i32;
+}
+
+fn sample_rss_mb() -> Option<u64> {
     #[cfg(target_os = "linux")]
     if let Ok(statm) = std::fs::read_to_string("/proc/self/statm")
         && let Some(resident_pages) = statm.split_whitespace().nth(1)
         && let Ok(pages) = resident_pages.parse::<u64>()
     {
-        return (pages * 4096) / (1024 * 1024);
+        return Some((pages * 4096) / (1024 * 1024));
     }
-    0
+    #[cfg(target_os = "windows")]
+    {
+        // SAFETY: `GetCurrentProcess` returns the current process pseudo-handle
+        // and `mem` has its exact byte size in `cb`.
+        unsafe {
+            let mut mem: ProcessMemoryCountersEx = std::mem::zeroed();
+            mem.cb = std::mem::size_of::<ProcessMemoryCountersEx>() as u32;
+            if GetProcessMemoryInfo(GetCurrentProcess(), &mut mem, mem.cb) != 0 {
+                return Some((mem.working_set_size / (1024 * 1024)) as u64);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_tab_id(state: &Arc<Mutex<State>>, target: control::TabTarget) -> Option<u64> {
+    match target {
+        control::TabTarget::Id(id) => Some(id),
+        control::TabTarget::Active => lock(state).active,
+    }
 }
 
 fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
+    macro_rules! tab_id_or_err {
+        ($target:expr) => {
+            match resolve_tab_id(state, $target) {
+                Some(id) => id,
+                None => return json!({"ok": false, "error": "pestaña no encontrada"}),
+            }
+        };
+    }
+
     match request.route() {
         Route::Health => {
             let s = lock(state);
@@ -222,16 +293,23 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
                 "uptime_secs": s.started_at.elapsed().as_secs(),
                 "requests_served": s.requests_served,
                 "worker_recycles": s.worker_recycles,
-                "rss_mb": current_rss_mb(),
+                "rss_mb": sample_rss_mb(),
             })
         }
         Route::ListTabs => {
             let state = lock(state);
-            let tabs: Vec<Value> = state
-                .tabs
-                .iter()
-                .map(|tab| tab_json(tab, state.active))
-                .collect();
+            let engine_ok = request
+                .query_param("engine")
+                .is_none_or(|eng| eng.eq_ignore_ascii_case("wisp"));
+            let tabs: Vec<Value> = if engine_ok {
+                state
+                    .tabs
+                    .iter()
+                    .map(|tab| tab_json(tab, state.active))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             json!({"ok": true, "tabs": tabs})
         }
         Route::OpenTab => {
@@ -267,7 +345,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             state.active = Some(id);
             response
         }
-        Route::Navigate(tab_id) => {
+        Route::Navigate(target) => {
+            let tab_id = tab_id_or_err!(target);
             let Some(url) = request.body.get("url").and_then(Value::as_str) else {
                 return json!({"ok": false, "error": "falta 'url'"});
             };
@@ -283,9 +362,16 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             let tab = &mut state.tabs[position];
             navigate(tab, url, &policy)
         }
-        Route::Back(tab_id) => history_step(state, tab_id, -1),
-        Route::Forward(tab_id) => history_step(state, tab_id, 1),
-        Route::Reload(tab_id) => {
+        Route::Back(target) => {
+            let tab_id = tab_id_or_err!(target);
+            history_step(state, tab_id, -1)
+        }
+        Route::Forward(target) => {
+            let tab_id = tab_id_or_err!(target);
+            history_step(state, tab_id, 1)
+        }
+        Route::Reload(target) => {
+            let tab_id = tab_id_or_err!(target);
             let mut state = lock(state);
             let policy = state.policy;
             let Some(position) = state.tabs.iter().position(|tab| tab.id == tab_id) else {
@@ -294,7 +380,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             state.active = Some(tab_id);
             load(&mut state.tabs[position], &policy)
         }
-        Route::Close(tab_id) => {
+        Route::Close(target) => {
+            let tab_id = tab_id_or_err!(target);
             let mut state = lock(state);
             state.tabs.retain(|tab| tab.id != tab_id);
             if state.active == Some(tab_id) {
@@ -302,14 +389,16 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             }
             json!({"ok": true})
         }
-        Route::Activate(tab_id) => {
+        Route::Activate(target) => {
+            let tab_id = tab_id_or_err!(target);
             let mut state = lock(state);
             if state.tabs.iter().any(|tab| tab.id == tab_id) {
                 state.active = Some(tab_id);
             }
             json!({"ok": true})
         }
-        Route::Text(tab_id) => {
+        Route::Text(target) => {
+            let tab_id = tab_id_or_err!(target);
             let state = lock(state);
             let Some(tab) = state.tabs.iter().find(|tab| tab.id == tab_id) else {
                 return json!({"ok": false, "error": "pestaña no encontrada"});
@@ -321,7 +410,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
                 None => page_missing_error(tab),
             }
         }
-        Route::Snapshot(tab_id) => {
+        Route::Snapshot(target) => {
+            let tab_id = tab_id_or_err!(target);
             let width = request
                 .body
                 .get("width")
@@ -344,7 +434,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
                 Err(error) => json!({"ok": false, "error": error.to_string()}),
             }
         }
-        Route::Eval(tab_id) => {
+        Route::Eval(target) => {
+            let tab_id = tab_id_or_err!(target);
             let js = request.body.get("js").and_then(Value::as_str).unwrap_or("");
             if js.is_empty() {
                 return json!({"ok": false, "error": "falta 'js'"});
@@ -355,7 +446,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             };
             eval_in_tab(tab, js)
         }
-        Route::Click(tab_id) => {
+        Route::Click(target) => {
+            let tab_id = tab_id_or_err!(target);
             let mut state = lock(state);
             let policy = state.policy;
             let Some(position) = state.tabs.iter().position(|tab| tab.id == tab_id) else {
@@ -418,7 +510,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
                 }),
             }
         }
-        Route::Fill(tab_id) => {
+        Route::Fill(target) => {
+            let tab_id = tab_id_or_err!(target);
             let value = request
                 .body
                 .get("value")
@@ -432,7 +525,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             };
             fill_control(tab, ref_id, name, value)
         }
-        Route::SelectOption(tab_id) => {
+        Route::SelectOption(target) => {
+            let tab_id = tab_id_or_err!(target);
             let value = request
                 .body
                 .get("value")
@@ -445,7 +539,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             };
             fill_control(tab, ref_id, None, value)
         }
-        Route::Type(tab_id) => {
+        Route::Type(target) => {
+            let tab_id = tab_id_or_err!(target);
             let text = request
                 .body
                 .get("text")
@@ -461,7 +556,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
                 .or_else(|| tab.focused_ref.clone());
             fill_control(tab, target_ref.as_deref(), None, text)
         }
-        Route::Press(tab_id) => {
+        Route::Press(target) => {
+            let tab_id = tab_id_or_err!(target);
             let key = request
                 .body
                 .get("key")
@@ -477,7 +573,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             });
             json!({"ok": true, "key": key, "focused": tab.focused_ref})
         }
-        Route::Move(tab_id) => {
+        Route::Move(target) => {
+            let tab_id = tab_id_or_err!(target);
             let (Some(x), Some(y)) = (point(request, "x"), point(request, "y")) else {
                 return json!({"ok": false, "error": "move necesita 'x' e 'y'"});
             };
@@ -494,7 +591,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             "ok": true,
             "note": "el motor headless maqueta el documento completo sin desplazamiento"
         }),
-        Route::WaitFor(tab_id) => {
+        Route::WaitFor(target) => {
+            let tab_id = tab_id_or_err!(target);
             let text = request.body.get("text").and_then(Value::as_str);
             let state = lock(state);
             let Some(tab) = state.tabs.iter().find(|tab| tab.id == tab_id) else {
@@ -510,7 +608,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             }
             json!({"ok": true, "ready": true})
         }
-        Route::NetworkRequests(tab_id) => {
+        Route::NetworkRequests(target) => {
+            let tab_id = tab_id_or_err!(target);
             let state = lock(state);
             let Some(tab) = state.tabs.iter().find(|tab| tab.id == tab_id) else {
                 return json!({"ok": false, "error": "pestaña no encontrada"});
@@ -531,7 +630,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
                 .collect();
             json!({"ok": true, "requests": items})
         }
-        Route::ConsoleMessages(tab_id) => {
+        Route::ConsoleMessages(target) => {
+            let tab_id = tab_id_or_err!(target);
             let state = lock(state);
             let Some(tab) = state.tabs.iter().find(|tab| tab.id == tab_id) else {
                 return json!({"ok": false, "error": "pestaña no encontrada"});
@@ -549,7 +649,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
                 .collect();
             json!({"ok": true, "messages": items})
         }
-        Route::Events(tab_id) => {
+        Route::Events(target) => {
+            let tab_id = tab_id_or_err!(target);
             let mut state = lock(state);
             let Some(tab) = state.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
                 return json!({"ok": false, "error": "pestaña no encontrada"});
@@ -557,8 +658,12 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             let drained: Vec<Value> = tab.events.drain(..).map(|e| e.to_json()).collect();
             json!({"ok": true, "events": drained})
         }
-        Route::Cdp(tab_id) => handle_cdp(state, tab_id, &request.body),
-        Route::Screenshot(tab_id) => {
+        Route::Cdp(target) => {
+            let tab_id = tab_id_or_err!(target);
+            handle_cdp(state, tab_id, &request.body)
+        }
+        Route::Screenshot(target) => {
+            let tab_id = tab_id_or_err!(target);
             let state = lock(state);
             let Some(tab) = state.tabs.iter().find(|tab| tab.id == tab_id) else {
                 return json!({"ok": false, "error": "pestaña no encontrada"});
@@ -597,7 +702,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
                 }),
             }
         }
-        Route::Pdf(tab_id) => {
+        Route::Pdf(target) => {
+            let tab_id = tab_id_or_err!(target);
             let state = lock(state);
             let Some(tab) = state.tabs.iter().find(|tab| tab.id == tab_id) else {
                 return json!({"ok": false, "error": "pestaña no encontrada"});

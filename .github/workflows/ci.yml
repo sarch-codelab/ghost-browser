@@ -9,6 +9,7 @@ on:
 env:
   RUSTFLAGS: "-D warnings"
   CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   build-and-test:
@@ -72,7 +73,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Run tests (root)
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1
 
   wisp-windows:
     name: Wisp (Windows)
@@ -86,11 +87,24 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: wisp -> wisp/target
           key: ${{ runner.os }}-wisp-cargo-${{ hashFiles('wisp/Cargo.lock') }}
+
+      - name: Verify no Boa or UI crates in default wisp-agent tree
+        shell: bash
+        run: |
+          if cargo tree --manifest-path wisp/Cargo.toml -p wisp-agent | grep -E "boa_|egui|wgpu|wry|webview2-com"; then
+            echo "Forbidden dependency found in wisp-agent default tree"
+            exit 1
+          fi
 
       - name: Check formatting (wisp)
         run: cargo fmt --manifest-path wisp/Cargo.toml --all -- --check
@@ -103,6 +117,125 @@ jobs:
 
       - name: Run tests (wisp)
         run: cargo test --manifest-path wisp/Cargo.toml --workspace --locked
+
+      - name: Smoke E2E (SSRF + fetch + serve API)
+        shell: pwsh
+        run: |
+          @'
+          import http.server, json, os, socket, socketserver, subprocess, sys, threading, time, traceback, urllib.error, urllib.request
+          sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = b"<!doctype html><html><head><title>Example Domain</title></head><body><h1>Example Domain</h1><a href='/next'>Next</a></body></html>"
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/html; charset=utf-8")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *args):
+                  pass
+
+          try:
+              with socketserver.TCPServer(("127.0.0.1", 0), Handler) as httpd:
+                  port = httpd.server_address[1]
+                  t = threading.Thread(target=httpd.serve_forever, daemon=True)
+                  t.start()
+                  agent = "wisp/target/release/wisp-agent.exe" if os.path.exists("wisp/target/release/wisp-agent.exe") else "wisp/target/release/wisp-agent"
+
+                  # 1. SSRF must block loopback by default
+                  blocked = subprocess.run([agent, "fetch", f"http://127.0.0.1:{port}/"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+                  assert blocked.returncode != 0, blocked.stdout
+                  assert "SSRF" in blocked.stderr or "SSRF" in blocked.stdout, blocked.stderr + blocked.stdout
+
+                  # 2. Fetch with --allow-private-network succeeds
+                  fetched = subprocess.run([agent, "fetch", f"http://127.0.0.1:{port}/", "--allow-private-network", "--dump", "markdown"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=True)
+                  assert "Example Domain" in fetched.stdout, fetched.stdout
+
+                  # 3. Serve API + /tabs/active/* + malformed JSON 400
+                  with socket.socket() as s:
+                      s.bind(("127.0.0.1", 0))
+                      api_port = s.getsockname()[1]
+                  srv = subprocess.Popen([agent, "serve", "--port", str(api_port), "--allow-private-network"])
+                  try:
+                      for _ in range(100):
+                          try:
+                              with urllib.request.urlopen(f"http://127.0.0.1:{api_port}/health", timeout=1) as r:
+                                  health = json.loads(r.read())
+                                  assert health["ok"] is True, health
+                                  assert health["rss_mb"] is not None, health
+                                  break
+                          except Exception:
+                              time.sleep(0.2)
+                      else:
+                          raise RuntimeError(f"wisp-agent serve did not become healthy on port {api_port}; rc={srv.poll()}")
+
+                      req = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs", data=json.dumps({"url": f"http://127.0.0.1:{port}/"}).encode(), method="POST")
+                      with urllib.request.urlopen(req, timeout=5) as r:
+                          assert json.loads(r.read())["ok"] is True
+
+                      with urllib.request.urlopen(f"http://127.0.0.1:{api_port}/tabs?engine=wisp", timeout=5) as r:
+                          tabs = json.loads(r.read())
+                          assert tabs["ok"] is True and len(tabs["tabs"]) == 1, tabs
+
+                      req = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs/active/snapshot", data=b"{}", method="POST")
+                      with urllib.request.urlopen(req, timeout=5) as r:
+                          snap = json.loads(r.read())
+                          assert snap["ok"] is True and len(snap.get("refs", [])) >= 1, snap
+
+                      req = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs/active/eval", data=b'{"js":"document.title"}', method="POST")
+                      with urllib.request.urlopen(req, timeout=5) as r:
+                          ev = json.loads(r.read())
+                          assert ev["ok"] is True and ev["result"] == "Example Domain", ev
+
+                      bad = urllib.request.Request(f"http://127.0.0.1:{api_port}/tabs/active/eval", data=b'{"js": "broken', method="POST")
+                      try:
+                          urllib.request.urlopen(bad, timeout=5)
+                          raise AssertionError("expected 400 Bad Request")
+                      except urllib.error.HTTPError as err:
+                          assert err.code == 400, err.code
+                          payload = json.loads(err.read())
+                          assert "JSON inv\u00e1lido" in payload["error"], payload
+                  finally:
+                      srv.terminate()
+                      try:
+                          srv.wait(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          srv.kill()
+                          srv.wait()
+          except Exception:
+              print("::error::" + traceback.format_exc().replace("\n", " | ")[:3500], flush=True)
+              raise
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run benchmarks & update WISP_RESULTS.md
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path target | Out-Null
+          cargo run --manifest-path wisp/Cargo.toml --release --locked -p wisp-benchmark -- `
+            --track all `
+            --json target/wisp-benchmark.json `
+            --md target/wisp-benchmark.md `
+            --victory-table WISP_RESULTS.md
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          @'
+          import json
+          with open("target/wisp-benchmark.json", encoding="utf-8") as f:
+              data = json.load(f)
+          assert data["memory_measured"] is True, data
+          assert data["rss_mb"] is not None and data["rss_mb"] > 0, data
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload Wisp benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wisp-results-windows
+          path: |
+            target/wisp-benchmark.json
+            target/wisp-benchmark.md
+            WISP_RESULTS.md
 
   wisp-linux:
     name: Wisp (Linux)
@@ -127,14 +260,48 @@ jobs:
           workspaces: wisp -> wisp/target
           key: ${{ runner.os }}-wisp-cargo-${{ hashFiles('wisp/Cargo.lock') }}
 
+      - name: Verify no Boa or UI crates in default wisp-agent tree
+        run: |
+          if cargo tree --manifest-path wisp/Cargo.toml -p wisp-agent | grep -E "boa_|egui|wgpu|wry|webview2-com"; then
+            echo "Forbidden dependency found in wisp-agent default tree"
+            exit 1
+          fi
+
       - name: Check formatting (wisp)
         run: cargo fmt --manifest-path wisp/Cargo.toml --all -- --check
 
       - name: Clippy (wisp)
-        run: cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+        run: |
+          cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features -- -D warnings
 
       - name: Build (wisp)
         run: cargo build --manifest-path wisp/Cargo.toml --workspace --release --locked
 
       - name: Run tests (wisp)
         run: cargo test --manifest-path wisp/Cargo.toml --workspace --locked
+
+      - name: Smoke E2E & Benchmarks (Linux)
+        run: |
+          mkdir -p target
+          cargo run --manifest-path wisp/Cargo.toml --release --locked -p wisp-benchmark -- \
+            --track all \
+            --json target/wisp-benchmark.json \
+            --md target/wisp-benchmark.md \
+            --victory-table WISP_RESULTS.md
+          python3 - << 'PY'
+          import json
+          with open("target/wisp-benchmark.json", encoding="utf-8") as f:
+              data = json.load(f)
+          assert data["memory_measured"] is True, data
+          assert data["rss_mb"] is not None and data["rss_mb"] > 0, data
+          PY
+
+      - name: Upload Wisp benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wisp-results-linux
+          path: |
+            target/wisp-benchmark.json
+            target/wisp-benchmark.md
+            WISP_RESULTS.md

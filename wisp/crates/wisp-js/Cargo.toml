@@ -2,12 +2,16 @@
 name = "wisp-js"
 version = "0.1.0"
 edition = "2024"
-description = "Wisp JavaScript stage: bounded Boa runtime, DOM bindings and network hooks."
+description = "Wisp JavaScript stage: homegrown bytecode VM, native DOM bindings and network hooks."
 license = "MIT"
+
+[features]
+default = []
+legacy-boa = ["dep:boa_engine"]
 
 [dependencies]
 anyhow = "1.0"
-boa_engine = { version = "0.22.0", default-features = false, features = ["annex-b"] }
+boa_engine = { version = "0.22.0", default-features = false, features = ["annex-b"], optional = true }
 ego-tree = "0.11"
 reqwest = { version = "0.13.5", features = ["blocking"] }
 scraper = "0.29"

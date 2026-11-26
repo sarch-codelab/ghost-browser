@@ -1,33 +1,46 @@
-//! Etapa de JavaScript de Wisp: ejecuta los scripts de una página en un
-//! runtime Boa acotado (límites de tamaño, tiempo, iteraciones y profundidad),
-//! expone el DOM a la página y devuelve el documento serializado cuando los
-//! scripts lo modifican. Este crate es autocontenido: no conoce el `DomNode`
-//! del motor, solo el árbol parseado y el HTML resultante.
+//! Etapa de JavaScript de Wisp: ejecuta los scripts de una página en el
+//! motor propio `wisp_js::vm` con DOM nativo en Rust (y soporte opcional
+//! `legacy-boa` desactivado por defecto), exponiendo el DOM a la página y
+//! devolviendo el documento serializado cuando los scripts lo modifican.
 
+#[cfg(not(feature = "legacy-boa"))]
+use anyhow::Result;
+#[cfg(feature = "legacy-boa")]
 use anyhow::{Result, anyhow, ensure};
+#[cfg(feature = "legacy-boa")]
 use boa_engine::builtins::promise::PromiseState;
+#[cfg(feature = "legacy-boa")]
 use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
+#[cfg(feature = "legacy-boa")]
 use boa_engine::native_function::NativeFunction;
+#[cfg(feature = "legacy-boa")]
 use boa_engine::{
     Context, JsNativeError, JsObject, JsResult, JsString, JsValue, Module, Source, js_string,
     property::Attribute,
 };
+#[cfg(feature = "legacy-boa")]
 use ego_tree::NodeRef;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE};
 use reqwest::redirect::Policy;
+#[cfg(feature = "legacy-boa")]
 use scraper::node::Node;
 use scraper::{Html, Selector};
+#[cfg(feature = "legacy-boa")]
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Read;
+#[cfg(feature = "legacy-boa")]
 use std::path::PathBuf;
+#[cfg(feature = "legacy-boa")]
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// Conformidad entre los descriptores WebIDL (`wisp-idl`) y el DOM de `dom.js`.
 pub mod idl;
+#[cfg(not(feature = "legacy-boa"))]
+mod native_dom;
 /// Motor JS propio de Wisp (lexer -> parser -> AST -> bytecode -> VM).
 pub mod vm;
 
@@ -38,21 +51,19 @@ const MAX_EXTERNAL_SCRIPT_BYTES: usize = 512 * 1024;
 const MAX_TOTAL_EXTERNAL_SCRIPT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EXECUTED_SCRIPTS: usize = 48;
 const MAX_MODULES: usize = 32;
+#[cfg(feature = "legacy-boa")]
 const MAX_LOOP_ITERATIONS: u64 = 100_000;
+#[cfg(feature = "legacy-boa")]
 const MAX_RECURSION_DEPTH: usize = 128;
+#[cfg(feature = "legacy-boa")]
 const MAX_STACK_SIZE: usize = 4096;
 const MAX_TREE_DEPTH: usize = 256;
-/// Presupuesto total de tiempo de JS por página. Boa no permite interrumpir
-/// un `eval` en curso, así que el límite se aplica entre scripts: una vez
-/// agotado, los scripts restantes se omiten con un warning. El peor caso de
-/// sobrepaso es un único script, ya acotado por los límites de iteraciones,
-/// recursión y pila de `RuntimeLimits`. En debug Boa es mucho más lento, así
-/// que el presupuesto se amplía para no cortar tests y desarrollo.
-#[cfg(not(debug_assertions))]
+#[cfg(all(feature = "legacy-boa", not(debug_assertions)))]
 const MAX_SCRIPT_EXECUTION_TIME: Duration = Duration::from_millis(120);
-#[cfg(debug_assertions)]
+#[cfg(all(feature = "legacy-boa", debug_assertions))]
 const MAX_SCRIPT_EXECUTION_TIME: Duration = Duration::from_secs(3);
 const MAX_SCRIPT_WARNINGS: usize = 8;
+#[cfg(feature = "legacy-boa")]
 const SCRIPT_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
 /// `fetch()`: tamaño máximo de una respuesta, peticiones por página y tiempo
 /// máximo. Son los mismos espíritu que el resto de límites de Wisp: la página
@@ -82,16 +93,18 @@ thread_local! {
     static FETCH_STATE: RefCell<FetchState> = RefCell::new(FetchState::default());
 }
 
+#[cfg(feature = "legacy-boa")]
 const DOM_RUNTIME: &str = include_str!("dom.js");
 
 #[derive(Default)]
 pub struct ScriptResult {
-    /// Serialized document produced by `dom.js` when page scripts changed the
-    /// tree. `None` means the original Rust-side document is still accurate.
+    /// Serialized document produced when page scripts changed the tree.
+    /// `None` means the original Rust-side document is still accurate.
     pub html: Option<String>,
     pub warnings: Vec<String>,
 }
 
+#[cfg(feature = "legacy-boa")]
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct InitialNode {
@@ -105,6 +118,7 @@ struct InitialNode {
     children: Vec<InitialNode>,
 }
 
+#[cfg(feature = "legacy-boa")]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DomSnapshot {
@@ -151,8 +165,8 @@ pub fn execute_scripts_with_policy(
 ) -> Result<ScriptResult> {
     let page_url_owned = page_url.map(str::to_owned);
     let policy = *policy;
-    let script_selector =
-        Selector::parse("script").map_err(|error| anyhow!("invalid script selector: {error}"))?;
+    let script_selector = Selector::parse("script")
+        .map_err(|error| anyhow::anyhow!("invalid script selector: {error}"))?;
     let mut classic = Vec::new();
     let mut modules = Vec::new();
     let mut warnings = Vec::new();
@@ -374,16 +388,30 @@ pub fn execute_scripts_with_policy(
         });
     }
 
-    let initial = build_initial_document(document)?;
-    let (html, script_warnings) = run_scripts_on_thread(
-        initial,
+    #[cfg(not(feature = "legacy-boa"))]
+    let (html, script_warnings) = native_dom::run_scripts_native(
+        document,
         classic,
         modules,
         module_scripts,
         page_url_owned,
-        viewport_width,
         policy,
-    )?;
+    );
+    #[cfg(feature = "legacy-boa")]
+    let (html, script_warnings) = {
+        let initial = build_initial_document(document)?;
+        run_scripts_on_thread(
+            initial,
+            classic,
+            modules,
+            module_scripts,
+            page_url_owned,
+            viewport_width,
+            policy,
+        )?
+    };
+    #[cfg(not(feature = "legacy-boa"))]
+    let _ = viewport_width;
     for warning in script_warnings {
         push_warning(&mut warnings, warning);
     }
@@ -404,11 +432,6 @@ pub struct EvalResult {
 }
 
 /// Evalúa `source` contra el DOM de `html` y devuelve su valor.
-///
-/// El contexto de JavaScript es efímero: se levanta desde el HTML, ejecuta la
-/// expresión y se descarta, porque Boa no es `Send` y no puede conservarse
-/// entre peticiones. Por eso `eval` ve el DOM tal y como quedó tras los
-/// scripts de la página, pero no las variables que esos scripts definieron.
 pub fn evaluate_expression(
     html: &str,
     page_url: Option<&str>,
@@ -432,32 +455,41 @@ pub fn evaluate_expression_with_policy(
     policy: &wisp_net::NetworkPolicy,
 ) -> Result<EvalResult> {
     let document = Html::parse_document(html);
-    let initial = build_initial_document(&document)?;
-    let page_url = page_url.map(str::to_owned);
-    let source = source.to_owned();
-    let policy = *policy;
-    // Boa puede necesitar más pila nativa que la que da el hilo llamante.
-    std::thread::scope(|scope| {
-        let handle = std::thread::Builder::new()
-            .name("wisp-eval".to_owned())
-            .stack_size(SCRIPT_THREAD_STACK_BYTES)
-            .spawn_scoped(scope, move || {
-                evaluate_expression_on_thread(
-                    initial,
-                    page_url.as_deref(),
-                    viewport_width,
-                    &source,
-                    policy,
-                )
-            })
-            .map_err(|error| anyhow!("could not start Wisp's evaluator: {error}"))?;
-        match handle.join() {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!("Wisp's evaluator failed unexpectedly")),
-        }
-    })
+    #[cfg(not(feature = "legacy-boa"))]
+    {
+        let _ = viewport_width;
+        native_dom::evaluate_expression_native(&document, page_url, source, *policy)
+    }
+    #[cfg(feature = "legacy-boa")]
+    {
+        let initial = build_initial_document(&document)?;
+        let page_url = page_url.map(str::to_owned);
+        let source = source.to_owned();
+        let policy = *policy;
+        // Boa puede necesitar más pila nativa que la que da el hilo llamante.
+        std::thread::scope(|scope| {
+            let handle = std::thread::Builder::new()
+                .name("wisp-eval".to_owned())
+                .stack_size(SCRIPT_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    evaluate_expression_on_thread(
+                        initial,
+                        page_url.as_deref(),
+                        viewport_width,
+                        &source,
+                        policy,
+                    )
+                })
+                .map_err(|error| anyhow!("could not start Wisp's evaluator: {error}"))?;
+            match handle.join() {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("Wisp's evaluator failed unexpectedly")),
+            }
+        })
+    }
 }
 
+#[cfg(feature = "legacy-boa")]
 fn evaluate_expression_on_thread(
     initial: InitialNode,
     page_url: Option<&str>,
@@ -566,6 +598,7 @@ fn resolve_script_url(page_url: Option<&str>, src: &str) -> Option<String> {
     Some(url.to_string())
 }
 
+#[cfg(feature = "legacy-boa")]
 fn build_initial_document(document: &Html) -> Result<InitialNode> {
     let root = document
         .tree
@@ -577,6 +610,7 @@ fn build_initial_document(document: &Html) -> Result<InitialNode> {
         .ok_or_else(|| anyhow!("the parsed document has no serializable root"))
 }
 
+#[cfg(feature = "legacy-boa")]
 fn convert_initial_node(node: NodeRef<'_, Node>, depth: usize) -> Result<Option<InitialNode>> {
     ensure!(
         depth <= MAX_TREE_DEPTH,
@@ -624,6 +658,7 @@ fn convert_initial_node(node: NodeRef<'_, Node>, depth: usize) -> Result<Option<
     }
 }
 
+#[cfg(feature = "legacy-boa")]
 fn page_url_json(url: Option<&str>) -> serde_json::Value {
     let Some(parsed) = url.and_then(|url| url::Url::parse(url).ok()) else {
         return serde_json::json!({
@@ -671,6 +706,7 @@ fn page_url_json(url: Option<&str>) -> serde_json::Value {
 /// match the URLs browsers use. Wisp stores every module under its resolved
 /// absolute URL, so this loader joins relative specifiers with the referrer URL
 /// and looks the result up in that map.
+#[cfg(feature = "legacy-boa")]
 struct WispModuleLoader {
     modules: RefCell<HashMap<String, Module>>,
     sources: HashMap<String, String>,
@@ -678,6 +714,7 @@ struct WispModuleLoader {
     module_urls: RefCell<HashMap<String, String>>,
 }
 
+#[cfg(feature = "legacy-boa")]
 impl WispModuleLoader {
     fn new(sources: &HashMap<String, String>, page_url: Option<&str>) -> Self {
         Self {
@@ -699,6 +736,7 @@ impl WispModuleLoader {
     }
 }
 
+#[cfg(feature = "legacy-boa")]
 impl ModuleLoader for WispModuleLoader {
     fn load_imported_module(
         self: Rc<Self>,
@@ -771,6 +809,7 @@ impl ModuleLoader for WispModuleLoader {
     }
 }
 
+#[cfg(feature = "legacy-boa")]
 fn resolve_module_url(base_url: &str, specifier: &str) -> Option<String> {
     if !(specifier.starts_with('/')
         || specifier.starts_with("./")
@@ -790,6 +829,7 @@ fn resolve_module_url(base_url: &str, specifier: &str) -> Option<String> {
     Some(url.to_string())
 }
 
+#[cfg(feature = "legacy-boa")]
 fn run_scripts_on_thread(
     initial: InitialNode,
     scripts: Vec<(String, String)>,
@@ -835,6 +875,7 @@ fn run_scripts_on_thread(
     })
 }
 
+#[cfg(feature = "legacy-boa")]
 fn evaluate_scripts(
     initial: InitialNode,
     scripts: Vec<(String, String)>,
@@ -1054,6 +1095,7 @@ fn evaluate_scripts(
 /// Puente nativo de `fetch()`: hace la petición HTTP de forma síncrona (el
 /// motor de scripts ya corre en su propio hilo) y devuelve un JSON con el
 /// cuerpo y los metadatos, o `null` si falla o la bloquea CORS.
+#[cfg(feature = "legacy-boa")]
 fn wisp_fetch_sync(_this: &JsValue, args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
     let Some(request) = args.first().and_then(|value| value.as_string()) else {
         return Ok(JsValue::null());
@@ -1253,6 +1295,7 @@ fn cors_allows(response: &reqwest::blocking::Response, page: &Option<url::Url>) 
 
 /// Registra `__wispDocument`, `__wispUrl` y `__wispViewport` antes de cargar
 /// `dom.js`. Compartido por la etapa de scripts y por `eval`.
+#[cfg(feature = "legacy-boa")]
 fn register_document_globals(
     context: &mut Context,
     initial: InitialNode,
@@ -1295,6 +1338,7 @@ fn register_document_globals(
     Ok(())
 }
 
+#[cfg(feature = "legacy-boa")]
 fn register_global(
     context: &mut Context,
     name: &str,
@@ -1309,6 +1353,7 @@ fn register_global(
     Ok(())
 }
 
+#[cfg(feature = "legacy-boa")]
 fn read_snapshot(context: &mut Context, warnings: &mut Vec<String>) -> Option<DomSnapshot> {
     let value = match context.eval(Source::from_bytes("__wispSnapshot()")) {
         Ok(value) => value,
@@ -1357,6 +1402,7 @@ fn read_snapshot(context: &mut Context, warnings: &mut Vec<String>) -> Option<Do
     }
 }
 
+#[cfg(feature = "legacy-boa")]
 fn read_runtime_warnings(context: &mut Context, warnings: &mut Vec<String>) -> Vec<String> {
     let value = match context.eval(Source::from_bytes("__wispTakeWarnings()")) {
         Ok(value) => value,
@@ -1678,6 +1724,7 @@ mod tests {
         assert_eq!(snapshot_text(html, "#out"), "after");
     }
 
+    #[cfg(feature = "legacy-boa")]
     #[test]
     fn custom_elements_receive_connected_callback() {
         let html = r##"<my-card id="one" data-label="uno">inicio</my-card>
@@ -1697,6 +1744,7 @@ mod tests {
         assert_eq!(snapshot_text(html, "#two"), "tarjeta:dos");
     }
 
+    #[cfg(feature = "legacy-boa")]
     #[test]
     fn custom_elements_report_invalid_names() {
         let html = r##"<p id="out">antes</p>

@@ -317,7 +317,7 @@ impl App {
         }
         let (mut browser, tx) = Browser::with_store(store);
         browser.set_event_proxy(event_proxy);
-        browser.cli_engine = cli.engine;
+        browser.set_cli_engine(cli.engine);
         if cli.no_saver {
             // Solo en memoria: el benchmark compara el coste por pestaña sin
             // la suspensión LRU. La sesión se restaura al cerrar Ghost.

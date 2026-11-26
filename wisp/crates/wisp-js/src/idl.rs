@@ -1,28 +1,35 @@
-//! Conformidad entre los descriptores WebIDL (`wisp-idl`) y el DOM real.
+//! Conformidad entre los descriptores WebIDL (`wisp-idl`) y el runtime DOM.
 //!
-//! `dom.js` define a mano las interfaces que Wisp expone a JavaScript. Este
-//! módulo levanta ese mismo runtime en un contexto Boa limpio y lo compara
-//! con los descriptores generados desde `wisp-idl`, sin modificar `dom.js`.
-//! El resultado es la lista exacta de lo que el runtime aún no ofrece, que es
-//! el punto de partida para generar los bindings desde el IDL.
+//! Con la feature por defecto (motor propio `wisp_js::vm` + `native_dom`),
+//! contrasta los descriptores generados desde `wisp-idl` con las capacidades
+//! nativas de `NativeDomHost`. Con `legacy-boa`, conserva además la comprobación
+//! histórica de `dom.js` en Boa.
 
+#[cfg(feature = "legacy-boa")]
 use crate::DOM_RUNTIME;
+#[cfg(not(feature = "legacy-boa"))]
+use anyhow::Result;
+#[cfg(feature = "legacy-boa")]
 use anyhow::{Result, anyhow};
+#[cfg(feature = "legacy-boa")]
 use boa_engine::property::Attribute;
+#[cfg(feature = "legacy-boa")]
 use boa_engine::{Context, JsValue, Source, js_string};
+#[cfg(feature = "legacy-boa")]
 use serde::Deserialize;
 
+#[cfg(feature = "legacy-boa")]
 const IDL_CHECK: &str = include_str!("idl_check.js");
 
-/// Presencia de una interfaz descrita en el IDL dentro del runtime de `dom.js`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Presencia de una interfaz descrita en el IDL dentro del runtime de Wisp.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct InterfaceStatus {
     pub name: &'static str,
     pub present: bool,
 }
 
-/// Informe de conformidad entre `wisp-idl` y el DOM de `dom.js`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Informe de conformidad entre `wisp-idl` y el runtime DOM.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct IdlConformance {
     /// Estado de cada interfaz descrita, en el orden del IDL.
     pub interfaces: Vec<InterfaceStatus>,
@@ -54,6 +61,50 @@ impl IdlConformance {
     }
 }
 
+#[cfg(not(feature = "legacy-boa"))]
+/// Compara los descriptores del IDL con el runtime DOM nativo de `wisp-js`.
+pub fn idl_conformance() -> Result<IdlConformance> {
+    let mut interfaces = Vec::with_capacity(wisp_idl::INTERFACES.len());
+    let mut missing_members = Vec::new();
+    let mut total_members = 0usize;
+    let mut found_members = 0usize;
+
+    for iface in wisp_idl::INTERFACES {
+        let present = crate::native_dom::native_idl_supports_interface(iface.name);
+        interfaces.push(InterfaceStatus {
+            name: iface.name,
+            present,
+        });
+        if !present {
+            continue;
+        }
+        for attr in iface.attributes {
+            total_members += 1;
+            if crate::native_dom::native_idl_supports_member(iface.name, attr.name) {
+                found_members += 1;
+            } else {
+                missing_members.push(format!("{}.{}", iface.name, attr.name));
+            }
+        }
+        for op in iface.operations {
+            total_members += 1;
+            if crate::native_dom::native_idl_supports_member(iface.name, op.name) {
+                found_members += 1;
+            } else {
+                missing_members.push(format!("{}.{}()", iface.name, op.name));
+            }
+        }
+    }
+
+    Ok(IdlConformance {
+        interfaces,
+        missing_members,
+        total_members,
+        found_members,
+    })
+}
+
+#[cfg(feature = "legacy-boa")]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawReport {
@@ -63,7 +114,8 @@ struct RawReport {
     found_members: usize,
 }
 
-/// Compara los descriptores del IDL con el DOM que instala `dom.js`.
+#[cfg(feature = "legacy-boa")]
+/// Compara los descriptores del IDL con el DOM que instala `dom.js` (Boa).
 pub fn idl_conformance() -> Result<IdlConformance> {
     let mut context = Context::builder()
         .build()
@@ -113,6 +165,7 @@ pub fn idl_conformance() -> Result<IdlConformance> {
     })
 }
 
+#[cfg(feature = "legacy-boa")]
 fn register_json(context: &mut Context, name: &str, value: serde_json::Value) -> Result<()> {
     let value = JsValue::from_json(&value, context)
         .map_err(|error| anyhow!("no se pudo preparar `{name}`: {error}"))?;
@@ -121,6 +174,7 @@ fn register_json(context: &mut Context, name: &str, value: serde_json::Value) ->
         .map_err(|error| anyhow!("no se pudo registrar `{name}`: {error}"))
 }
 
+#[cfg(feature = "legacy-boa")]
 /// Vista mínima de los descriptores que consume el chequeo en JavaScript.
 fn descriptor_json() -> serde_json::Value {
     serde_json::Value::Array(
@@ -161,7 +215,7 @@ mod tests {
         ] {
             assert!(
                 present.contains(&name),
-                "`{name}` debería estar presente en el DOM de dom.js"
+                "`{name}` debería estar presente en el DOM de Wisp"
             );
         }
     }
@@ -172,7 +226,7 @@ mod tests {
         assert_eq!(
             report.missing_members,
             Vec::<String>::new(),
-            "dom.js debe implementar cada atributo y operación descritos"
+            "el DOM de Wisp debe implementar cada atributo y operación descritos"
         );
     }
 
@@ -184,6 +238,6 @@ mod tests {
             report.total_members - report.found_members,
             "cada miembro debe contar como encontrado o ausente"
         );
-        assert!(report.found_members > 0, "dom.js sí implementa miembros");
+        assert!(report.found_members > 0, "el DOM sí implementa miembros");
     }
 }

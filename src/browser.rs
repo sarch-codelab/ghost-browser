@@ -1405,6 +1405,33 @@ impl Browser {
         self.navigate_tab_by_id(id, input);
     }
 
+    /// Fija el motor forzado por CLI/entorno (`--wisp`, `--webview2`,
+    /// `GHOST_ENGINE`) y actualiza las pestañas restauradas/inactivas que no
+    /// tengan selección manual, respetando `site_requires_chromium`.
+    pub fn set_cli_engine(&mut self, engine: Option<BrowserEngine>) {
+        self.cli_engine = engine;
+        if engine.is_none() {
+            return;
+        }
+        let updates: Vec<(usize, BrowserEngine)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, tab)| {
+                if tab.engine_manual || tab.is_live() || tab.is_newtab() {
+                    return None;
+                }
+                let forced = self.forced_engine_for(&tab.url)?;
+                (forced != tab.engine).then_some((idx, forced))
+            })
+            .collect();
+        for (idx, forced) in updates {
+            if let Some(tab) = self.tabs.get_mut(idx) {
+                tab.engine = forced;
+            }
+        }
+    }
+
     /// Motor que impone un motor fijado por CLI/entorno (`--wisp`,
     /// `--webview2` o `GHOST_ENGINE`). Con Wisp forzado toda URL http(s) se
     /// sirve en Wisp salvo los sitios de la lista explícita que necesita
@@ -1696,9 +1723,17 @@ impl Browser {
 
     // ---- API de control remoto (localhost) ---------------------------------
 
+    fn resolve_tab_target(&self, target: wisp_mcp::control::TabTarget) -> Option<u64> {
+        match target {
+            wisp_mcp::control::TabTarget::Id(id) => Some(id),
+            wisp_mcp::control::TabTarget::Active => self.active_tab().map(|t| t.id),
+        }
+    }
+
     /// Punto de entrada para comandos que llegan del servidor HTTP local.
     /// Debe llamarse desde el hilo de UI (donde vive `Browser`).
     pub fn handle_remote_command(&mut self, command: crate::remote::RemoteCommand) {
+        use serde_json::json;
         match command {
             crate::remote::RemoteCommand::Sync { request, reply } => {
                 // `None` = la respuesta queda diferida: el resultado llegará
@@ -1707,17 +1742,31 @@ impl Browser {
                     let _ = reply.send(value);
                 }
             }
-            crate::remote::RemoteCommand::Eval { tab_id, js, done } => {
+            crate::remote::RemoteCommand::Eval { target, js, done } => {
+                let Some(tab_id) = self.resolve_tab_target(target) else {
+                    let _ = done.send(json!({"ok": false, "error": "pestaña no encontrada"}));
+                    return;
+                };
                 self.start_remote_eval(tab_id, &js, done);
             }
             crate::remote::RemoteCommand::Cdp {
-                tab_id,
+                target,
                 method,
                 params,
                 done,
-            } => self.start_remote_cdp(tab_id, &method, &params, done),
-            crate::remote::RemoteCommand::Shot { tab_id, path, done } => {
-                self.start_remote_shot(tab_id, path, done)
+            } => {
+                let Some(tab_id) = self.resolve_tab_target(target) else {
+                    let _ = done.send(json!({"ok": false, "error": "pestaña no encontrada"}));
+                    return;
+                };
+                self.start_remote_cdp(tab_id, &method, &params, done);
+            }
+            crate::remote::RemoteCommand::Shot { target, path, done } => {
+                let Some(tab_id) = self.resolve_tab_target(target) else {
+                    let _ = done.send(json!({"ok": false, "error": "pestaña no encontrada"}));
+                    return;
+                };
+                self.start_remote_shot(tab_id, path, done);
             }
         }
     }
@@ -1732,12 +1781,21 @@ impl Browser {
     ) -> Option<serde_json::Value> {
         use serde_json::json;
         use wisp_mcp::control::Route;
+        let resolve = |target| {
+            self.resolve_tab_target(target)
+                .ok_or_else(|| json!({"ok": false, "error": "pestaña no encontrada"}))
+        };
         Some(match request.route() {
             Route::ListTabs => {
                 let active_id = self.active_tab().map(|t| t.id);
+                let engine_filter = request.query_param("engine");
                 let tabs: Vec<serde_json::Value> = self
                     .tabs
                     .iter()
+                    .filter(|t| {
+                        engine_filter
+                            .is_none_or(|eng| format!("{:?}", t.engine).eq_ignore_ascii_case(eng))
+                    })
                     .map(|t| {
                         json!({
                             "id": t.id,
@@ -1762,66 +1820,137 @@ impl Browser {
                     _ => json!({"ok": false, "error": "falta una 'url' http(s) válida"}),
                 }
             }
-            Route::Navigate(tab_id) => {
+            Route::Navigate(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 let Some(url) = request.body.get("url").and_then(|u| u.as_str()) else {
                     return Some(json!({"ok": false, "error": "falta 'url'"}));
                 };
                 self.navigate_tab_by_id(tab_id, url);
                 json!({"ok": true})
             }
-            Route::Back(tab_id) => {
+            Route::Back(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 self.navigate_history_for_tab(tab_id, -1);
                 json!({"ok": true})
             }
-            Route::Forward(tab_id) => {
+            Route::Forward(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 self.navigate_history_for_tab(tab_id, 1);
                 json!({"ok": true})
             }
-            Route::Reload(tab_id) => {
+            Route::Reload(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 self.reload_tab_by_id(tab_id);
                 json!({"ok": true})
             }
-            Route::Close(tab_id) => {
+            Route::Close(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 if let Some(index) = self.tab_index_of(tab_id) {
                     self.close_tab(index);
                 }
                 json!({"ok": true})
             }
-            Route::Activate(tab_id) => {
+            Route::Activate(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 if let Some(index) = self.tab_index_of(tab_id) {
-                    self.active = index;
-                    if let Some(t) = self.tabs.get_mut(index) {
-                        t.last_active = Instant::now();
-                    }
-                    self.needs_bounds_sync = true;
-                    self.dirty = true;
+                    self.switch_tab(index);
                 }
                 json!({"ok": true})
             }
-            Route::Text(tab_id) => self.remote_tab_text(tab_id, reply.clone())?,
-            Route::Snapshot(tab_id) => {
+            Route::Text(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
+                self.remote_tab_text(tab_id, reply.clone())?
+            }
+            Route::Snapshot(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 self.remote_snapshot(tab_id, &request.body, reply.clone())?
             }
-            Route::Click(tab_id) => {
+            Route::Click(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 if self.is_wisp_tab(tab_id) {
                     self.remote_wisp_click(tab_id, &request.body)
                 } else {
                     self.remote_input(tab_id, "click", &request.body)
                 }
             }
-            Route::Fill(tab_id) => self.remote_fill(tab_id, &request.body),
-            Route::SelectOption(tab_id) => self.remote_fill(tab_id, &request.body),
-            Route::Type(tab_id) => self.remote_input(tab_id, "type", &request.body),
-            Route::Press(tab_id) => self.remote_input(tab_id, "press", &request.body),
-            Route::Scroll(tab_id) => self.remote_input(tab_id, "scroll", &request.body),
-            Route::Move(tab_id) => {
+            Route::Fill(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
+                self.remote_fill(tab_id, &request.body)
+            }
+            Route::SelectOption(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
+                self.remote_fill(tab_id, &request.body)
+            }
+            Route::Type(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
+                self.remote_input(tab_id, "type", &request.body)
+            }
+            Route::Press(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
+                self.remote_input(tab_id, "press", &request.body)
+            }
+            Route::Scroll(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
+                self.remote_input(tab_id, "scroll", &request.body)
+            }
+            Route::Move(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 if self.is_wisp_tab(tab_id) {
                     self.remote_wisp_move(tab_id, &request.body)
                 } else {
                     self.remote_input(tab_id, "move", &request.body)
                 }
             }
-            Route::WaitFor(tab_id) => {
+            Route::WaitFor(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 let text = request.body.get("text").and_then(|v| v.as_str());
                 let Some(tab) = self.tab_by_id(tab_id) else {
                     return Some(json!({"ok": false, "error": "pestaña no encontrada"}));
@@ -1834,14 +1963,22 @@ impl Browser {
                     json!({"ok": true, "ready": !tab.loading})
                 }
             }
-            Route::NetworkRequests(tab_id) => {
+            Route::NetworkRequests(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 if self.tab_by_id(tab_id).is_none() {
                     json!({"ok": false, "error": "pestaña no encontrada"})
                 } else {
                     json!({"ok": true, "requests": []})
                 }
             }
-            Route::ConsoleMessages(tab_id) => {
+            Route::ConsoleMessages(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 let Some(tab) = self.tab_by_id(tab_id) else {
                     return Some(json!({"ok": false, "error": "pestaña no encontrada"}));
                 };
@@ -1853,7 +1990,11 @@ impl Browser {
                 }
                 json!({"ok": true, "messages": messages})
             }
-            Route::Events(tab_id) => {
+            Route::Events(target) => {
+                let tab_id = match resolve(target) {
+                    Ok(id) => id,
+                    Err(err) => return Some(err),
+                };
                 if self.tab_by_id(tab_id).is_none() {
                     json!({"ok": false, "error": "pestaña no encontrada"})
                 } else {
@@ -2505,7 +2646,15 @@ impl Browser {
             t.last_active = Instant::now();
         }
         if !live {
+            let forced = self
+                .tabs
+                .get(index)
+                .filter(|t| !t.engine_manual)
+                .and_then(|t| self.forced_engine_for(&t.url));
             if let Some(t) = self.tabs.get_mut(index) {
+                if let Some(engine) = forced {
+                    t.engine = engine;
+                }
                 t.loading = true;
             }
             self.queue_restore(id);
@@ -3490,11 +3639,89 @@ mod tests {
         let tab_id = browser.tabs[0].id;
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         browser.handle_remote_command(crate::remote::RemoteCommand::Eval {
-            tab_id,
+            target: wisp_mcp::control::TabTarget::Id(tab_id),
             js: "1+1".into(),
             done: done_tx,
         });
         let response = done_rx.recv().unwrap();
         assert_eq!(response["ok"], false);
+
+        // Eval con `TabTarget::Active` también se resuelve contra la pestaña activa.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        browser.handle_remote_command(crate::remote::RemoteCommand::Eval {
+            target: wisp_mcp::control::TabTarget::Active,
+            js: "1+1".into(),
+            done: done_tx,
+        });
+        assert_eq!(done_rx.recv().unwrap()["ok"], false);
+    }
+
+    #[test]
+    fn set_cli_engine_wisp_updates_restored_tabs_except_chromium_list() {
+        let mut store = Store::default();
+        store.session = vec![
+            SessionTab {
+                url: "https://example.com/".into(),
+                engine: BrowserEngine::WebView2,
+                title: "Example".into(),
+                zoom: 1.0,
+                navigation_history: vec!["https://example.com/".into()],
+                history_index: 0,
+            },
+            SessionTab {
+                url: "https://youtube.com/".into(),
+                engine: BrowserEngine::WebView2,
+                title: "YouTube".into(),
+                zoom: 1.0,
+                navigation_history: vec!["https://youtube.com/".into()],
+                history_index: 0,
+            },
+        ];
+        let (mut browser, _) = Browser::from_store(store);
+        browser.set_cli_engine(Some(BrowserEngine::Wisp));
+
+        let ex = browser
+            .tabs
+            .iter()
+            .find(|t| t.url == "https://example.com/")
+            .unwrap();
+        assert_eq!(ex.engine, BrowserEngine::Wisp);
+
+        let yt = browser
+            .tabs
+            .iter()
+            .find(|t| t.url == "https://youtube.com/")
+            .unwrap();
+        assert_eq!(yt.engine, BrowserEngine::WebView2);
+
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        browser.handle_remote_command(crate::remote::RemoteCommand::Sync {
+            request: wisp_mcp::control::Request {
+                method: "GET".into(),
+                path: "/tabs?engine=wisp".into(),
+                body: serde_json::Value::Null,
+            },
+            reply: reply_tx,
+        });
+        let filtered = reply_rx.recv().unwrap();
+        let arr = filtered["tabs"].as_array().unwrap();
+        assert!(arr.iter().all(|t| t["engine"] == "Wisp"));
+        assert!(arr.iter().any(|t| t["url"] == "https://example.com/"));
+
+        // `switch_tab` aplica `--wisp` en pestañas suspendidas salvo `engine_manual`.
+        let ex_idx = browser
+            .tabs
+            .iter()
+            .position(|t| t.url == "https://example.com/")
+            .unwrap();
+        browser.tabs[ex_idx].engine = BrowserEngine::WebView2;
+        browser.switch_tab(ex_idx);
+        assert_eq!(browser.tabs[ex_idx].engine, BrowserEngine::Wisp);
+
+        browser.active = 0;
+        browser.tabs[ex_idx].engine = BrowserEngine::WebView2;
+        browser.tabs[ex_idx].engine_manual = true;
+        browser.switch_tab(ex_idx);
+        assert_eq!(browser.tabs[ex_idx].engine, BrowserEngine::WebView2);
     }
 }
