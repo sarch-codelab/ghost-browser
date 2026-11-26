@@ -345,11 +345,7 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             }
         }
         Route::Eval(tab_id) => {
-            let js = request
-                .body
-                .get("js")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let js = request.body.get("js").and_then(Value::as_str).unwrap_or("");
             if js.is_empty() {
                 return json!({"ok": false, "error": "falta 'js'"});
             }
@@ -386,7 +382,8 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
                     return result;
                 }
                 if el.role == "button" && let Some(href) = el.href.as_deref() {
-                    return json!({"ok": true, "target": el.to_json(), "note": format!("botón sin navegación ({href})")});
+                    let note = format!("botón sin navegación ({href})");
+                    return json!({"ok": true, "target": el.to_json(), "note": note});
                 }
                 return json!({"ok": true, "target": el.to_json(), "focused": el.ref_id});
             }
@@ -883,7 +880,10 @@ fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, policy: &Networ
         "Input.dispatchMouseEvent" => {
             let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
             let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
-            let event_type = params.get("type").and_then(Value::as_str).unwrap_or("mousePressed");
+            let event_type = params
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("mousePressed");
             let hit = hit_target(tab, x, y).ok().flatten();
             if event_type == "mouseReleased"
                 && let Some(ref target) = hit
@@ -916,7 +916,10 @@ fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, policy: &Networ
                 Err(error) => json!({"ok": false, "error": error.to_string()}),
             }
         }
-        _ => json!({"ok": false, "error": format!("método CDP no soportado en headless: {method}")}),
+        _ => {
+            let error = format!("método CDP no soportado en headless: {method}");
+            json!({"ok": false, "error": error})
+        }
     }
 }
 

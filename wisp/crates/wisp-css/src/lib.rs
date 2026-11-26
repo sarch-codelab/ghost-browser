@@ -564,7 +564,10 @@ pub fn supports_query_matches(condition: &str, supported_properties: &[&str]) ->
         }
         return supports_query_matches(inner, supported_properties);
     }
-    if trimmed.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("selector")) {
+    if trimmed
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("selector"))
+    {
         return trimmed.contains('(') && trimmed.ends_with(')');
     }
     false
@@ -590,10 +593,7 @@ fn split_once_top_level_ci<'a>(value: &'a str, needle: &str) -> Option<(&'a str,
                     && i + needle_bytes.len() <= bytes.len()
                     && bytes[i..i + needle_bytes.len()].eq_ignore_ascii_case(needle_bytes)
                 {
-                    return Some((
-                        value[..i].trim(),
-                        value[i + needle_bytes.len()..].trim(),
-                    ));
+                    return Some((value[..i].trim(), value[i + needle_bytes.len()..].trim()));
                 }
                 i += 1;
             }

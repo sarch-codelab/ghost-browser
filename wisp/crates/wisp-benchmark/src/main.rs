@@ -39,7 +39,15 @@ fn main() {
     }
 
     let mut results = Vec::new();
-    for name in ["wpt", "obstacle", "compare", "realworld", "reliability", "perf"] {
+    let all_tracks = [
+        "wpt",
+        "obstacle",
+        "compare",
+        "realworld",
+        "reliability",
+        "perf",
+    ];
+    for name in all_tracks {
         if track == "all" || track == name {
             results.push(run_track(name));
         }
@@ -74,8 +82,16 @@ fn run_track(track: &str) -> Value {
             let mut passed = 0usize;
             let cases = [
                 ("css-calc", "<div>ok</div>", "calc(10px + 20px)"),
-                ("dom-write", "<p id=\"x\">a</p>", "document.getElementById('x').textContent"),
-                ("ua-heading", "<h1>Title</h1>", "document.querySelector('h1').tagName"),
+                (
+                    "dom-write",
+                    "<p id=\"x\">a</p>",
+                    "document.getElementById('x').textContent",
+                ),
+                (
+                    "ua-heading",
+                    "<h1>Title</h1>",
+                    "document.querySelector('h1').tagName",
+                ),
             ];
             for (_, html, expr) in cases {
                 let page = FetchedPage::new(
