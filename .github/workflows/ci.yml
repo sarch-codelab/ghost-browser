@@ -38,17 +38,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Run tests (root)
-        shell: bash
-        run: |
-          if ! out=$(cargo test --locked 2>&1); then
-            printf '%s\n' "$out"
-            matched=$(printf '%s\n' "$out" | grep -E '(FAILED|panicked at|error\[|\[91merror|^error|-->)' | head -n 9 || true)
-            if [ -z "$matched" ]; then matched=$(printf '%s\n' "$out" | tail -n 8); fi
-            printf '%s\n' "$matched" | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-            exit 1
-          fi
+        run: cargo test --locked
 
   build-linux:
     name: Build (Linux)
@@ -76,31 +66,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (root)
-        run: |
-          if ! out=$(cargo clippy --all-targets --all-features -- -D warnings 2>&1); then
-            printf '%s\n' "$out"
-            matched=$(printf '%s\n' "$out" | grep -E '(\[91merror|^error|-->)' | head -n 9 || true)
-            if [ -z "$matched" ]; then matched=$(printf '%s\n' "$out" | tail -n 8); fi
-            printf '%s\n' "$matched" | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-            exit 1
-          fi
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build (root)
         run: cargo build --release --locked
 
       - name: Run tests (root)
-        run: |
-          if ! out=$(cargo test --locked 2>&1); then
-            printf '%s\n' "$out"
-            matched=$(printf '%s\n' "$out" | grep -E '(FAILED|panicked at|error\[|\[91merror|^error|-->)' | head -n 9 || true)
-            if [ -z "$matched" ]; then matched=$(printf '%s\n' "$out" | tail -n 8); fi
-            printf '%s\n' "$matched" | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-            exit 1
-          fi
+        run: cargo test --locked
 
   wisp-windows:
     name: Wisp (Windows)
@@ -130,17 +102,7 @@ jobs:
         run: cargo build --manifest-path wisp/Cargo.toml --workspace --release --locked
 
       - name: Run tests (wisp)
-        shell: bash
-        run: |
-          if ! out=$(cargo test --manifest-path wisp/Cargo.toml --workspace --locked 2>&1); then
-            printf '%s\n' "$out"
-            matched=$(printf '%s\n' "$out" | grep -E '(FAILED|panicked at|error\[|\[91merror|^error|-->)' | head -n 9 || true)
-            if [ -z "$matched" ]; then matched=$(printf '%s\n' "$out" | tail -n 8); fi
-            printf '%s\n' "$matched" | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-            exit 1
-          fi
+        run: cargo test --manifest-path wisp/Cargo.toml --workspace --locked
 
   wisp-linux:
     name: Wisp (Linux)
@@ -169,28 +131,10 @@ jobs:
         run: cargo fmt --manifest-path wisp/Cargo.toml --all -- --check
 
       - name: Clippy (wisp)
-        run: |
-          if ! out=$(cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features -- -D warnings 2>&1); then
-            printf '%s\n' "$out"
-            matched=$(printf '%s\n' "$out" | grep -E '(\[91merror|^error|-->)' | head -n 9 || true)
-            if [ -z "$matched" ]; then matched=$(printf '%s\n' "$out" | tail -n 8); fi
-            printf '%s\n' "$matched" | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-            exit 1
-          fi
+        run: cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features -- -D warnings
 
       - name: Build (wisp)
         run: cargo build --manifest-path wisp/Cargo.toml --workspace --release --locked
 
       - name: Run tests (wisp)
-        run: |
-          if ! out=$(cargo test --manifest-path wisp/Cargo.toml --workspace --locked 2>&1); then
-            printf '%s\n' "$out"
-            matched=$(printf '%s\n' "$out" | grep -E '(FAILED|panicked at|error\[|\[91merror|^error|-->)' | head -n 9 || true)
-            if [ -z "$matched" ]; then matched=$(printf '%s\n' "$out" | tail -n 8); fi
-            printf '%s\n' "$matched" | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-            exit 1
-          fi
+        run: cargo test --manifest-path wisp/Cargo.toml --workspace --locked
