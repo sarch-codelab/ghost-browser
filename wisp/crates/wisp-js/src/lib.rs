@@ -411,7 +411,14 @@ pub fn evaluate_expression_with_policy(
     source: &str,
     policy: &wisp_net::NetworkPolicy,
 ) -> Result<EvalResult> {
-    evaluate_expression_with_geometry(html, page_url, viewport_width, source, policy, None)
+    evaluate_expression_with_geometry(
+        html,
+        page_url,
+        viewport_width,
+        source,
+        policy,
+        None,
+    )
 }
 
 pub fn evaluate_expression_with_geometry(
@@ -545,8 +552,7 @@ fn fetch_json(request: &str, method: &str) -> Result<String, String> {
         client.get(target.clone())
     };
     if policy.stealth {
-        request_builder = request_builder
-            .header("Accept-Language", stealth_profile.accept_language);
+        request_builder = request_builder.header("Accept-Language", stealth_profile.accept_language);
         if let Some(ch_ua) = stealth_profile.sec_ch_ua {
             request_builder = request_builder.header("Sec-CH-UA", ch_ua);
         }

@@ -1050,7 +1050,10 @@ impl HostBridge for NativeDomHost<'_> {
                     "readyState" => Ok(JsVal::Str("complete".to_owned())),
                     "URL" => Ok(JsVal::Str(self.page_url.clone().unwrap_or_default())),
                     "cookie" => {
-                        let parsed = self.page_url.as_deref().and_then(|u| url::Url::parse(u).ok());
+                        let parsed = self
+                            .page_url
+                            .as_deref()
+                            .and_then(|u| url::Url::parse(u).ok());
                         let (host, path, is_https) = match parsed {
                             Some(ref u) => (
                                 u.host_str().unwrap_or("localhost").to_owned(),
@@ -1095,11 +1098,10 @@ impl HostBridge for NativeDomHost<'_> {
                     "navigator" => Ok(JsVal::NativeHandle("navigator".to_owned())),
                     "performance" => Ok(JsVal::NativeHandle("performance".to_owned())),
                     "crypto" => Ok(JsVal::NativeHandle("crypto".to_owned())),
-                    "chrome" => Ok(vm
-                        .globals
-                        .get("chrome")
-                        .cloned()
-                        .unwrap_or(JsVal::Undefined)),
+                    "chrome" => {
+                        let chrome = vm.globals.get("chrome").cloned();
+                        Ok(chrome.unwrap_or(JsVal::Undefined))
+                    }
                     "innerWidth" => Ok(JsVal::Number(self.viewport_width as f64)),
                     "innerHeight" => Ok(JsVal::Number(720.0)),
                     "devicePixelRatio" => Ok(JsVal::Number(1.0)),
@@ -1352,7 +1354,10 @@ impl HostBridge for NativeDomHost<'_> {
             JsVal::NativeHandle(handle) => {
                 if handle == "document" && prop == "cookie" {
                     let raw = value.to_string();
-                    let parsed = self.page_url.as_deref().and_then(|u| url::Url::parse(u).ok());
+                    let parsed = self
+                        .page_url
+                        .as_deref()
+                        .and_then(|u| url::Url::parse(u).ok());
                     let (host, path) = match parsed {
                         Some(ref u) => (
                             u.host_str().unwrap_or("localhost").to_owned(),

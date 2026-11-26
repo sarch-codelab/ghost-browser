@@ -997,7 +997,12 @@ impl Parser {
                 } else {
                     Vec::new()
                 };
-                Ok(Stmt::TryCatch(try_body, catch_var, catch_body, finally_body))
+                Ok(Stmt::TryCatch(
+                    try_body,
+                    catch_var,
+                    catch_body,
+                    finally_body,
+                ))
             }
             Tok::KwThrow => {
                 self.next();

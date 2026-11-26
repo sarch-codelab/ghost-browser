@@ -961,9 +961,7 @@ fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, options: &Fetch
         "Page.enable"
         | "DOM.enable"
         | "Page.setLifecycleEventsEnabled"
-        | "Emulation.setDeviceMetricsOverride" => {
-            json!({"ok": true, "result": {}})
-        }
+        | "Emulation.setDeviceMetricsOverride" => json!({"ok": true, "result": {}}),
         "Page.getFrameTree" => json!({
             "ok": true,
             "result": {

@@ -9282,10 +9282,11 @@ fetch("http://{data_address}/data.json").then(function () {{
 
     #[test]
     fn taffy_flex_geometry_feeds_get_bounding_client_rect() {
+        let html = r#"<html><body><div style="display: flex; width: 400px;"><div id="a" style="width: 100px; height: 50px;">A</div><div id="b" style="width: 120px; height: 50px;">B</div></div></body></html>"#;
         let page = FetchedPage::new(
             "https://example.com/".to_owned(),
             "Layout".to_owned(),
-            r#"<html><body><div style="display: flex; width: 400px;"><div id="a" style="width: 100px; height: 50px;">A</div><div id="b" style="width: 120px; height: 50px;">B</div></div></body></html>"#.to_owned(),
+            html.to_owned(),
             vec![],
             HashMap::new(),
             HashMap::new(),

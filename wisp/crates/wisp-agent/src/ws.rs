@@ -200,9 +200,9 @@ pub fn read_ws_message(stream: &mut TcpStream) -> io::Result<Option<WsMessage>> 
                 fragmented.extend_from_slice(&payload);
                 if fin {
                     let msg = match fragmented_opcode {
-                        0x1 => String::from_utf8(fragmented).map(WsMessage::Text).map_err(|e| {
-                            io::Error::new(io::ErrorKind::InvalidData, e)
-                        })?,
+                        0x1 => String::from_utf8(fragmented)
+                            .map(WsMessage::Text)
+                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
                         _ => WsMessage::Text(String::from_utf8_lossy(&fragmented).into_owned()),
                     };
                     return Ok(Some(msg));
