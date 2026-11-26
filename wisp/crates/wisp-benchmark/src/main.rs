@@ -252,8 +252,8 @@ fn run_wpt_track(started: Instant) -> Value {
         };
         let decls = computer.resolve_declarations(&el, "");
         if decls
-            .iter()
-            .any(|d| d.name == prop && Some(d.value.as_str()) == expected)
+            .get(prop)
+            .is_some_and(|d| Some(d.value.as_str()) == expected)
         {
             core_passed += 1;
         }
