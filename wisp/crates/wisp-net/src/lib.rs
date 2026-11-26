@@ -676,14 +676,8 @@ mod tests {
                 .as_deref(),
             Some("sid=ok123")
         );
-        assert_eq!(
-            jar.cookie_header_for("sub.example.com", "/v1/page", false, true),
-            None
-        );
-        assert_eq!(
-            jar.cookie_header_for("sub.example.com", "/v1/page", true, false),
-            None
-        );
+        assert_eq!(jar.cookie_header_for("sub.example.com", "/v1/page", false, true), None);
+        assert_eq!(jar.cookie_header_for("sub.example.com", "/v1/page", true, false), None);
     }
 
     #[test]

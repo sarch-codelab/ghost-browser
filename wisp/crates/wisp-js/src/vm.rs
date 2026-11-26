@@ -616,7 +616,12 @@ enum Stmt {
     TryCatch(Vec<Stmt>, Option<String>, Vec<Stmt>, Vec<Stmt>),
     Throw(Expr),
     FnDecl(String, Vec<String>, Vec<Stmt>),
-    ClassDecl(String, Option<String>, Option<(Vec<String>, Vec<Stmt>)>, Vec<(String, Vec<String>, Vec<Stmt>)>),
+    ClassDecl(
+        String,
+        Option<String>,
+        Option<(Vec<String>, Vec<Stmt>)>,
+        Vec<(String, Vec<String>, Vec<Stmt>)>,
+    ),
     Return(Option<Expr>),
     Expr(Expr),
 }
@@ -3212,7 +3217,9 @@ impl VmRuntime {
                         } else if let Some((_, first)) = iter.next() {
                             first.clone()
                         } else {
-                            return Err(JsVal::Str("Reduce of empty array with no initial value".into()));
+                            return Err(JsVal::Str(
+                                "Reduce of empty array with no initial value".into(),
+                            ));
                         };
                         for (i, item) in iter {
                             acc = self.call_fn_id(
@@ -3406,10 +3413,13 @@ impl VmRuntime {
                         match wtype.as_str() {
                             "Map" => match method {
                                 "set" => {
-                                    let k = args.first().map(ToString::to_string).unwrap_or_default();
+                                    let k =
+                                        args.first().map(ToString::to_string).unwrap_or_default();
                                     let v = args.get(1).cloned().unwrap_or(JsVal::Undefined);
                                     if let Some(entries) = self.maps.get_mut(idx) {
-                                        if let Some(slot) = entries.iter_mut().find(|(ek, _)| ek == &k) {
+                                        if let Some(slot) =
+                                            entries.iter_mut().find(|(ek, _)| ek == &k)
+                                        {
                                             slot.1 = v;
                                         } else {
                                             entries.push((k, v));
@@ -3418,7 +3428,8 @@ impl VmRuntime {
                                     return Ok(target);
                                 }
                                 "get" => {
-                                    let k = args.first().map(ToString::to_string).unwrap_or_default();
+                                    let k =
+                                        args.first().map(ToString::to_string).unwrap_or_default();
                                     let found = self
                                         .maps
                                         .get(idx)
@@ -3428,7 +3439,8 @@ impl VmRuntime {
                                     return Ok(found);
                                 }
                                 "has" => {
-                                    let k = args.first().map(ToString::to_string).unwrap_or_default();
+                                    let k =
+                                        args.first().map(ToString::to_string).unwrap_or_default();
                                     let has = self
                                         .maps
                                         .get(idx)
@@ -3436,7 +3448,8 @@ impl VmRuntime {
                                     return Ok(JsVal::Bool(has));
                                 }
                                 "delete" => {
-                                    let k = args.first().map(ToString::to_string).unwrap_or_default();
+                                    let k =
+                                        args.first().map(ToString::to_string).unwrap_or_default();
                                     if let Some(entries) = self.maps.get_mut(idx) {
                                         let before = entries.len();
                                         entries.retain(|(ek, _)| ek != &k);
@@ -3448,7 +3461,9 @@ impl VmRuntime {
                                     let ks = self
                                         .maps
                                         .get(idx)
-                                        .map(|e| e.iter().map(|(k, _)| JsVal::Str(k.clone())).collect())
+                                        .map(|e| {
+                                            e.iter().map(|(k, _)| JsVal::Str(k.clone())).collect()
+                                        })
                                         .unwrap_or_default();
                                     return Ok(JsVal::Array(ks));
                                 }
@@ -3493,9 +3508,11 @@ impl VmRuntime {
                                 _ => {}
                             },
                             "RegExp" => {
-                                let pat = m.get("source").map(ToString::to_string).unwrap_or_default();
+                                let pat =
+                                    m.get("source").map(ToString::to_string).unwrap_or_default();
                                 let ci = m.get("ignoreCase") == Some(&JsVal::Bool(true));
-                                let text = args.first().map(ToString::to_string).unwrap_or_default();
+                                let text =
+                                    args.first().map(ToString::to_string).unwrap_or_default();
                                 match method {
                                     "test" => {
                                         return Ok(JsVal::Bool(
@@ -3507,7 +3524,9 @@ impl VmRuntime {
                                         return Ok(if found.is_empty() {
                                             JsVal::Null
                                         } else {
-                                            JsVal::Array(found.into_iter().map(JsVal::Str).collect())
+                                            JsVal::Array(
+                                                found.into_iter().map(JsVal::Str).collect(),
+                                            )
                                         });
                                     }
                                     _ => {}
@@ -3515,7 +3534,8 @@ impl VmRuntime {
                             }
                             "URLSearchParams" => match method {
                                 "get" => {
-                                    let k = args.first().map(ToString::to_string).unwrap_or_default();
+                                    let k =
+                                        args.first().map(ToString::to_string).unwrap_or_default();
                                     let found = self
                                         .maps
                                         .get(idx)
@@ -3525,7 +3545,8 @@ impl VmRuntime {
                                     return Ok(found);
                                 }
                                 "has" => {
-                                    let k = args.first().map(ToString::to_string).unwrap_or_default();
+                                    let k =
+                                        args.first().map(ToString::to_string).unwrap_or_default();
                                     let has = self
                                         .maps
                                         .get(idx)
@@ -3533,8 +3554,11 @@ impl VmRuntime {
                                     return Ok(JsVal::Bool(has));
                                 }
                                 "set" => {
-                                    let k = args.first().map(ToString::to_string).unwrap_or_default();
-                                    let v = JsVal::Str(args.get(1).map(ToString::to_string).unwrap_or_default());
+                                    let k =
+                                        args.first().map(ToString::to_string).unwrap_or_default();
+                                    let v = JsVal::Str(
+                                        args.get(1).map(ToString::to_string).unwrap_or_default(),
+                                    );
                                     if let Some(entries) = self.maps.get_mut(idx) {
                                         entries.retain(|(ek, _)| ek != &k);
                                         entries.push((k, v));
@@ -3542,15 +3566,19 @@ impl VmRuntime {
                                     return Ok(JsVal::Undefined);
                                 }
                                 "append" => {
-                                    let k = args.first().map(ToString::to_string).unwrap_or_default();
-                                    let v = JsVal::Str(args.get(1).map(ToString::to_string).unwrap_or_default());
+                                    let k =
+                                        args.first().map(ToString::to_string).unwrap_or_default();
+                                    let v = JsVal::Str(
+                                        args.get(1).map(ToString::to_string).unwrap_or_default(),
+                                    );
                                     if let Some(entries) = self.maps.get_mut(idx) {
                                         entries.push((k, v));
                                     }
                                     return Ok(JsVal::Undefined);
                                 }
                                 "delete" => {
-                                    let k = args.first().map(ToString::to_string).unwrap_or_default();
+                                    let k =
+                                        args.first().map(ToString::to_string).unwrap_or_default();
                                     if let Some(entries) = self.maps.get_mut(idx) {
                                         entries.retain(|(ek, _)| ek != &k);
                                     }
@@ -3562,7 +3590,13 @@ impl VmRuntime {
                                         .get(idx)
                                         .map(|e| {
                                             e.iter()
-                                                .map(|(k, v)| format!("{}={}", pct_encode(k), pct_encode(&v.to_string())))
+                                                .map(|(k, v)| {
+                                                    format!(
+                                                        "{}={}",
+                                                        pct_encode(k),
+                                                        pct_encode(&v.to_string())
+                                                    )
+                                                })
                                                 .collect::<Vec<_>>()
                                                 .join("&")
                                         })
@@ -3572,7 +3606,10 @@ impl VmRuntime {
                                 _ => {}
                             },
                             "Date" if method == "getTime" => {
-                                return Ok(m.get("__wispTime").cloned().unwrap_or(JsVal::Number(0.0)));
+                                return Ok(m
+                                    .get("__wispTime")
+                                    .cloned()
+                                    .unwrap_or(JsVal::Number(0.0)));
                             }
                             _ => {}
                         }
@@ -3599,7 +3636,12 @@ fn norm_slice_idx(idx: isize, len: isize) -> usize {
 fn pct_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')') {
+        if b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+            )
+        {
             out.push(*b as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
@@ -3618,7 +3660,10 @@ fn pct_decode(s: &str) -> String {
             i += 1;
         } else if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(val) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            && let Ok(val) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
+                16,
+            )
         {
             out.push(val);
             i += 3;

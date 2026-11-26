@@ -245,12 +245,16 @@ fn print_assets(page: &wisp_engine::FetchedPage) {
 fn print_usage() {
     eprintln!("wisp-agent — headless Wisp engine");
     eprintln!(
-        "Usage: wisp-agent fetch <url> [--dump original|html|text|links|markdown|assets] [--width <px>] [--allow-private-network] [--stealth] [--block-trackers] [--proxy <url>]"
+        "Usage: wisp-agent fetch <url> [--dump original|html|text|links|markdown|assets] \
+         [--width <px>] [--allow-private-network] [--stealth] [--block-trackers] [--proxy <url>]"
     );
     eprintln!(
-        "       wisp-agent screenshot <url> [--width <px>] [--out <png>] [--allow-private-network] [--stealth] [--block-trackers] [--proxy <url>]"
+        "       wisp-agent screenshot <url> [--width <px>] [--out <png>] \
+         [--allow-private-network] [--stealth] [--block-trackers] [--proxy <url>]"
     );
     eprintln!(
-        "       wisp-agent serve [--port <n>] [--allow-private-network] [--stealth] [--block-trackers] [--proxy <url>] [--workers <n>] [--worker-max-rss <mb>] [--worker-max-age <s>] [--worker-drain-timeout <s>]"
+        "       wisp-agent serve [--port <n>] [--allow-private-network] [--stealth] \
+         [--block-trackers] [--proxy <url>] [--workers <n>] [--worker-max-rss <mb>] \
+         [--worker-max-age <s>] [--worker-drain-timeout <s>]"
     );
 }

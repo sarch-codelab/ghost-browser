@@ -1941,7 +1941,11 @@ fn layout_roots_with_geometry(
     })
 }
 
-fn collect_preorder_node_ids(node: NodeRef<'_, Node>, next_idx: &mut usize, out: &mut HashMap<NodeId, usize>) {
+fn collect_preorder_node_ids(
+    node: NodeRef<'_, Node>,
+    next_idx: &mut usize,
+    out: &mut HashMap<NodeId, usize>,
+) {
     if matches!(node.value(), Node::Element(_)) {
         out.insert(node.id(), *next_idx);
         *next_idx += 1;

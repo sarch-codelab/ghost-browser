@@ -871,6 +871,7 @@ fn handle_cdp(state: &Arc<Mutex<State>>, tab_id: u64, body: &Value) -> Value {
     let params = body.get("params").cloned().unwrap_or_else(|| json!({}));
     let mut s = lock(state);
     let options = s.options.clone();
+    let ua = wisp_engine::wisp_net::StealthProfile::for_policy(&options.policy).user_agent;
     match method {
         "Browser.getVersion" => json!({
             "ok": true,
@@ -878,7 +879,7 @@ fn handle_cdp(state: &Arc<Mutex<State>>, tab_id: u64, body: &Value) -> Value {
                 "protocolVersion": "1.3",
                 "product": format!("Wisp/{}", env!("CARGO_PKG_VERSION")),
                 "revision": "@wisp",
-                "userAgent": wisp_engine::wisp_net::StealthProfile::for_policy(&options.policy).user_agent,
+                "userAgent": ua,
                 "jsVersion": "wisp-vm/1.0",
             }
         }),
@@ -957,7 +958,10 @@ fn handle_cdp(state: &Arc<Mutex<State>>, tab_id: u64, body: &Value) -> Value {
 
 fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, options: &FetchOptions) -> Value {
     match method {
-        "Page.enable" | "DOM.enable" | "Page.setLifecycleEventsEnabled" | "Emulation.setDeviceMetricsOverride" => {
+        "Page.enable"
+        | "DOM.enable"
+        | "Page.setLifecycleEventsEnabled"
+        | "Emulation.setDeviceMetricsOverride" => {
             json!({"ok": true, "result": {}})
         }
         "Page.getFrameTree" => json!({
@@ -1495,14 +1499,19 @@ fn handle_cdp_discovery(request: &control::Request, state: &Arc<Mutex<State>>) -
                 .tabs
                 .iter()
                 .map(|t| {
+                    let ws_url = format!("ws://127.0.0.1:{port}/devtools/page/wisp-{}", t.id);
+                    let frontend = format!(
+                        "/devtools/inspector.html?ws=127.0.0.1:{port}/devtools/page/wisp-{}",
+                        t.id
+                    );
                     json!({
                         "description": "",
-                        "devtoolsFrontendUrl": format!("/devtools/inspector.html?ws=127.0.0.1:{port}/devtools/page/wisp-{}", t.id),
+                        "devtoolsFrontendUrl": frontend,
                         "id": format!("wisp-{}", t.id),
                         "title": t.title,
                         "type": "page",
                         "url": t.url,
-                        "webSocketDebuggerUrl": format!("ws://127.0.0.1:{port}/devtools/page/wisp-{}", t.id),
+                        "webSocketDebuggerUrl": ws_url,
                     })
                 })
                 .collect();
@@ -1673,11 +1682,15 @@ fn serve_ws_cdp(mut stream: TcpStream, state: Arc<Mutex<State>>, tab_hint: Optio
                         "result": resp.get("result").cloned().unwrap_or_else(|| json!({})),
                     })
                 } else {
+                    let msg = resp
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("CDP error");
                     json!({
                         "id": id,
                         "error": {
                             "code": -32000,
-                            "message": resp.get("error").and_then(Value::as_str).unwrap_or("CDP error"),
+                            "message": msg,
                         }
                     })
                 };
@@ -1758,10 +1771,7 @@ mod tests {
         let list = handle_cdp_discovery(&list_req, &state).expect("list");
         let arr = list.as_array().expect("array");
         assert_eq!(arr.len(), 1);
-        assert_eq!(
-            arr[0]["webSocketDebuggerUrl"],
-            "ws://127.0.0.1:49123/devtools/page/wisp-1"
-        );
+        assert_eq!(arr[0]["webSocketDebuggerUrl"], "ws://127.0.0.1:49123/devtools/page/wisp-1");
     }
 
     #[test]
@@ -1813,11 +1823,16 @@ mod tests {
         });
 
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        client
-            .write_all(
-                b"GET /devtools/page/wisp-1 HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
-            )
-            .unwrap();
+        let req_bytes = concat!(
+            "GET /devtools/page/wisp-1 HTTP/1.1\r\n",
+            "Host: 127.0.0.1\r\n",
+            "Upgrade: websocket\r\n",
+            "Connection: Upgrade\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .as_bytes();
+        client.write_all(req_bytes).unwrap();
         let mut resp_buf = [0u8; 512];
         let mut total = 0;
         while !resp_buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {

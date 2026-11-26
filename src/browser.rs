@@ -774,7 +774,9 @@ impl Browser {
                     }
                 });
             if let Err(error) = spawn {
-                log::error!("No se pudo iniciar la carga de Wisp para la pestaña {tab_id}: {error}");
+                log::error!(
+                    "No se pudo iniciar la carga de Wisp para la pestaña {tab_id}: {error}"
+                );
                 self.deliver_wisp_result(
                     tab_id,
                     request_id,
