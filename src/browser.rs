@@ -1799,31 +1799,21 @@ impl Browser {
                 json!({"ok": true})
             }
             Route::Text(tab_id) => self.remote_tab_text(tab_id, reply.clone())?,
-            Route::Snapshot(tab_id) => {
-                let body = &request.body;
-                self.remote_tab_snapshot(tab_id, body, reply.clone())?
-            }
+            Route::Snapshot(tab_id) => self.remote_snapshot(tab_id, &request.body, reply.clone())?,
             Route::Click(tab_id) => {
-                let is_wisp = self
-                    .tab_by_id(tab_id)
-                    .is_some_and(|t| t.engine == BrowserEngine::Wisp);
-                if is_wisp {
+                if self.is_wisp_tab(tab_id) {
                     self.remote_wisp_click(tab_id, &request.body)
                 } else {
                     self.remote_input(tab_id, "click", &request.body)
                 }
             }
-            Route::Fill(tab_id) | Route::SelectOption(tab_id) => {
-                self.remote_tab_fill(tab_id, &request.body)
-            }
+            Route::Fill(tab_id) => self.remote_fill(tab_id, &request.body),
+            Route::SelectOption(tab_id) => self.remote_fill(tab_id, &request.body),
             Route::Type(tab_id) => self.remote_input(tab_id, "type", &request.body),
             Route::Press(tab_id) => self.remote_input(tab_id, "press", &request.body),
             Route::Scroll(tab_id) => self.remote_input(tab_id, "scroll", &request.body),
             Route::Move(tab_id) => {
-                let is_wisp = self
-                    .tab_by_id(tab_id)
-                    .is_some_and(|t| t.engine == BrowserEngine::Wisp);
-                if is_wisp {
+                if self.is_wisp_tab(tab_id) {
                     self.remote_wisp_move(tab_id, &request.body)
                 } else {
                     self.remote_input(tab_id, "move", &request.body)
@@ -1931,18 +1921,45 @@ impl Browser {
         }
     }
 
-    fn remote_tab_snapshot(
+    fn is_wisp_tab(&self, tab_id: u64) -> bool {
+        match self.tab_by_id(tab_id) {
+            Some(t) => t.engine == BrowserEngine::Wisp,
+            None => false,
+        }
+    }
+
+    fn apply_wisp_mutated_html(&mut self, tab_id: u64, mutated: Option<String>) {
+        let Some(mutated) = mutated else {
+            return;
+        };
+        let Some(tab) = self.tab_by_id_mut(tab_id) else {
+            return;
+        };
+        if let Some(old_page) = tab.wisp_html.take() {
+            tab.wisp_html = Some(wisp_engine::FetchedPage::new(
+                old_page.final_url,
+                old_page.title,
+                mutated,
+                old_page.stylesheets,
+                old_page.external_scripts,
+                old_page.module_scripts,
+                old_page.images,
+                old_page.warnings,
+            ));
+        }
+    }
+
+    fn remote_snapshot(
         &mut self,
         tab_id: u64,
         body: &serde_json::Value,
         reply: Sender<serde_json::Value>,
     ) -> Option<serde_json::Value> {
         use serde_json::json;
-        let width = body
-            .get("width")
-            .and_then(|v| v.as_f64())
-            .map(|w| w as f32)
-            .unwrap_or(1280.0);
+        let width = match body.get("width").and_then(|v| v.as_f64()) {
+            Some(w) => w as f32,
+            None => 1280.0,
+        };
         let Some(tab) = self.tab_by_id(tab_id) else {
             return Some(json!({"ok": false, "error": "pestaña no encontrada"}));
         };
@@ -1965,8 +1982,16 @@ impl Browser {
         }
         let eval_id = self.next_remote_eval_id;
         self.next_remote_eval_id += 1;
-        let js = "(function(){var list=Array.from(document.querySelectorAll('a[href],button,input,select,textarea,h1,h2,h3,[role=button],[role=link]'));return JSON.stringify({url:location.href,title:document.title,refs:list.map(function(el,i){var r=el.getBoundingClientRect();return{ref:'@e'+(i+1),tag:el.tagName.toLowerCase(),text:(el.getAttribute('aria-label')||el.innerText||el.placeholder||el.value||'').trim(),href:el.getAttribute('href'),name:el.getAttribute('name')||el.id||null,rect:{x:r.x,y:r.y,width:r.width,height:r.height}}})});})()";
-        let wrapped = remote_eval_script(eval_id, js);
+        const SNAPSHOT_JS: &str = "(function(){var list=Array.from(document.querySelectorAll(\
+            'a[href],button,input,select,textarea,h1,h2,h3,[role=button],[role=link]'));\
+            return JSON.stringify({url:location.href,title:document.title,\
+            refs:list.map(function(el,i){var r=el.getBoundingClientRect();\
+            return{ref:'@e'+(i+1),tag:el.tagName.toLowerCase(),\
+            text:(el.getAttribute('aria-label')||el.innerText||el.placeholder\
+            ||el.value||'').trim(),href:el.getAttribute('href'),\
+            name:el.getAttribute('name')||el.id||null,\
+            rect:{x:r.x,y:r.y,width:r.width,height:r.height}}})});})()";
+        let wrapped = remote_eval_script(eval_id, SNAPSHOT_JS);
         let delivered = self
             .tab_by_id(tab_id)
             .and_then(|t| t.webview.as_ref())
@@ -2040,15 +2065,15 @@ impl Browser {
             return json!({"ok": false, "error": "move necesita 'x' e 'y'"});
         };
         match page.hit_test(x as f32, y as f32) {
-            Ok(target) => json!({
-                "ok": true,
-                "target": target.map(|t| json!({"href": t.href, "url": t.url, "text": t.text}))
-            }),
+            Ok(target) => {
+                let t = target.map(|t| json!({"href": t.href, "url": t.url, "text": t.text}));
+                json!({"ok": true, "target": t})
+            }
             Err(error) => json!({"ok": false, "error": error.to_string()}),
         }
     }
 
-    fn remote_tab_fill(&mut self, tab_id: u64, body: &serde_json::Value) -> serde_json::Value {
+    fn remote_fill(&mut self, tab_id: u64, body: &serde_json::Value) -> serde_json::Value {
         use serde_json::json;
         let value = body.get("value").and_then(|v| v.as_str()).unwrap_or("");
         let ref_id = body.get("ref").and_then(|v| v.as_str());
@@ -2074,21 +2099,7 @@ impl Browser {
             let js = fill_by_name_js(&field_name, value);
             let out = match page.eval_js(&js) {
                 Ok(res) => {
-                    if let Some(mutated) = res.html
-                        && let Some(tab_mut) = self.tab_by_id_mut(tab_id)
-                        && let Some(old_page) = tab_mut.wisp_html.take()
-                    {
-                        tab_mut.wisp_html = Some(wisp_engine::FetchedPage::new(
-                            old_page.final_url,
-                            old_page.title,
-                            mutated,
-                            old_page.stylesheets,
-                            old_page.external_scripts,
-                            old_page.module_scripts,
-                            old_page.images,
-                            old_page.warnings,
-                        ));
-                    }
+                    self.apply_wisp_mutated_html(tab_id, res.html);
                     json!({"ok": true, "field": field_name, "value": value})
                 }
                 Err(error) => json!({"ok": false, "error": error.to_string()}),
