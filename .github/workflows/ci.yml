@@ -51,7 +51,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev gdb
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -64,34 +64,16 @@ jobs:
           key: ${{ runner.os }}-root-cargo-${{ hashFiles('Cargo.lock', 'wisp/Cargo.lock') }}
 
       - name: Check formatting (root)
-        run: |
-          if ! out=$(cargo fmt --all -- --check 2>&1); then
-            python3 -c 'import sys; txt=sys.stdin.read(); print("::error::" + txt.replace("\n", " | ")[:3500])' <<< "$out"
-            exit 1
-          fi
+        run: cargo fmt --all -- --check
 
       - name: Clippy (root)
-        run: |
-          if ! out=$(cargo clippy --all-targets --all-features --message-format=short -- -D warnings 2>&1); then
-            python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | "); txt=txt[-14000:]; [print("::error::" + txt[i:i+3500]) for i in range(0, len(txt), 3500)]' <<< "$out"
-            exit 1
-          fi
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build (root)
         run: cargo build --release --locked
 
       - name: Run tests (root)
-        run: |
-          if ! out=$(RUST_BACKTRACE=1 cargo test --locked 2>&1); then
-            bin=$(find target/debug -maxdepth 5 -type f -executable -name 'ghost-*' ! -name '*.so' | head -n1 || true)
-            bt=""
-            if [ -n "$bin" ]; then
-              bt=$(gdb -batch -ex "run" -ex "thread apply all bt" "$bin" 2>&1 | tail -n 80 || true)
-            fi
-            msg=$(python3 -c 'import sys; print(sys.stdin.read().replace("\n"," | ")[-3500:])' <<< "BIN=$bin | OUT=${out: -1500} | BT=$bt")
-            echo "::error::$msg"
-            exit 1
-          fi
+        run: cargo test --locked
 
   wisp-windows:
     name: Wisp (Windows)
@@ -279,32 +261,18 @@ jobs:
           fi
 
       - name: Check formatting (wisp)
-        run: |
-          if ! out=$(cargo fmt --manifest-path wisp/Cargo.toml --all -- --check 2>&1); then
-            python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | "); [print("::error::" + txt[i:i+3500]) for i in range(0, min(len(txt), 14000), 3500)]' <<< "$out"
-            exit 1
-          fi
+        run: cargo fmt --manifest-path wisp/Cargo.toml --all -- --check
 
       - name: Clippy (wisp)
         run: |
-          if ! out=$(cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --message-format=short -- -D warnings 2>&1); then
-            python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | "); txt=txt[-14000:]; [print("::error::" + txt[i:i+3500]) for i in range(0, len(txt), 3500)]' <<< "$out"
-            exit 1
-          fi
-          if ! out=$(cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features --message-format=short -- -D warnings 2>&1); then
-            python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | "); txt=txt[-14000:]; [print("::error::" + txt[i:i+3500]) for i in range(0, len(txt), 3500)]' <<< "$out"
-            exit 1
-          fi
+          cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features -- -D warnings
 
       - name: Build (wisp)
         run: cargo build --manifest-path wisp/Cargo.toml --workspace --release --locked
 
       - name: Run tests (wisp)
-        run: |
-          if ! out=$(cargo test --manifest-path wisp/Cargo.toml --workspace --locked 2>&1); then
-            python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | ")[-3500:]; print("::error::" + txt)' <<< "$out"
-            exit 1
-          fi
+        run: cargo test --manifest-path wisp/Cargo.toml --workspace --locked
 
       - name: Smoke E2E & Benchmarks (Linux)
         run: |
