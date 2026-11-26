@@ -71,7 +71,11 @@ jobs:
           fi
 
       - name: Clippy (root)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: |
+          if ! out=$(cargo clippy --all-targets --all-features --message-format=short -- -D warnings 2>&1); then
+            python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | "); txt=txt[-14000:]; [print("::error::" + txt[i:i+3500]) for i in range(0, len(txt), 3500)]' <<< "$out"
+            exit 1
+          fi
 
       - name: Build (root)
         run: cargo build --release --locked
@@ -264,7 +268,15 @@ jobs:
           fi
 
       - name: Clippy (wisp)
-        run: cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+        run: |
+          if ! out=$(cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --message-format=short -- -D warnings 2>&1); then
+            python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | "); txt=txt[-14000:]; [print("::error::" + txt[i:i+3500]) for i in range(0, len(txt), 3500)]' <<< "$out"
+            exit 1
+          fi
+          if ! out=$(cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features --message-format=short -- -D warnings 2>&1); then
+            python3 -c 'import sys; txt=sys.stdin.read().replace("\n"," | "); txt=txt[-14000:]; [print("::error::" + txt[i:i+3500]) for i in range(0, len(txt), 3500)]' <<< "$out"
+            exit 1
+          fi
 
       - name: Build (wisp)
         run: cargo build --manifest-path wisp/Cargo.toml --workspace --release --locked
