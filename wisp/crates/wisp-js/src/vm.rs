@@ -1452,11 +1452,7 @@ impl VmRuntime {
         let toks = tokenize(src)?;
         let stmts = Parser::new(toks).parse_program()?;
         let base_fn_id = self.functions.len();
-        let mut compiler = Compiler {
-            functions: Vec::new(),
-            fn_names: HashMap::new(),
-            loops: Vec::new(),
-        };
+        let mut compiler = Compiler::new();
         let mut main_code = compiler.compile_program(&stmts);
         if base_fn_id > 0 {
             remap_fn_ids(&mut main_code, base_fn_id);
@@ -1568,7 +1564,7 @@ impl VmRuntime {
                         let split = stack.len().saturating_sub(n * 2);
                         let raw = stack.split_off(split);
                         let mut map = HashMap::new();
-                        for pair in raw.chunks_exact(2) {
+                        for pair in raw.as_chunks::<2>().0 {
                             map.insert(pair[0].to_string(), pair[1].clone());
                         }
                         let obj = self.alloc_object(map);
