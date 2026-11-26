@@ -1,0 +1,92 @@
+/* Wisp User-Agent Stylesheet (extracted from struct Style defaults) */
+
+html, body, div, main, section, article, header, footer, nav, aside,
+p, h1, h2, h3, h4, h5, h6, ul, ol, li, blockquote, pre, hr, form,
+fieldset, figure, figcaption, dl, dt, dd, address, table {
+  display: block;
+}
+
+head, script, style, title, meta, link {
+  display: none;
+}
+
+body {
+  margin: 8px;
+}
+
+p {
+  margin-bottom: 16px;
+}
+
+h1 {
+  font-size: 32px;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+
+h2 {
+  font-size: 24px;
+  font-weight: 700;
+  margin-bottom: 10px;
+}
+
+h3 {
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 8px;
+}
+
+h4 {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+h5 {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+h6 {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+li {
+  margin-bottom: 4px;
+}
+
+ul {
+  padding-left: 40px;
+  margin-top: 16px;
+  margin-bottom: 16px;
+  list-style-type: disc;
+}
+
+ol {
+  padding-left: 40px;
+  margin-top: 16px;
+  margin-bottom: 16px;
+  list-style-type: decimal;
+}
+
+b, strong {
+  font-weight: 700;
+}
+
+pre {
+  white-space: pre;
+  margin-bottom: 12px;
+}
+
+hr {
+  border-top-width: 1px;
+  border-top-style: solid;
+  border-top-color: #c8c8c8;
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+a {
+  color: #0066cc;
+  text-decoration: underline;
+}

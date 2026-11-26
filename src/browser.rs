@@ -1767,11 +1767,76 @@ impl Browser {
                 json!({"ok": true})
             }
             Route::Text(tab_id) => self.remote_tab_text(tab_id, reply.clone())?,
-            Route::Click(tab_id) => self.remote_input(tab_id, "click", &request.body),
+            Route::Snapshot(tab_id) => self.remote_tab_snapshot(tab_id, &request.body, reply.clone())?,
+            Route::Click(tab_id) => {
+                if self
+                    .tab_by_id(tab_id)
+                    .is_some_and(|t| t.engine == BrowserEngine::Wisp)
+                {
+                    self.remote_wisp_click(tab_id, &request.body)
+                } else {
+                    self.remote_input(tab_id, "click", &request.body)
+                }
+            }
+            Route::Fill(tab_id) | Route::SelectOption(tab_id) => {
+                self.remote_tab_fill(tab_id, &request.body)
+            }
             Route::Type(tab_id) => self.remote_input(tab_id, "type", &request.body),
             Route::Press(tab_id) => self.remote_input(tab_id, "press", &request.body),
             Route::Scroll(tab_id) => self.remote_input(tab_id, "scroll", &request.body),
-            Route::Move(tab_id) => self.remote_input(tab_id, "move", &request.body),
+            Route::Move(tab_id) => {
+                if self
+                    .tab_by_id(tab_id)
+                    .is_some_and(|t| t.engine == BrowserEngine::Wisp)
+                {
+                    self.remote_wisp_move(tab_id, &request.body)
+                } else {
+                    self.remote_input(tab_id, "move", &request.body)
+                }
+            }
+            Route::WaitFor(tab_id) => {
+                let text = request.body.get("text").and_then(|v| v.as_str());
+                let Some(tab) = self.tab_by_id(tab_id) else {
+                    return Some(json!({"ok": false, "error": "pestaña no encontrada"}));
+                };
+                if let (Some(needle), Some(page)) = (text, tab.wisp_html.as_ref()) {
+                    let hay = page.reader_text().unwrap_or_default();
+                    let found = hay.contains(needle) || page.html.contains(needle);
+                    json!({"ok": found, "matched": found, "text": needle})
+                } else {
+                    json!({"ok": true, "ready": !tab.loading})
+                }
+            }
+            Route::NetworkRequests(tab_id) => {
+                if self.tab_by_id(tab_id).is_none() {
+                    json!({"ok": false, "error": "pestaña no encontrada"})
+                } else {
+                    json!({"ok": true, "requests": []})
+                }
+            }
+            Route::ConsoleMessages(tab_id) => {
+                let Some(tab) = self.tab_by_id(tab_id) else {
+                    return Some(json!({"ok": false, "error": "pestaña no encontrada"}));
+                };
+                let messages: Vec<serde_json::Value> = tab
+                    .wisp_html
+                    .as_ref()
+                    .map(|p| {
+                        p.warnings
+                            .iter()
+                            .map(|w| json!({"level": "warning", "text": w}))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                json!({"ok": true, "messages": messages})
+            }
+            Route::Events(tab_id) => {
+                if self.tab_by_id(tab_id).is_none() {
+                    json!({"ok": false, "error": "pestaña no encontrada"})
+                } else {
+                    json!({"ok": true, "events": []})
+                }
+            }
             _ => json!({"ok": false, "error": "ruta desconocida"}),
         })
     }
@@ -1835,17 +1900,224 @@ impl Browser {
         }
     }
 
-    /// Evalúa JS en una pestaña WebView2 y devuelve el resultado por `done`.
+    fn remote_tab_snapshot(
+        &mut self,
+        tab_id: u64,
+        body: &serde_json::Value,
+        reply: Sender<serde_json::Value>,
+    ) -> Option<serde_json::Value> {
+        use serde_json::json;
+        let width = body
+            .get("width")
+            .and_then(|v| v.as_f64())
+            .map(|w| w as f32)
+            .unwrap_or(1280.0);
+        let Some(tab) = self.tab_by_id(tab_id) else {
+            return Some(json!({"ok": false, "error": "pestaña no encontrada"}));
+        };
+        if tab.engine == BrowserEngine::Wisp {
+            if let Some(page) = tab.wisp_html.as_ref() {
+                return Some(match page.snapshot(width) {
+                    Ok(snap) => {
+                        let mut val = snap.to_json();
+                        val["ok"] = json!(true);
+                        val
+                    }
+                    Err(error) => json!({"ok": false, "error": error.to_string()}),
+                });
+            }
+            return Some(json!({"ok": false, "error": "la pestaña Wisp aún no tiene página"}));
+        }
+        if tab.webview.is_none() {
+            return Some(json!({"ok": false, "error": "pestaña sin motor activo"}));
+        }
+        let eval_id = self.next_remote_eval_id;
+        self.next_remote_eval_id += 1;
+        let js = "(function(){var list=Array.from(document.querySelectorAll('a[href],button,input,select,textarea,h1,h2,h3,[role=button],[role=link]'));return JSON.stringify({url:location.href,title:document.title,refs:list.map(function(el,i){var r=el.getBoundingClientRect();return{ref:'@e'+(i+1),tag:el.tagName.toLowerCase(),text:(el.getAttribute('aria-label')||el.innerText||el.placeholder||el.value||'').trim(),href:el.getAttribute('href'),name:el.getAttribute('name')||el.id||null,rect:{x:r.x,y:r.y,width:r.width,height:r.height}}})});})()";
+        let wrapped = remote_eval_script(eval_id, js);
+        let delivered = self
+            .tab_by_id(tab_id)
+            .and_then(|t| t.webview.as_ref())
+            .is_some_and(|webview| webview.evaluate_script(&wrapped).is_ok());
+        if delivered {
+            if self.pending_remote_evals.len() >= MAX_PENDING_REMOTE_EVALS {
+                self.pending_remote_evals.clear();
+            }
+            self.pending_remote_evals.insert(eval_id, reply);
+            None
+        } else {
+            Some(json!({"ok": false, "error": "no se pudo evaluar snapshot en WebView2"}))
+        }
+    }
+
+    fn remote_wisp_click(&mut self, tab_id: u64, body: &serde_json::Value) -> serde_json::Value {
+        use serde_json::json;
+        let Some(tab) = self.tab_by_id(tab_id) else {
+            return json!({"ok": false, "error": "pestaña no encontrada"});
+        };
+        let Some(page) = tab.wisp_html.as_ref() else {
+            return json!({"ok": false, "error": "la pestaña Wisp aún no tiene página"});
+        };
+        if let Some(ref_id) = body.get("ref").and_then(|v| v.as_str()) {
+            let snap = match page.snapshot(1280.0) {
+                Ok(snap) => snap,
+                Err(error) => return json!({"ok": false, "error": error.to_string()}),
+            };
+            let Some(el) = snap.find_ref(ref_id).cloned() else {
+                return json!({"ok": false, "error": format!("referencia `{ref_id}` no encontrada")});
+            };
+            if let Some(url) = el.url.clone() {
+                self.navigate_tab_by_id(tab_id, &url);
+                return json!({"ok": true, "url": url, "target": el.to_json()});
+            }
+            return json!({"ok": true, "target": el.to_json()});
+        }
+        let (Some(x), Some(y)) = (
+            body.get("x").and_then(|v| v.as_f64()),
+            body.get("y").and_then(|v| v.as_f64()),
+        ) else {
+            return json!({"ok": false, "error": "click necesita 'ref' o ('x' e 'y')"});
+        };
+        match page.hit_test(x as f32, y as f32) {
+            Ok(Some(target)) => {
+                let target_url = target.url.clone();
+                let info = json!({"href": target.href, "url": target.url, "text": target.text});
+                if let Some(url) = target_url {
+                    self.navigate_tab_by_id(tab_id, &url);
+                    json!({"ok": true, "url": url, "target": info})
+                } else {
+                    json!({"ok": true, "target": info})
+                }
+            }
+            Ok(None) => json!({"ok": true, "target": serde_json::Value::Null}),
+            Err(error) => json!({"ok": false, "error": error.to_string()}),
+        }
+    }
+
+    fn remote_wisp_move(&self, tab_id: u64, body: &serde_json::Value) -> serde_json::Value {
+        use serde_json::json;
+        let Some(tab) = self.tab_by_id(tab_id) else {
+            return json!({"ok": false, "error": "pestaña no encontrada"});
+        };
+        let Some(page) = tab.wisp_html.as_ref() else {
+            return json!({"ok": false, "error": "la pestaña Wisp aún no tiene página"});
+        };
+        let (Some(x), Some(y)) = (
+            body.get("x").and_then(|v| v.as_f64()),
+            body.get("y").and_then(|v| v.as_f64()),
+        ) else {
+            return json!({"ok": false, "error": "move necesita 'x' e 'y'"});
+        };
+        match page.hit_test(x as f32, y as f32) {
+            Ok(target) => json!({
+                "ok": true,
+                "target": target.map(|t| json!({"href": t.href, "url": t.url, "text": t.text}))
+            }),
+            Err(error) => json!({"ok": false, "error": error.to_string()}),
+        }
+    }
+
+    fn remote_tab_fill(&mut self, tab_id: u64, body: &serde_json::Value) -> serde_json::Value {
+        use serde_json::json;
+        let value = body.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        let ref_id = body.get("ref").and_then(|v| v.as_str());
+        let name = body.get("name").and_then(|v| v.as_str());
+        let Some(tab) = self.tab_by_id(tab_id) else {
+            return json!({"ok": false, "error": "pestaña no encontrada"});
+        };
+        if tab.engine == BrowserEngine::Wisp {
+            let Some(page) = tab.wisp_html.as_ref() else {
+                return json!({"ok": false, "error": "la pestaña Wisp aún no tiene página"});
+            };
+            let field_name = if let Some(ref_id) = ref_id {
+                let Ok(snap) = page.snapshot(1280.0) else {
+                    return json!({"ok": false, "error": "no se pudo generar snapshot"});
+                };
+                snap.find_ref(ref_id).and_then(|e| e.name.clone())
+            } else {
+                name.map(str::to_owned)
+            };
+            let Some(field_name) = field_name else {
+                return json!({"ok": false, "error": "falta name/id o @ref para rellenar"});
+            };
+            let js = format!(
+                "(function(){{ var el = document.querySelector('[name=' + {} + ']') || document.getElementById({}); if (!el) return false; el.value = {}; el.setAttribute('value', {}); return true; }})()",
+                serde_json::to_string(&field_name).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(&field_name).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
+            );
+            return match page.eval_js(&js) {
+                Ok(res) => {
+                    if let Some(mutated) = res.html
+                        && let Some(tab_mut) = self.tab_by_id_mut(tab_id)
+                        && let Some(old_page) = tab_mut.wisp_html.take()
+                    {
+                        tab_mut.wisp_html = Some(wisp_engine::FetchedPage::new(
+                            old_page.final_url,
+                            old_page.title,
+                            mutated,
+                            old_page.stylesheets,
+                            old_page.external_scripts,
+                            old_page.module_scripts,
+                            old_page.images,
+                            old_page.warnings,
+                        ));
+                    }
+                    json!({"ok": true, "field": field_name, "value": value})
+                }
+                Err(error) => json!({"ok": false, "error": error.to_string()}),
+            };
+        }
+        if let Some(webview) = self.remote_webview(tab_id) {
+            let target = name.or(ref_id).unwrap_or("");
+            let js = format!(
+                "(function(){{ var el = document.querySelector('[name=' + {} + ']') || document.getElementById({}); if (el) {{ el.focus(); el.value = {}; el.dispatchEvent(new Event('input', {{bubbles:true}})); }} }})();",
+                serde_json::to_string(target).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(target).unwrap_or_else(|_| "\"\"".into()),
+                serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into()),
+            );
+            let _ = webview.evaluate_script(&js);
+            return json!({"ok": true, "field": target, "value": value});
+        }
+        json!({"ok": false, "error": "pestaña sin motor activo"})
+    }
+
+    /// Evalúa JS en una pestaña (WebView2 por IPC o Wisp vía `FetchedPage::eval_js`).
     fn start_remote_eval(&mut self, tab_id: u64, js: &str, done: Sender<serde_json::Value>) {
         use serde_json::json;
         let Some(tab) = self.tab_by_id(tab_id) else {
             let _ = done.send(json!({"ok": false, "error": "pestaña no encontrada"}));
             return;
         };
+        if tab.engine == BrowserEngine::Wisp {
+            if let Some(page) = tab.wisp_html.as_ref() {
+                let reply = match page.eval_js(js) {
+                    Ok(res) => {
+                        let mut out = json!({"ok": true, "result": res.value});
+                        if let Some(html) = res.html {
+                            out["html"] = json!(html);
+                        }
+                        if !res.warnings.is_empty() {
+                            out["warnings"] = json!(res.warnings);
+                        }
+                        out
+                    }
+                    Err(error) => json!({"ok": false, "error": error.to_string()}),
+                };
+                let _ = done.send(reply);
+            } else {
+                let _ = done.send(json!({
+                    "ok": false,
+                    "error": "la pestaña Wisp aún no tiene página cargada"
+                }));
+            }
+            return;
+        }
         if tab.engine != BrowserEngine::WebView2 || tab.webview.is_none() {
             let _ = done.send(json!({
                 "ok": false,
-                "error": "eval solo está disponible en pestañas WebView2; usa /text para Wisp"
+                "error": "pestaña sin motor activo (suspendida o nueva)"
             }));
             return;
         }

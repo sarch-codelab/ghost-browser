@@ -3819,6 +3819,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wisp-benchmark"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "wisp-engine",
+]
+
+[[package]]
 name = "wisp-cdp"
 version = "0.1.0"
 dependencies = [
@@ -3828,6 +3836,14 @@ dependencies = [
  "windows-core",
  "wry",
 ]
+
+[[package]]
+name = "wisp-css"
+version = "0.1.0"
+
+[[package]]
+name = "wisp-dom"
+version = "0.1.0"
 
 [[package]]
 name = "wisp-engine"
@@ -3843,8 +3859,13 @@ dependencies = [
  "serde_json",
  "taffy",
  "url",
+ "wisp-css",
+ "wisp-dom",
  "wisp-js",
+ "wisp-layout",
+ "wisp-net",
  "wisp-paint",
+ "wisp-style",
 ]
 
 [[package]]
@@ -3864,7 +3885,12 @@ dependencies = [
  "serde_json",
  "url",
  "wisp-idl",
+ "wisp-net",
 ]
+
+[[package]]
+name = "wisp-layout"
+version = "0.1.0"
 
 [[package]]
 name = "wisp-mcp"
@@ -3874,10 +3900,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "wisp-net"
+version = "0.1.0"
+
+[[package]]
 name = "wisp-paint"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "wisp-style"
+version = "0.1.0"
+dependencies = [
+ "wisp-css",
 ]
 
 [[package]]

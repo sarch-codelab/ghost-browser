@@ -1,0 +1,8 @@
+[package]
+name = "wisp-dom"
+version = "0.1.0"
+edition = "2024"
+description = "Wisp DOM model: Page -> Navigable -> Document, origins and document.write."
+license = "MIT"
+
+[dependencies]

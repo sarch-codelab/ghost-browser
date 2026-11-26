@@ -56,8 +56,7 @@ Incluye en el issue:
 
 ## Áreas donde más ayuda hace falta
 
-- Compatibilidad CSS/JS en Wisp (selectores, pseudo-clases, layout).
-- Acciones de entrada en la API remota (click, tipeo, scroll).
-- Screenshot/captura en la API remota.
-- Benchmarks en más escenarios (JS pesado, video, muchas pestañas WebView2).
+- Cobertura WPT y test262 en Wisp (sustituir `taffy`, `scraper`/`html5ever` y `boa_engine` por los crates propios `wisp-layout`, parser HTML propio y `wisp-js::vm`).
+- Transporte WebSocket CDP completo para conectar `puppeteer-core` / `playwright-core` contra `wisp-agent`.
+- Benchmarks reproducibles con `scripts/run-all.sh` y actualización de `WISP_RESULTS.md`.
 - Firma de código para el instalador (Azure Trusted Signing).

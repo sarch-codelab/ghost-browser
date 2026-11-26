@@ -1,0 +1,8 @@
+[package]
+name = "wisp-css"
+version = "0.1.0"
+edition = "2024"
+description = "Wisp CSS: own parser, CSSOM rules and the UA stylesheet."
+license = "MIT"
+
+[dependencies]

@@ -1,0 +1,17 @@
+# Regla de independencia de estándares web de Wisp (ítem 33).
+# Ejecutar con `cargo deny check bans` dentro de `wisp/`.
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+deny = [
+    { name = "v8", reason = "Prohibido depender de V8: usar motor JS propio wisp-js" },
+    { name = "deno_core", reason = "Prohibido depender de V8/deno_core" },
+    { name = "rquickjs", reason = "Prohibido depender de QuickJS" },
+    { name = "quickjs-sys", reason = "Prohibido depender de QuickJS" },
+    # En transición (bloques 2 y 3): descomentar al completar ítems 12, 14 y 16.
+    # { name = "taffy", reason = "Sustituido por wisp-layout (ítem 12)" },
+    # { name = "html5ever", reason = "Sustituido por parser HTML propio (ítem 14)" },
+    # { name = "boa_engine", reason = "Solo permitido temporalmente detrás de feature boa-fallback (ítem 16)" },
+]

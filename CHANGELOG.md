@@ -50,6 +50,9 @@ el proyecto usa [Versionado Semántico](https://semver.org/lang/es/).
   enlace bajo el punto. La GUI usa el mismo criterio. Las operaciones que
   necesitan foco, desplazamiento o CDP nativo (`type`, `press`, `scroll`, `cdp`)
   devuelven un error explícito en vez de fallar en silencio.
+- **Workspace completo de Wisp, SSRF y agentes unificados**: añadidos los crates `wisp-dom` (`Page -> Navigable -> Document` y orígenes), `wisp-css` (`default.css` UA + parser CSS + `var()`/`calc()`/`min()`/`max()`/`clamp()`), `wisp-style` (`StyleComputer` con buckets), `wisp-layout` (BFC/IFC/FFC/TFC + `LayoutState`), `wisp-net` (bloqueo SSRF en URL principal, redirecciones, subrecursos y `fetch()` JS + presupuestos duros) y `wisp-benchmark` (6 tracks + `scripts/run-all.sh`, `WISP_RESULTS.md` y `deny.toml`).
+- **MCP unificado, `@ref` snapshots y paridad Ghost↔`wisp-agent`**: `wisp-mcp` añade las 14 herramientas `browser_*`, `wisp-engine` genera snapshots `@e1`, `@e2`… con centralidad, `wisp-agent` incorpora dispatcher CDP headless (incl. `LP.getMarkdown`), exportación PDF 1.4 y flags `--workers`/`--allow-private-network`, y `src/browser.rs` habilita `eval`, `snapshot`, `click` por `@ref`, `move` y `fill` también en pestañas Wisp.
+- **VM JS propia y bindings WebIDL**: `wisp-js::vm` añade pipeline `lexer -> parser -> AST -> bytecode -> VM` con presupuesto de pasos, y `wisp-idl/build.rs` genera `JS_IDL_BINDINGS`.
 - **Captura en `wisp-agent`**: el motor rasteriza su lista de pintura a un PNG
   (fondos, bordes, degradados, texto y recorte) sin añadir un codificador al
   binario: el PNG se escribe con deflate «stored» y CRC/Adler-32 propios. Se

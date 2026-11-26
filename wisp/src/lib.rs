@@ -17,6 +17,7 @@ use taffy::prelude::*;
 
 /// Resultado de evaluar JavaScript contra el DOM de una página.
 pub use wisp_js::EvalResult;
+pub use {wisp_css, wisp_dom, wisp_layout, wisp_net, wisp_style};
 
 pub const MAX_DOCUMENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_STYLESHEET_BYTES: usize = 4 * 1024 * 1024;
@@ -100,12 +101,11 @@ impl std::hash::Hasher for FastHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
         let mut hash = self.0;
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            let word = u64::from_le_bytes(chunk.try_into().expect("chunk is 8 bytes"));
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for &chunk in chunks {
+            let word = u64::from_le_bytes(chunk);
             hash = (hash.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
         }
-        let rest = chunks.remainder();
         if !rest.is_empty() {
             let mut tail = [0u8; 8];
             tail[..rest.len()].copy_from_slice(rest);
@@ -133,6 +133,7 @@ impl std::hash::Hasher for FastHasher {
 
 type FastBuildHasher = std::hash::BuildHasherDefault<FastHasher>;
 type FastMap<K, V> = HashMap<K, V, FastBuildHasher>;
+type TextWidthCache = FastMap<(u32, bool), FastMap<Box<str>, f32>>;
 
 /// Horizontal advance of `text` at `font_size` pixels, kerning included.
 /// Results are memoized: word widths never depend on layout state, and the
@@ -154,8 +155,7 @@ pub fn text_width_weighted(text: &str, font_size: f32, bold: bool) -> f32 {
     // veces). Un `Mutex` global obligaba a un lock por palabra y serializaba
     // cualquier medición concurrente; `RefCell` en thread-local lo elimina.
     thread_local! {
-        static CACHE: RefCell<FastMap<(u32, bool), FastMap<Box<str>, f32>>> =
-            RefCell::new(FastMap::default());
+        static CACHE: RefCell<TextWidthCache> = RefCell::new(FastMap::default());
     }
     let key = (font_size.to_bits(), bold);
     let cached = CACHE.with(|cache| {
@@ -275,6 +275,7 @@ pub struct FetchedPage {
     /// ancho, así que un redimensionado solo reevalúa CSS y conversión, nunca
     /// el JavaScript.
     prepared: Arc<Mutex<HashMap<u32, Arc<PreparedDocument>>>>,
+    network_policy: wisp_net::NetworkPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -338,6 +339,7 @@ impl FetchedPage {
             warnings,
             scripted: Arc::new(OnceLock::new()),
             prepared: Arc::new(Mutex::new(HashMap::new())),
+            network_policy: wisp_net::NetworkPolicy::allow_private(),
         }
     }
 
@@ -363,12 +365,13 @@ impl FetchedPage {
         self.scripted
             .get_or_init(|| {
                 let document = Html::parse_document(&self.html);
-                let script_result = wisp_js::execute_scripts(
+                let script_result = wisp_js::execute_scripts_with_policy(
                     &document,
                     &self.external_scripts,
                     &self.module_scripts,
                     Some(&self.final_url),
                     SCRIPT_VIEWPORT_WIDTH,
+                    &self.network_policy,
                 )
                 .map_err(|error| error.to_string())?;
                 Ok(ScriptedDocument {
@@ -465,7 +468,13 @@ impl FetchedPage {
     /// sobreviven a la siguiente llamada.
     pub fn eval_js(&self, source: &str) -> Result<EvalResult> {
         let html = self.document_html().unwrap_or_else(|_| self.html.clone());
-        wisp_js::evaluate_expression(&html, Some(&self.final_url), SCRIPT_VIEWPORT_WIDTH, source)
+        wisp_js::evaluate_expression_with_policy(
+            &html,
+            Some(&self.final_url),
+            SCRIPT_VIEWPORT_WIDTH,
+            source,
+            &self.network_policy,
+        )
     }
 
     /// Enlace cuyo área pintada contiene el punto (`x`, `y`) en coordenadas CSS
@@ -533,6 +542,280 @@ impl FetchedPage {
         }
         Ok(trim_markdown(out))
     }
+
+    /// Modelo `Page -> Navigable -> Document` (ítem 8) derivado de la página.
+    pub fn to_page(&self) -> wisp_dom::Page {
+        let html = self.document_html().unwrap_or_else(|_| self.html.clone());
+        wisp_dom::Page::load(&self.final_url, &html)
+    }
+
+    /// Origen del documento según su URL final.
+    pub fn origin(&self) -> wisp_dom::Origin {
+        wisp_dom::Origin::from_url(&self.final_url)
+    }
+
+    /// Snapshot accesible con referencias estables `@e1`, `@e2`... y métrica de
+    /// centralidad para agentes (ítem 22).
+    pub fn snapshot(&self, viewport_width: f32) -> Result<PageSnapshot> {
+        let html = self.document_html().unwrap_or_else(|_| self.html.clone());
+        let document = self.layout(viewport_width)?;
+        let parsed = Html::parse_document(&html);
+        let base = url::Url::parse(&self.final_url).ok();
+
+        // Rectángulos de texto/imagen con `href` obtenidos del paint list.
+        let mut link_rects: Vec<(String, Rect)> = Vec::new();
+        for command in &document.commands {
+            match command {
+                PaintCommand::Text {
+                    x,
+                    y,
+                    content,
+                    font_size,
+                    font_weight,
+                    href: Some(href),
+                    ..
+                } => {
+                    link_rects.push((
+                        href.clone(),
+                        Rect {
+                            x: *x,
+                            y: *y,
+                            width: text_width_weighted(
+                                content,
+                                *font_size,
+                                is_bold_weight(*font_weight),
+                            ),
+                            height: text_line_height(*font_size),
+                        },
+                    ));
+                }
+                PaintCommand::Image {
+                    rect,
+                    href: Some(href),
+                    ..
+                } => link_rects.push((href.clone(), *rect)),
+                _ => {}
+            }
+        }
+
+        let selector = Selector::parse(
+            "a[href], button, input, select, textarea, h1, h2, h3, [role=\"button\"], [role=\"link\"]",
+        )
+        .map_err(|error| anyhow::anyhow!("selector inválido en snapshot: {error}"))?;
+
+        let mut elements = Vec::new();
+        let center_x = viewport_width / 2.0;
+        let center_y = 400.0;
+
+        for (idx, el) in parsed.select(&selector).enumerate() {
+            let tag = el.value().name().to_ascii_lowercase();
+            let input_type = el
+                .value()
+                .attr("type")
+                .map(|s| s.trim().to_ascii_lowercase());
+            if tag == "input" && input_type.as_deref() == Some("hidden") {
+                continue;
+            }
+            let role = snapshot_role(&tag, el.value().attr("role"), input_type.as_deref());
+            let href = el.value().attr("href").map(str::to_owned);
+            let url = href.as_deref().and_then(|h| {
+                base.as_ref()
+                    .and_then(|b| b.join(h).ok())
+                    .filter(|u| matches!(u.scheme(), "http" | "https"))
+                    .map(|u| u.to_string())
+            });
+            let text_content = el
+                .text()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let accessible_text = el
+                .value()
+                .attr("aria-label")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or_else(|| (!text_content.is_empty()).then_some(text_content))
+                .or_else(|| {
+                    el.value()
+                        .attr("placeholder")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                })
+                .or_else(|| {
+                    el.value()
+                        .attr("value")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                })
+                .or_else(|| {
+                    el.value()
+                        .attr("name")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+
+            let rect = href.as_deref().and_then(|raw_href| {
+                link_rects
+                    .iter()
+                    .find(|(h, _)| h == raw_href)
+                    .map(|(_, rect)| *rect)
+            });
+
+            let centrality = compute_centrality(
+                &role,
+                rect,
+                center_x,
+                center_y,
+                viewport_width,
+                idx,
+            );
+
+            elements.push(SnapshotElement {
+                ref_id: format!("@e{}", elements.len() + 1),
+                role,
+                tag,
+                text: accessible_text,
+                href,
+                url,
+                name: el
+                    .value()
+                    .attr("name")
+                    .or_else(|| el.value().attr("id"))
+                    .map(str::to_owned),
+                input_type,
+                value: el.value().attr("value").map(str::to_owned),
+                rect,
+                centrality,
+            });
+        }
+
+        Ok(PageSnapshot {
+            url: self.final_url.clone(),
+            title: self.title.clone(),
+            elements,
+            text_preview: self.reader_text().unwrap_or_default(),
+        })
+    }
+}
+
+/// Elemento interactivo o estructural dentro de [`PageSnapshot`].
+#[derive(Clone, Debug)]
+pub struct SnapshotElement {
+    pub ref_id: String,
+    pub role: String,
+    pub tag: String,
+    pub text: String,
+    pub href: Option<String>,
+    pub url: Option<String>,
+    pub name: Option<String>,
+    pub input_type: Option<String>,
+    pub value: Option<String>,
+    pub rect: Option<Rect>,
+    pub centrality: f32,
+}
+
+impl SnapshotElement {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ref": self.ref_id,
+            "role": self.role,
+            "tag": self.tag,
+            "text": self.text,
+            "href": self.href,
+            "url": self.url,
+            "name": self.name,
+            "type": self.input_type,
+            "value": self.value,
+            "rect": self.rect,
+            "centrality": self.centrality,
+        })
+    }
+}
+
+/// Snapshot accesible de una página con referencias estables `@e1`, `@e2`...
+#[derive(Clone, Debug)]
+pub struct PageSnapshot {
+    pub url: String,
+    pub title: String,
+    pub elements: Vec<SnapshotElement>,
+    pub text_preview: String,
+}
+
+impl PageSnapshot {
+    pub fn find_ref(&self, ref_id: &str) -> Option<&SnapshotElement> {
+        let normalized = if ref_id.starts_with('@') {
+            ref_id.to_owned()
+        } else {
+            format!("@{ref_id}")
+        };
+        self.elements.iter().find(|el| el.ref_id == normalized)
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "url": self.url,
+            "title": self.title,
+            "refs": self.elements.iter().map(SnapshotElement::to_json).collect::<Vec<_>>(),
+            "text": self.text_preview,
+        })
+    }
+}
+
+fn snapshot_role(tag: &str, explicit_role: Option<&str>, input_type: Option<&str>) -> String {
+    if let Some(role) = explicit_role {
+        let trimmed = role.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_ascii_lowercase();
+        }
+    }
+    match tag {
+        "a" => "link".to_owned(),
+        "button" => "button".to_owned(),
+        "select" => "combobox".to_owned(),
+        "textarea" => "textbox".to_owned(),
+        "h1" | "h2" | "h3" => "heading".to_owned(),
+        "input" => match input_type {
+            Some("submit" | "button" | "reset") => "button".to_owned(),
+            Some("checkbox") => "checkbox".to_owned(),
+            Some("radio") => "radio".to_owned(),
+            _ => "textbox".to_owned(),
+        },
+        _ => tag.to_owned(),
+    }
+}
+
+fn compute_centrality(
+    role: &str,
+    rect: Option<Rect>,
+    center_x: f32,
+    center_y: f32,
+    viewport_width: f32,
+    order_idx: usize,
+) -> f32 {
+    let role_bonus = match role {
+        "heading" => 0.30,
+        "button" | "textbox" | "combobox" => 0.25,
+        "link" => 0.15,
+        _ => 0.10,
+    };
+    let spatial = match rect {
+        Some(r) => {
+            let rx = r.x + r.width / 2.0;
+            let ry = r.y + r.height / 2.0;
+            let dx = (rx - center_x).abs() / viewport_width.max(1.0);
+            let dy = (ry - center_y).abs() / 1200.0;
+            (1.0 - (dx * 0.5 + dy * 0.5)).clamp(0.0, 1.0) * 0.70
+        }
+        None => (0.55 - (order_idx as f32 * 0.01)).clamp(0.10, 0.55),
+    };
+    (role_bonus + spatial).clamp(0.0, 1.0)
 }
 
 fn collect_reader_text(node: &DomNode, out: &mut String) {
@@ -996,7 +1279,7 @@ fn parse_background_image(value: &str, page_url: Option<&str>) -> Option<BgImage
 /// Devuelve el contenido entre paréntesis de la primera aparición de
 /// `name(...)` (búsqueda insensible a mayúsculas), con comillas `"`/`'`
 /// exterior eliminadas si las hay.
-fn extract_css_function<'a>(value: &'a str, name: &str) -> Option<String> {
+fn extract_css_function(value: &str, name: &str) -> Option<String> {
     let lower = value.to_ascii_lowercase();
     let needle = format!("{name}(");
     let start = lower.find(&needle)? + needle.len();
@@ -1073,8 +1356,8 @@ fn parse_linear_gradient(args: &str) -> Option<BgImage> {
     let mut index = 0usize;
     let mut angle_deg = 180.0f32; // `to bottom` por defecto
     let first = parts[0].trim();
-    if first.starts_with("to ") {
-        angle_deg = match first[3..].trim() {
+    if let Some(direction) = first.strip_prefix("to ") {
+        angle_deg = match direction.trim() {
             "top" => 0.0,
             "right" => 90.0,
             "bottom" => 180.0,
@@ -1601,20 +1884,15 @@ fn layout_roots(
     }];
     let mut cursor_y = 0.0;
     let mut measure_cache = MeasureCache::new();
+    let mut ctx = LayoutCtx {
+        images,
+        commands: &mut commands,
+        measure_only: false,
+        measure_cache: &mut measure_cache,
+    };
     for root in roots {
         if is_block(root) {
-            cursor_y += layout_block(
-                root,
-                0.0,
-                cursor_y,
-                viewport_width,
-                Style::default(),
-                images,
-                &mut commands,
-                0,
-                false,
-                &mut measure_cache,
-            )?;
+            cursor_y += layout_block(root, 0.0, cursor_y, viewport_width, Style::default(), 0, &mut ctx)?;
         }
     }
 
@@ -1634,6 +1912,7 @@ fn layout_roots(
 struct NetworkBudgetState {
     deadline: Option<Instant>,
     skipped: usize,
+    policy: wisp_net::NetworkPolicy,
 }
 
 thread_local! {
@@ -1643,12 +1922,30 @@ thread_local! {
     static NETWORK_BUDGET: RefCell<NetworkBudgetState> = RefCell::new(NetworkBudgetState::default());
 }
 
-fn begin_network_budget() {
+fn begin_network_budget_with_policy(policy: wisp_net::NetworkPolicy) {
     NETWORK_BUDGET.with(|budget| {
         let mut budget = budget.borrow_mut();
         budget.deadline = Some(Instant::now() + MAX_NETWORK_TIME);
         budget.skipped = 0;
+        budget.policy = policy;
     });
+}
+
+fn subresource_allowed(url: &str) -> Result<(), String> {
+    let policy = NETWORK_BUDGET.with(|budget| budget.borrow().policy);
+    wisp_net::validate_url(url, &policy).map(|_| ())
+}
+
+fn redirect_policy_for(policy: wisp_net::NetworkPolicy, max_hops: usize) -> Policy {
+    Policy::custom(move |attempt| {
+        if attempt.previous().len() >= max_hops {
+            attempt.stop()
+        } else if wisp_net::validate_url(attempt.url().as_str(), &policy).is_err() {
+            attempt.error("SSRF blocked redirect")
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
 /// Tiempo máximo que puede durar la siguiente petición. `None` cuando el
@@ -1684,7 +1981,12 @@ fn take_network_warning() -> Option<String> {
 }
 
 pub fn fetch_url(url: &str) -> Result<FetchedPage> {
-    begin_network_budget();
+    fetch_url_with_policy(url, &wisp_net::NetworkPolicy::allow_private())
+}
+
+pub fn fetch_url_with_policy(url: &str, policy: &wisp_net::NetworkPolicy) -> Result<FetchedPage> {
+    begin_network_budget_with_policy(*policy);
+    wisp_net::validate_url(url, policy).map_err(|error| anyhow::anyhow!(error))?;
     let url = url::Url::parse(url)?;
     ensure!(
         matches!(url.scheme(), "http" | "https"),
@@ -1695,10 +1997,11 @@ pub fn fetch_url(url: &str) -> Result<FetchedPage> {
         "URLs containing embedded credentials are not supported"
     );
 
+    let timeout = Duration::from_millis(policy.fetch_deadline_ms.max(1000));
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .redirect(Policy::limited(10))
+        .timeout(timeout)
+        .redirect(redirect_policy_for(*policy, 10))
         .user_agent("GhostWisp/0.1")
         .build()?;
     let response = client
@@ -1710,6 +2013,8 @@ pub fn fetch_url(url: &str) -> Result<FetchedPage> {
         "Wisp received HTTP status {}",
         response.status()
     );
+    let final_url = response.url().to_string();
+    wisp_net::validate_url(&final_url, policy).map_err(|error| anyhow::anyhow!(error))?;
     if let Some(content_type) = response.headers().get(CONTENT_TYPE) {
         let mime = content_type
             .to_str()?
@@ -1730,7 +2035,6 @@ pub fn fetch_url(url: &str) -> Result<FetchedPage> {
         );
     }
 
-    let final_url = response.url().to_string();
     let mut body = Vec::new();
     response
         .take((MAX_DOCUMENT_BYTES + 1) as u64)
@@ -1753,7 +2057,7 @@ pub fn fetch_url(url: &str) -> Result<FetchedPage> {
         warnings.push(warning);
     }
 
-    Ok(FetchedPage::new(
+    let mut page = FetchedPage::new(
         final_url,
         title,
         html,
@@ -1762,7 +2066,9 @@ pub fn fetch_url(url: &str) -> Result<FetchedPage> {
         module_scripts,
         images,
         warnings,
-    ))
+    );
+    page.network_policy = *policy;
+    Ok(page)
 }
 
 fn fetch_stylesheets(client: &Client, html: &str, base_url: &str) -> (Vec<String>, Vec<String>) {
@@ -1857,6 +2163,10 @@ fn fetch_stylesheet_tree(
     let Some(timeout) = network_request_timeout(MAX_NETWORK_REQUEST_TIMEOUT) else {
         return;
     };
+    if let Err(error) = subresource_allowed(stylesheet_url) {
+        warnings.push(error);
+        return;
+    }
     let response = match client.get(stylesheet_url).timeout(timeout).send() {
         Ok(response) if response.status().is_success() => response,
         Ok(response) => {
@@ -2109,6 +2419,10 @@ fn fetch_external_scripts(
         let Some(timeout) = network_request_timeout(MAX_NETWORK_REQUEST_TIMEOUT) else {
             break;
         };
+        if let Err(error) = subresource_allowed(&script_url) {
+            warnings.push(error);
+            continue;
+        }
         let response = match client.get(&script_url).timeout(timeout).send() {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
@@ -2385,6 +2699,10 @@ fn fetch_images(
             let Some(timeout) = network_request_timeout(Duration::from_secs(10)) else {
                 break;
             };
+            if let Err(error) = subresource_allowed(&key) {
+                warnings.push(error);
+                continue;
+            }
             let response = match client.get(&key).timeout(timeout).send() {
                 Ok(response) if response.status().is_success() => response,
                 Ok(response) => {
@@ -2484,7 +2802,7 @@ fn collect_background_urls<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<
         while let Some(relative) = lower.get(search..).and_then(|s| s.find("url(")) {
             let pos = search + relative;
             let segment_start = text[..pos]
-                .rfind(|c| c == ';' || c == '{' || c == '}')
+                .rfind([';', '{', '}'])
                 .map(|index| index + 1)
                 .unwrap_or(0);
             if text[segment_start..pos].contains("background")
@@ -2544,6 +2862,9 @@ fn fetch_background_images(
             let Some(timeout) = network_request_timeout(Duration::from_secs(10)) else {
                 break;
             };
+            if subresource_allowed(&key).is_err() {
+                continue;
+            }
             let Ok(response) = client.get(&key).timeout(timeout).send() else {
                 continue;
             };
@@ -2700,6 +3021,7 @@ fn is_url_like_module_specifier(specifier: &str) -> bool {
 }
 
 fn fetch_javascript_source(client: &Client, script_url: &str) -> Result<String, String> {
+    subresource_allowed(script_url)?;
     let timeout = network_request_timeout(MAX_NETWORK_REQUEST_TIMEOUT).ok_or_else(|| {
         format!(
             "Se alcanzó el presupuesto de red de {} s: un módulo no se descargó.",
@@ -2869,10 +3191,10 @@ fn import_specifier(bytes: &[u8], mut index: usize) -> Option<(String, usize)> {
                 }
                 if &bytes[start..cursor] == b"from" {
                     let next = skip_js_whitespace(bytes, cursor);
-                    if next < bytes.len() {
-                        if let Some((specifier, next)) = read_js_string(bytes, next) {
-                            return Some((specifier, next));
-                        }
+                    if next < bytes.len()
+                        && let Some((specifier, next)) = read_js_string(bytes, next)
+                    {
+                        return Some((specifier, next));
                     }
                 }
             }
@@ -2910,10 +3232,10 @@ fn export_specifier(bytes: &[u8], index: usize) -> Option<(String, usize)> {
                 }
                 if &bytes[start..cursor] == b"from" {
                     let next = skip_js_whitespace(bytes, cursor);
-                    if next < bytes.len() {
-                        if let Some((specifier, next)) = read_js_string(bytes, next) {
-                            return Some((specifier, next));
-                        }
+                    if next < bytes.len()
+                        && let Some((specifier, next)) = read_js_string(bytes, next)
+                    {
+                        return Some((specifier, next));
                     }
                 }
             }
@@ -3408,8 +3730,8 @@ fn media_query_matches(condition: &str, viewport_width: f32) -> bool {
 fn media_query_part_matches(query: &str, viewport_width: f32) -> bool {
     let query = query.trim().to_ascii_lowercase();
     let (negated, query) = match query.split_once(char::is_whitespace) {
-        Some((keyword, rest)) if keyword == "not" => (true, rest.trim().to_owned()),
-        Some((keyword, rest)) if keyword == "only" => (false, rest.trim().to_owned()),
+        Some(("not", rest)) => (true, rest.trim().to_owned()),
+        Some(("only", rest)) => (false, rest.trim().to_owned()),
         _ => (false, query),
     };
     let mut matched = true;
@@ -3843,7 +4165,7 @@ fn resolve_custom_properties_node(node: &mut DomNode, inherited: &CustomProperti
     }
 
     for child in &mut node.children {
-        resolve_custom_properties_node(child, &mut local);
+        resolve_custom_properties_node(child, &local);
     }
 }
 
@@ -3944,73 +4266,59 @@ fn relative_offset(style: Style, basis: f32) -> (f32, f32) {
     )
 }
 
+struct LayoutCtx<'a> {
+    images: &'a HashMap<String, ImageResource>,
+    commands: &'a mut Vec<PaintCommand>,
+    measure_only: bool,
+    measure_cache: &'a mut MeasureCache,
+}
+
 /// Pinta un hijo `position: absolute`: se coloca respecto al caja de
 /// contenido del ancestro que lo contiene y no altera el flujo del padre.
 /// Con `left` y `right` juntos se estira a lo ancho; con solo `bottom` se mide
 /// primero su altura para apoyarlo en el borde inferior.
-#[allow(clippy::too_many_arguments)]
 fn layout_absolute_child(
     child: &DomNode,
     parent_style: Style,
-    content_x: f32,
-    content_y: f32,
-    content_width: f32,
-    content_height: f32,
-    images: &HashMap<String, ImageResource>,
-    commands: &mut Vec<PaintCommand>,
+    bounds: Rect,
     depth: usize,
-    measure_only: bool,
-    measure_cache: &mut MeasureCache,
+    ctx: &mut LayoutCtx<'_>,
 ) -> Result<()> {
     let child_style = cached_style(child, parent_style);
-    let inset =
-        |index: usize| child_style.insets[index].map(|length| length.resolve(content_width));
+    let inset = |index: usize| child_style.insets[index].map(|length| length.resolve(bounds.width));
     let (left, right) = (inset(3), inset(1));
     let (top, bottom) = (inset(0), inset(2));
     let width = match (left, right) {
-        (Some(left), Some(right)) => (content_width - left - right).max(1.0),
-        _ => content_width,
+        (Some(left), Some(right)) => (bounds.width - left - right).max(1.0),
+        _ => bounds.width,
     };
     let x = match (left, right) {
-        (Some(left), _) => content_x + left,
+        (Some(left), _) => bounds.x + left,
         // Sin `left`, la caja se apoya en el borde derecho con su ancho propio.
         (None, Some(right)) if child_style.width.is_some() => {
-            (content_x + content_width - outer_width_for(child_style, content_width) - right)
-                .max(content_x)
+            (bounds.x + bounds.width - outer_width_for(child_style, bounds.width) - right)
+                .max(bounds.x)
         }
-        _ => content_x,
+        _ => bounds.x,
     };
     // Se mide siempre: hace falta la altura para `bottom` y así se pinta una
     // sola vez con la posición ya resuelta.
-    let measured = layout_block(
-        child,
-        x,
-        0.0,
-        width,
-        parent_style,
-        images,
-        &mut Vec::new(),
-        depth + 1,
-        true,
-        measure_cache,
-    )?;
-    let y = match (top, bottom) {
-        (Some(top), _) => content_y + top,
-        (None, Some(bottom)) => content_y + (content_height - measured - bottom).max(0.0),
-        _ => content_y,
+    let measured = {
+        let mut scratch = Vec::new();
+        let mut measure_ctx = LayoutCtx {
+            images: ctx.images,
+            commands: &mut scratch,
+            measure_only: true,
+            measure_cache: ctx.measure_cache,
+        };
+        layout_block(child, x, 0.0, width, parent_style, depth + 1, &mut measure_ctx)?
     };
-    layout_block(
-        child,
-        x,
-        y,
-        width,
-        parent_style,
-        images,
-        commands,
-        depth + 1,
-        measure_only,
-        measure_cache,
-    )?;
+    let y = match (top, bottom) {
+        (Some(top), _) => bounds.y + top,
+        (None, Some(bottom)) => bounds.y + (bounds.height - measured - bottom).max(0.0),
+        _ => bounds.y,
+    };
+    layout_block(child, x, y, width, parent_style, depth + 1, ctx)?;
     Ok(())
 }
 
@@ -4020,11 +4328,8 @@ fn layout_block(
     y: f32,
     available_width: f32,
     inherited: Style,
-    images: &HashMap<String, ImageResource>,
-    commands: &mut Vec<PaintCommand>,
     depth: usize,
-    measure_only: bool,
-    measure_cache: &mut MeasureCache,
+    ctx: &mut LayoutCtx<'_>,
 ) -> Result<f32> {
     ensure!(
         depth <= MAX_TREE_DEPTH,
@@ -4053,7 +4358,7 @@ fn layout_block(
     let content_x = outer_x + border[3] + padding[3];
     let box_y = y + margin[0];
     let content_y = box_y + border[0] + padding[0];
-    let command_start = commands.len();
+    let command_start = ctx.commands.len();
     let mut cursor_y = content_y;
     let mut inline_items = Vec::new();
 
@@ -4064,11 +4369,8 @@ fn layout_block(
             content_y,
             content_width,
             style,
-            images,
-            commands,
             depth + 1,
-            measure_only,
-            measure_cache,
+            ctx,
         )?;
     } else {
         let list_kind = matches!(node.tag.as_deref(), Some("ul" | "ol"))
@@ -4089,22 +4391,27 @@ fn layout_block(
             if is_block(child) {
                 let (run_height, _) = flush_inline_runs(
                     &mut inline_items,
-                    content_x,
-                    cursor_y,
+                    (content_x, cursor_y),
                     content_width,
-                    images,
-                    commands,
+                    ctx.images,
+                    ctx.commands,
                     style.text_align,
-                    measure_only,
+                    ctx.measure_only,
                 );
                 cursor_y += run_height;
                 if let Some(kind) = list_kind
                     && child.tag.as_deref() == Some("li")
-                    && !measure_only
+                    && !ctx.measure_only
                 {
                     list_index += 1;
                     paint_list_marker(
-                        child, kind, list_index, content_x, cursor_y, style, commands,
+                        child,
+                        kind,
+                        list_index,
+                        content_x,
+                        cursor_y,
+                        style,
+                        ctx.commands,
                     );
                 }
                 // `position: relative` desplaza el pintado, no el flujo.
@@ -4115,43 +4422,33 @@ fn layout_block(
                     cursor_y + offset_y,
                     content_width,
                     style,
-                    images,
-                    commands,
                     depth + 1,
-                    measure_only,
-                    measure_cache,
+                    ctx,
                 )?;
             } else {
-                collect_inline_runs(child, style, None, images, &mut inline_items);
+                collect_inline_runs(child, style, None, ctx.images, &mut inline_items);
             }
         }
         let (run_height, _) = flush_inline_runs(
             &mut inline_items,
-            content_x,
-            cursor_y,
+            (content_x, cursor_y),
             content_width,
-            images,
-            commands,
+            ctx.images,
+            ctx.commands,
             style.text_align,
-            measure_only,
+            ctx.measure_only,
         );
         cursor_y += run_height;
 
         let flow_height = (cursor_y - content_y).max(0.0);
+        let abs_bounds = Rect {
+            x: content_x,
+            y: content_y,
+            width: content_width,
+            height: flow_height,
+        };
         for child in absolute_children {
-            layout_absolute_child(
-                child,
-                style,
-                content_x,
-                content_y,
-                content_width,
-                flow_height,
-                images,
-                commands,
-                depth,
-                measure_only,
-                measure_cache,
-            )?;
+            layout_absolute_child(child, style, abs_bounds, depth, ctx)?;
         }
     }
 
@@ -4202,61 +4499,48 @@ fn layout_block(
         box_height = box_height.max(to_content_height(min));
     }
     let border_box_height = border[0] + padding[0] + box_height + padding[2] + border[2];
-    if !measure_only && style.visibility == VisibilityKind::Visible {
+    if !ctx.measure_only && style.visibility == VisibilityKind::Visible {
         let radius = resolve_radius(style.border_radius, outer_width, border_box_height);
+        let box_rect = Rect {
+            x: outer_x,
+            y: box_y,
+            width: outer_width,
+            height: border_box_height,
+        };
         if let Some(color) = style.background {
-            commands.insert(
+            ctx.commands.insert(
                 command_start,
                 PaintCommand::FillRect {
-                    rect: Rect {
-                        x: outer_x,
-                        y: box_y,
-                        width: outer_width,
-                        height: border_box_height,
-                    },
+                    rect: box_rect,
                     color,
                     radius,
                 },
             );
         }
         if let Some(image) = &node.background_image {
-            commands.insert(
+            ctx.commands.insert(
                 command_start + usize::from(style.background.is_some()),
                 PaintCommand::BackgroundImage {
-                    rect: Rect {
-                        x: outer_x,
-                        y: box_y,
-                        width: outer_width,
-                        height: border_box_height,
-                    },
+                    rect: box_rect,
                     radius,
                     image: image.clone(),
                 },
             );
         }
-        paint_border(
-            outer_x,
-            box_y,
-            outer_width,
-            border_box_height,
-            border,
-            &style,
-            radius,
-            commands,
-        );
+        paint_border(box_rect, border, &style, radius, ctx.commands);
     }
     // `overflow: hidden|auto|scroll`: el contenido (incluidos los hijos
     // absolutos) queda recortado al padding box, como en un navegador. El
     // recorte va antes del fondo para que éste también se limite.
-    if style.overflow_clip && !measure_only {
+    if style.overflow_clip && !ctx.measure_only {
         let clip = Rect {
             x: outer_x + border[3],
             y: box_y + border[0],
             width: (outer_width - border[1] - border[3]).max(0.0),
             height: (border_box_height - border[0] - border[2]).max(0.0),
         };
-        commands.insert(command_start, PaintCommand::Clip { rect: clip });
-        commands.push(PaintCommand::ClipEnd);
+        ctx.commands.insert(command_start, PaintCommand::Clip { rect: clip });
+        ctx.commands.push(PaintCommand::ClipEnd);
     }
 
     Ok(margin[0] + border_box_height + margin[2])
@@ -4388,15 +4672,18 @@ fn resolve_radius(radius: Length, width: f32, height: f32) -> f32 {
 /// `StrokeRect` (conserva el `border-radius`); en cualquier otro caso pinta
 /// cada lado por separado, con guiones o puntos si el estilo lo pide.
 fn paint_border(
-    x: f32,
-    y: f32,
-    width: f32,
-    height: f32,
+    rect: Rect,
     border: [f32; 4],
     style: &Style,
     radius: f32,
     commands: &mut Vec<PaintCommand>,
 ) {
+    let Rect {
+        x,
+        y,
+        width,
+        height,
+    } = rect;
     let sides: Vec<usize> = (0..4)
         .filter(|side| {
             border[*side] > 0.0
@@ -4546,11 +4833,8 @@ fn layout_taffy_children(
     y: f32,
     width: f32,
     parent_style: Style,
-    images: &HashMap<String, ImageResource>,
-    commands: &mut Vec<PaintCommand>,
     depth: usize,
-    measure_only: bool,
-    measure_cache: &mut MeasureCache,
+    ctx: &mut LayoutCtx<'_>,
 ) -> Result<f32> {
     ensure!(
         depth <= MAX_TREE_DEPTH,
@@ -4584,21 +4868,15 @@ fn layout_taffy_children(
         items.push(TaffyItem::Run(run));
     }
     if items.is_empty() {
-        if !measure_only {
+        if !ctx.measure_only {
+            let abs_bounds = Rect {
+                x,
+                y,
+                width,
+                height: 0.0,
+            };
             for child in absolute_children {
-                layout_absolute_child(
-                    child,
-                    parent_style,
-                    x,
-                    y,
-                    width,
-                    0.0,
-                    images,
-                    commands,
-                    depth,
-                    false,
-                    measure_cache,
-                )?;
+                layout_absolute_child(child, parent_style, abs_bounds, depth, ctx)?;
             }
         }
         return Ok(0.0);
@@ -4623,6 +4901,8 @@ fn layout_taffy_children(
         height: AvailableSpace::MaxContent,
     };
     let container_width = width;
+    let images = ctx.images;
+    let measure_cache = &mut *ctx.measure_cache;
     taffy
         .compute_layout_with_measure(root, available_space, |inputs, _node_id, context, style| {
             let index = context.map(|context| *context).unwrap_or(0);
@@ -4631,15 +4911,21 @@ fn layout_taffy_children(
                 style,
                 |_, _| 0.0,
                 |known, available| {
+                    let mut scratch = Vec::new();
+                    let mut measure_ctx = LayoutCtx {
+                        images,
+                        commands: &mut scratch,
+                        measure_only: true,
+                        measure_cache,
+                    };
                     measure_taffy_item(
                         &items[index],
                         known,
                         available,
                         container_width,
                         parent_style,
-                        images,
                         depth + 1,
-                        measure_cache,
+                        &mut measure_ctx,
                     )
                 },
             )
@@ -4651,7 +4937,7 @@ fn layout_taffy_children(
         .map_err(|error| anyhow::anyhow!("taffy layout failed: {error}"))?
         .size
         .height;
-    if measure_only {
+    if ctx.measure_only {
         return Ok(height.max(0.0));
     }
     for (index, item) in items.iter().enumerate() {
@@ -4671,45 +4957,35 @@ fn layout_taffy_children(
                     item_y + offset_y,
                     item_width,
                     parent_style,
-                    images,
-                    commands,
                     depth + 1,
-                    false,
-                    measure_cache,
+                    ctx,
                 )?;
             }
             TaffyItem::Run(children) => {
                 let mut run_items = Vec::new();
                 for child in children {
-                    collect_inline_runs(child, parent_style, None, images, &mut run_items);
+                    collect_inline_runs(child, parent_style, None, ctx.images, &mut run_items);
                 }
                 let (_, _) = flush_inline_runs(
                     &mut run_items,
-                    item_x,
-                    item_y,
+                    (item_x, item_y),
                     item_width,
-                    images,
-                    commands,
+                    ctx.images,
+                    ctx.commands,
                     parent_style.text_align,
                     false,
                 );
             }
         }
     }
+    let abs_bounds = Rect {
+        x,
+        y,
+        width,
+        height: height.max(0.0),
+    };
     for child in absolute_children {
-        layout_absolute_child(
-            child,
-            parent_style,
-            x,
-            y,
-            width,
-            height.max(0.0),
-            images,
-            commands,
-            depth,
-            false,
-            measure_cache,
-        )?;
+        layout_absolute_child(child, parent_style, abs_bounds, depth, ctx)?;
     }
     Ok(height.max(0.0))
 }
@@ -4722,9 +4998,8 @@ fn measure_taffy_item(
     available_space: Size<AvailableSpace>,
     container_width: f32,
     parent_style: Style,
-    images: &HashMap<String, ImageResource>,
     depth: usize,
-    measure_cache: &mut MeasureCache,
+    ctx: &mut LayoutCtx<'_>,
 ) -> Size<f32> {
     let layout_width = known_dimensions
         .width
@@ -4740,26 +5015,15 @@ fn measure_taffy_item(
         TaffyItem::Run(children) => (children[0] as *const DomNode as usize, children.len()),
     };
     let key = (key_node, key_len, layout_width.to_bits());
-    if let Some(size) = measure_cache.get(&key) {
+    if let Some(size) = ctx.measure_cache.get(&key) {
         return *size;
     }
 
     let size = match item {
         TaffyItem::Element(child) => {
-            let mut scratch = Vec::new();
-            let height = layout_block(
-                child,
-                0.0,
-                0.0,
-                layout_width,
-                parent_style,
-                images,
-                &mut scratch,
-                depth + 1,
-                true,
-                measure_cache,
-            )
-            .unwrap_or(0.0);
+            let height =
+                layout_block(child, 0.0, 0.0, layout_width, parent_style, depth + 1, ctx)
+                    .unwrap_or(0.0);
             let child_style = cached_style(child, parent_style);
             let margin_x = child_style.margin[1].resolve(layout_width)
                 + child_style.margin[3].resolve(layout_width);
@@ -4772,14 +5036,13 @@ fn measure_taffy_item(
         TaffyItem::Run(children) => {
             let mut run_items = Vec::new();
             for child in children {
-                collect_inline_runs(child, parent_style, None, images, &mut run_items);
+                collect_inline_runs(child, parent_style, None, ctx.images, &mut run_items);
             }
             let (height, width) = flush_inline_runs(
                 &mut run_items,
-                0.0,
-                0.0,
+                (0.0, 0.0),
                 layout_width,
-                images,
+                ctx.images,
                 &mut Vec::new(),
                 parent_style.text_align,
                 true,
@@ -4787,7 +5050,7 @@ fn measure_taffy_item(
             Size { width, height }
         }
     };
-    measure_cache.insert(key, size);
+    ctx.measure_cache.insert(key, size);
     size
 }
 
@@ -4852,44 +5115,46 @@ fn taffy_grid_line(placement: GridLinePlacement) -> taffy::geometry::Line<GridPl
 /// Estilo de Taffy para el contenedor flex/grid: traduce las propiedades CSS
 /// de `Style` y, en el caso de grid, las plantillas `grid-template-*`.
 fn taffy_container_style(node: &DomNode, parent_style: Style, width: f32) -> taffy::Style {
-    let mut style = taffy::Style::default();
-    style.display = match parent_style.display {
-        Display::Grid => taffy::Display::Grid,
-        _ => taffy::Display::Flex,
-    };
-    style.flex_direction = match parent_style.flex_direction {
-        FlexDirectionKind::Row => FlexDirection::Row,
-        FlexDirectionKind::RowReverse => FlexDirection::RowReverse,
-        FlexDirectionKind::Column => FlexDirection::Column,
-        FlexDirectionKind::ColumnReverse => FlexDirection::ColumnReverse,
-    };
-    style.flex_wrap = if parent_style.flex_wrap {
-        FlexWrap::Wrap
-    } else {
-        FlexWrap::NoWrap
-    };
-    style.justify_content = match parent_style.justify_content {
-        JustifyKind::Start => JustifyContent::START,
-        JustifyKind::End => JustifyContent::END,
-        JustifyKind::Center => JustifyContent::CENTER,
-        JustifyKind::SpaceBetween => JustifyContent::SPACE_BETWEEN,
-        JustifyKind::SpaceAround => JustifyContent::SPACE_AROUND,
-        JustifyKind::SpaceEvenly => JustifyContent::SPACE_EVENLY,
-    };
-    style.align_items = match parent_style.align_items {
-        AlignKind::Stretch => AlignItems::STRETCH,
-        AlignKind::Start => AlignItems::FLEX_START,
-        AlignKind::End => AlignItems::FLEX_END,
-        AlignKind::Center => AlignItems::CENTER,
-        AlignKind::Baseline => AlignItems::BASELINE,
-    };
-    style.gap = Size {
-        width: taffy_length_percentage(parent_style.gap[1], width),
-        height: taffy_length_percentage(parent_style.gap[0], width),
-    };
-    style.size = Size {
-        width: Dimension::from_length(width),
-        height: Dimension::AUTO,
+    let mut style = taffy::Style {
+        display: match parent_style.display {
+            Display::Grid => taffy::Display::Grid,
+            _ => taffy::Display::Flex,
+        },
+        flex_direction: match parent_style.flex_direction {
+            FlexDirectionKind::Row => FlexDirection::Row,
+            FlexDirectionKind::RowReverse => FlexDirection::RowReverse,
+            FlexDirectionKind::Column => FlexDirection::Column,
+            FlexDirectionKind::ColumnReverse => FlexDirection::ColumnReverse,
+        },
+        flex_wrap: if parent_style.flex_wrap {
+            FlexWrap::Wrap
+        } else {
+            FlexWrap::NoWrap
+        },
+        justify_content: match parent_style.justify_content {
+            JustifyKind::Start => JustifyContent::START,
+            JustifyKind::End => JustifyContent::END,
+            JustifyKind::Center => JustifyContent::CENTER,
+            JustifyKind::SpaceBetween => JustifyContent::SPACE_BETWEEN,
+            JustifyKind::SpaceAround => JustifyContent::SPACE_AROUND,
+            JustifyKind::SpaceEvenly => JustifyContent::SPACE_EVENLY,
+        },
+        align_items: match parent_style.align_items {
+            AlignKind::Stretch => AlignItems::STRETCH,
+            AlignKind::Start => AlignItems::FLEX_START,
+            AlignKind::End => AlignItems::FLEX_END,
+            AlignKind::Center => AlignItems::CENTER,
+            AlignKind::Baseline => AlignItems::BASELINE,
+        },
+        gap: Size {
+            width: taffy_length_percentage(parent_style.gap[1], width),
+            height: taffy_length_percentage(parent_style.gap[0], width),
+        },
+        size: Size {
+            width: Dimension::from_length(width),
+            height: Dimension::AUTO,
+        },
+        ..Default::default()
     };
     if matches!(parent_style.display, Display::Grid) {
         if let Some(tracks) = inline_declaration(node, "grid-template-columns") {
@@ -5598,14 +5863,14 @@ fn place_flow_word(
 /// comandos: solo calcula el espacio que ocuparía el texto.
 fn flush_inline_runs(
     items: &mut Vec<InlineItem<'_>>,
-    x: f32,
-    y: f32,
+    origin: (f32, f32),
     width: f32,
     images: &HashMap<String, ImageResource>,
     commands: &mut Vec<PaintCommand>,
     align: TextAlignKind,
     measure_only: bool,
 ) -> (f32, f32) {
+    let (x, y) = origin;
     let mut writer = InlineWriter::new(commands, x, y, width, measure_only);
     let mut last_style = Style::default();
     for item in items.iter() {
@@ -8729,5 +8994,45 @@ fetch("http://{data_address}/data.json").then(function () {{
                 a: 255
             })
         );
+    }
+
+    #[test]
+    fn snapshot_assigns_stable_refs_and_centrality() {
+        let page = FetchedPage::new(
+            "https://example.com/".to_owned(),
+            "Demo".to_owned(),
+            r#"<html><body><h1>Título</h1><form><input name="q" placeholder="Buscar"><button>Ir</button></form><a href="/next">Siguiente</a></body></html>"#.to_owned(),
+            vec![],
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            vec![],
+        );
+        let snap = page.snapshot(1280.0).expect("snapshot");
+        assert_eq!(snap.elements.len(), 4);
+        assert_eq!(snap.elements[0].ref_id, "@e1");
+        assert_eq!(snap.elements[0].role, "heading");
+        assert_eq!(snap.elements[1].ref_id, "@e2");
+        assert_eq!(snap.elements[1].role, "textbox");
+        assert_eq!(snap.elements[2].ref_id, "@e3");
+        assert_eq!(snap.elements[2].role, "button");
+        assert_eq!(snap.elements[3].ref_id, "@e4");
+        assert_eq!(snap.elements[3].url.as_deref(), Some("https://example.com/next"));
+        assert!(snap.find_ref("@e4").is_some());
+        assert!(snap.elements[3].centrality > 0.0);
+    }
+
+    #[test]
+    fn strict_ssrf_policy_blocks_localhost_and_subresources() {
+        let err = fetch_url_with_policy(
+            "http://127.0.0.1:47820/health",
+            &wisp_net::NetworkPolicy::strict(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("SSRF"));
+
+        begin_network_budget_with_policy(wisp_net::NetworkPolicy::strict());
+        assert!(subresource_allowed("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(subresource_allowed("http://127.0.0.1:8080/secret.js").is_err());
     }
 }

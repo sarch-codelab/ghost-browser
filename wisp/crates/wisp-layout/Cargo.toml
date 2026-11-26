@@ -1,0 +1,8 @@
+[package]
+name = "wisp-layout"
+version = "0.1.0"
+edition = "2024"
+description = "Wisp layout engine: BFC, IFC, FFC, TFC formatting contexts and LayoutState."
+license = "MIT"
+
+[dependencies]

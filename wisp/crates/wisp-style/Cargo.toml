@@ -1,0 +1,9 @@
+[package]
+name = "wisp-style"
+version = "0.1.0"
+edition = "2024"
+description = "Wisp StyleComputer: bucketed selector indexing and CSS cascade."
+license = "MIT"
+
+[dependencies]
+wisp-css = { path = "../wisp-css" }

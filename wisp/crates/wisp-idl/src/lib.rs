@@ -307,4 +307,10 @@ mod tests {
         assert_eq!(open.arguments[0].default, Some("\"\""));
         assert!(open.return_nullable);
     }
+
+    #[test]
+    fn genera_bindings_js_para_herencia_y_constantes() {
+        assert!(JS_IDL_BINDINGS.contains("link(\"HTMLElement\", \"Element\")"));
+        assert!(JS_IDL_BINDINGS.contains("ELEMENT_NODE"));
+    }
 }
