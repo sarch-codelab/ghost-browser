@@ -46,7 +46,12 @@ pub fn render_pdf(title: &str, document: &LayoutDocument) -> Vec<u8> {
     objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
     // Obj 2: Pages (kids = 4, 6, 8...)
     let kids: Vec<String> = (0..page_count).map(|i| format!("{} 0 R", 4 + i * 2)).collect();
-    objects.push(format!("<< /Type /Pages /Kids [{}] /Count {} >>", kids.join(" "), page_count).into_bytes());
+    let pages_obj = format!(
+        "<< /Type /Pages /Kids [{}] /Count {} >>",
+        kids.join(" "),
+        page_count
+    );
+    objects.push(pages_obj.into_bytes());
     // Obj 3: Font Helvetica
     objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec());
 

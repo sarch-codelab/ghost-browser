@@ -248,9 +248,14 @@ fn layout_block(
 
     let children = normalize_block_children(node.children.clone(), next_anon_id);
     let inner_height = match node.formatting_context {
-        FormattingContext::Flex => {
-            layout_flex_children(&children, content_x, content_y, content_width, next_anon_id, state)
-        }
+        FormattingContext::Flex => layout_flex_children(
+            &children,
+            content_x,
+            content_y,
+            content_width,
+            next_anon_id,
+            state,
+        ),
         FormattingContext::Table => layout_table_children(
             &children,
             content_x,

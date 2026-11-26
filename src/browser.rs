@@ -205,6 +205,38 @@ fn remote_eval_script(eval_id: u64, js: &str) -> String {
     )
 }
 
+fn js_quote(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+fn fill_by_name_js(name: &str, value: &str) -> String {
+    let q_name = js_quote(name);
+    let q_val = js_quote(value);
+    let mut js = String::from("(function(){ var el = document.querySelector('[name=' + ");
+    js.push_str(&q_name);
+    js.push_str(" + ']') || document.getElementById(");
+    js.push_str(&q_name);
+    js.push_str("); if (!el) return false; el.value = ");
+    js.push_str(&q_val);
+    js.push_str("; el.setAttribute('value', ");
+    js.push_str(&q_val);
+    js.push_str("); return true; })()");
+    js
+}
+
+fn fill_and_input_js(target: &str, value: &str) -> String {
+    let q_target = js_quote(target);
+    let q_val = js_quote(value);
+    let mut js = String::from("(function(){ var el = document.querySelector('[name=' + ");
+    js.push_str(&q_target);
+    js.push_str(" + ']') || document.getElementById(");
+    js.push_str(&q_target);
+    js.push_str("); if (el) { el.focus(); el.value = ");
+    js.push_str(&q_val);
+    js.push_str("; el.dispatchEvent(new Event('input', {bubbles:true})); } })();");
+    js
+}
+
 fn normalized_navigation_history(
     history: &[String],
     history_index: usize,
@@ -1768,13 +1800,14 @@ impl Browser {
             }
             Route::Text(tab_id) => self.remote_tab_text(tab_id, reply.clone())?,
             Route::Snapshot(tab_id) => {
-                self.remote_tab_snapshot(tab_id, &request.body, reply.clone())?
+                let body = &request.body;
+                self.remote_tab_snapshot(tab_id, body, reply.clone())?
             }
             Route::Click(tab_id) => {
-                if self
+                let is_wisp = self
                     .tab_by_id(tab_id)
-                    .is_some_and(|t| t.engine == BrowserEngine::Wisp)
-                {
+                    .is_some_and(|t| t.engine == BrowserEngine::Wisp);
+                if is_wisp {
                     self.remote_wisp_click(tab_id, &request.body)
                 } else {
                     self.remote_input(tab_id, "click", &request.body)
@@ -1787,10 +1820,10 @@ impl Browser {
             Route::Press(tab_id) => self.remote_input(tab_id, "press", &request.body),
             Route::Scroll(tab_id) => self.remote_input(tab_id, "scroll", &request.body),
             Route::Move(tab_id) => {
-                if self
+                let is_wisp = self
                     .tab_by_id(tab_id)
-                    .is_some_and(|t| t.engine == BrowserEngine::Wisp)
-                {
+                    .is_some_and(|t| t.engine == BrowserEngine::Wisp);
+                if is_wisp {
                     self.remote_wisp_move(tab_id, &request.body)
                 } else {
                     self.remote_input(tab_id, "move", &request.body)
@@ -1820,16 +1853,12 @@ impl Browser {
                 let Some(tab) = self.tab_by_id(tab_id) else {
                     return Some(json!({"ok": false, "error": "pestaña no encontrada"}));
                 };
-                let messages: Vec<serde_json::Value> = tab
-                    .wisp_html
-                    .as_ref()
-                    .map(|p| {
-                        p.warnings
-                            .iter()
-                            .map(|w| json!({"level": "warning", "text": w}))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let mut messages = Vec::new();
+                if let Some(page) = tab.wisp_html.as_ref() {
+                    for w in &page.warnings {
+                        messages.push(json!({"level": "warning", "text": w}));
+                    }
+                }
                 json!({"ok": true, "messages": messages})
             }
             Route::Events(tab_id) => {
@@ -1919,14 +1948,15 @@ impl Browser {
         };
         if tab.engine == BrowserEngine::Wisp {
             if let Some(page) = tab.wisp_html.as_ref() {
-                return Some(match page.snapshot(width) {
+                let res = match page.snapshot(width) {
                     Ok(snap) => {
                         let mut val = snap.to_json();
                         val["ok"] = json!(true);
                         val
                     }
                     Err(error) => json!({"ok": false, "error": error.to_string()}),
-                });
+                };
+                return Some(res);
             }
             return Some(json!({"ok": false, "error": "la pestaña Wisp aún no tiene página"}));
         }
@@ -1975,10 +2005,9 @@ impl Browser {
             }
             return json!({"ok": true, "target": el.to_json()});
         }
-        let (Some(x), Some(y)) = (
-            body.get("x").and_then(|v| v.as_f64()),
-            body.get("y").and_then(|v| v.as_f64()),
-        ) else {
+        let x = body.get("x").and_then(|v| v.as_f64());
+        let y = body.get("y").and_then(|v| v.as_f64());
+        let (Some(x), Some(y)) = (x, y) else {
             return json!({"ok": false, "error": "click necesita 'ref' o ('x' e 'y')"});
         };
         match page.hit_test(x as f32, y as f32) {
@@ -2005,10 +2034,9 @@ impl Browser {
         let Some(page) = tab.wisp_html.as_ref() else {
             return json!({"ok": false, "error": "la pestaña Wisp aún no tiene página"});
         };
-        let (Some(x), Some(y)) = (
-            body.get("x").and_then(|v| v.as_f64()),
-            body.get("y").and_then(|v| v.as_f64()),
-        ) else {
+        let x = body.get("x").and_then(|v| v.as_f64());
+        let y = body.get("y").and_then(|v| v.as_f64());
+        let (Some(x), Some(y)) = (x, y) else {
             return json!({"ok": false, "error": "move necesita 'x' e 'y'"});
         };
         match page.hit_test(x as f32, y as f32) {
@@ -2043,21 +2071,8 @@ impl Browser {
             let Some(field_name) = field_name else {
                 return json!({"ok": false, "error": "falta name/id o @ref para rellenar"});
             };
-            let q_name = serde_json::to_string(&field_name).unwrap_or_else(|_| "\"\"".into());
-            let q_val = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into());
-            let js = [
-                "(function(){ var el = document.querySelector('[name=' + ",
-                &q_name,
-                " + ']') || document.getElementById(",
-                &q_name,
-                "); if (!el) return false; el.value = ",
-                &q_val,
-                "; el.setAttribute('value', ",
-                &q_val,
-                "); return true; })()",
-            ]
-            .concat();
-            return match page.eval_js(&js) {
+            let js = fill_by_name_js(&field_name, value);
+            let out = match page.eval_js(&js) {
                 Ok(res) => {
                     if let Some(mutated) = res.html
                         && let Some(tab_mut) = self.tab_by_id_mut(tab_id)
@@ -2078,21 +2093,11 @@ impl Browser {
                 }
                 Err(error) => json!({"ok": false, "error": error.to_string()}),
             };
+            return out;
         }
         if let Some(webview) = self.remote_webview(tab_id) {
             let target = name.or(ref_id).unwrap_or("");
-            let q_target = serde_json::to_string(target).unwrap_or_else(|_| "\"\"".into());
-            let q_val = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into());
-            let js = [
-                "(function(){ var el = document.querySelector('[name=' + ",
-                &q_target,
-                " + ']') || document.getElementById(",
-                &q_target,
-                "); if (el) { el.focus(); el.value = ",
-                &q_val,
-                "; el.dispatchEvent(new Event('input', {bubbles:true})); } })();",
-            ]
-            .concat();
+            let js = fill_and_input_js(target, value);
             let _ = webview.evaluate_script(&js);
             return json!({"ok": true, "field": target, "value": value});
         }

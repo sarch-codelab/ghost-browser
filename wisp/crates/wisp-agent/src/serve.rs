@@ -916,6 +916,25 @@ fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, policy: &Networ
     }
 }
 
+fn js_quote(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+fn fill_by_name_js(name: &str, value: &str) -> String {
+    let q_name = js_quote(name);
+    let q_val = js_quote(value);
+    let mut js = String::from("(function(){ var el = document.querySelector('[name=' + ");
+    js.push_str(&q_name);
+    js.push_str(" + ']') || document.getElementById(");
+    js.push_str(&q_name);
+    js.push_str("); if (!el) return false; el.value = ");
+    js.push_str(&q_val);
+    js.push_str("; el.setAttribute('value', ");
+    js.push_str(&q_val);
+    js.push_str("); return true; })()");
+    js
+}
+
 fn eval_in_tab(tab: &mut Tab, js: &str) -> Value {
     let Some(page) = &tab.page else {
         return page_missing_error(tab);
@@ -965,20 +984,7 @@ fn fill_control(tab: &mut Tab, ref_id: Option<&str>, name: Option<&str>, value: 
     let Some(field_name) = target_name else {
         return json!({"ok": false, "error": "el control no tiene atributo name/id para rellenar"});
     };
-    let q_name = serde_json::to_string(&field_name).unwrap_or_else(|_| "\"\"".into());
-    let q_val = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".into());
-    let js = [
-        "(function(){ var el = document.querySelector('[name=' + ",
-        &q_name,
-        " + ']') || document.getElementById(",
-        &q_name,
-        "); if (!el) return false; el.value = ",
-        &q_val,
-        "; el.setAttribute('value', ",
-        &q_val,
-        "); return true; })()",
-    ]
-    .concat();
+    let js = fill_by_name_js(&field_name, value);
     match page.eval_js(&js) {
         Ok(res) => {
             if let Some(mutated_html) = res.html {
