@@ -51,7 +51,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev gdb
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -73,7 +73,18 @@ jobs:
         run: cargo build --release --locked
 
       - name: Run tests (root)
-        run: cargo test --locked
+        run: |
+          bin=$(cargo test --locked --no-run --message-format=json | python3 -c 'import json,sys; [print(d["executable"]) for l in sys.stdin if l.startswith("{") for d in [json.loads(l)] if d.get("reason")=="compiler-artifact" and d.get("profile",{}).get("test") and d.get("executable")]' | head -n1)
+          for i in $(seq 1 10); do
+            out=$(gdb -batch -ex "run" -ex "thread apply all bt" "$bin" 2>&1)
+            rc=$?
+            if echo "$out" | grep -qE "SIGABRT|received signal|Program terminated"; then
+              msg=$(python3 -c 'import sys; print(sys.stdin.read().replace("\n"," | ")[-3500:])' <<< "ITER=$i RC=$rc | $out")
+              echo "::error::$msg"
+              exit 1
+            fi
+          done
+          cargo test --locked
 
   wisp-windows:
     name: Wisp (Windows)
