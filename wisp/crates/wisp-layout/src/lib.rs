@@ -287,13 +287,12 @@ fn layout_block(
                 let mut prev_margin_bottom = 0.0f32;
                 let mut first = true;
                 for child in &children {
-                    let gap = if first {
+                    if first {
                         first = false;
-                        child.margin[0]
                     } else {
-                        collapse_margins(prev_margin_bottom, child.margin[0])
-                    };
-                    cursor_y += gap - child.margin[0];
+                        let gap = collapse_margins(prev_margin_bottom, child.margin[0]);
+                        cursor_y += gap - prev_margin_bottom - child.margin[0];
+                    }
                     let used_h = layout_block(
                         child,
                         content_x,
