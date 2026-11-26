@@ -75,19 +75,32 @@ jobs:
       - name: Run tests (root)
         run: |
           bin=$(cargo test --locked --no-run --message-format=json | python3 -c 'import json,sys; [print(d["executable"]) for l in sys.stdin if l.startswith("{") for d in [json.loads(l)] if d.get("reason")=="compiler-artifact" and d.get("profile",{}).get("test") and d.get("executable")]' | head -n1)
-          for i in $(seq 1 20); do
-            if ! out=$("$bin" 2>&1); then
+          for mod in browser::tests logo::tests store::tests ui::tests webview::newtab_tests window_frame_tests; do
+            for k in $(seq 1 15); do
+              out=$("$bin" "$mod" 2>&1)
               rc=$?
-              bt=""
-              for j in $(seq 1 10); do
-                gout=$(gdb -batch -ex "set disable-randomization off" -ex "run" -ex "thread apply all bt" "$bin" 2>&1)
-                if echo "$gout" | grep -qE "SIGABRT|received signal|Program terminated"; then
-                  bt="GDB_ITER=$j | ${gout: -2000}"
-                  break
-                fi
-              done
-              msg=$(python3 -c 'import sys; print(sys.stdin.read().replace("\n"," | ")[-3500:])' <<< "ITER=$i RC=$rc | OUT=${out: -1000} | $bt")
-              echo "::error::$msg"
+              if [ $rc -ne 0 ]; then
+                msg=$(python3 -c 'import sys; print(sys.stdin.read().replace("\n"," | ")[-3000:])' <<< "$out")
+                echo "::error::FAILED mod=$mod k=$k rc=$rc | $msg"
+                exit 1
+              fi
+            done
+          done
+          for k in $(seq 1 15); do
+            out=$("$bin" --test-threads=1 2>&1)
+            rc=$?
+            if [ $rc -ne 0 ]; then
+              msg=$(python3 -c 'import sys; print(sys.stdin.read().replace("\n"," | ")[-3000:])' <<< "$out")
+              echo "::error::FAILED single-thread k=$k rc=$rc | $msg"
+              exit 1
+            fi
+          done
+          for k in $(seq 1 15); do
+            out=$("$bin" 2>&1)
+            rc=$?
+            if [ $rc -ne 0 ]; then
+              msg=$(python3 -c 'import sys; print(sys.stdin.read().replace("\n"," | ")[-3000:])' <<< "$out")
+              echo "::error::FAILED parallel k=$k rc=$rc | $msg"
               exit 1
             fi
           done
