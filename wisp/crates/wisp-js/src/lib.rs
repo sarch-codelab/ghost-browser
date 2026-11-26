@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 
 /// Conformidad entre los descriptores WebIDL (`wisp-idl`) y el DOM de `dom.js`.
 pub mod idl;
+/// Motor JS propio de Wisp (lexer -> parser -> AST -> bytecode -> VM).
+pub mod vm;
 
 const MAX_INLINE_SCRIPT_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_SCRIPT_BYTES: usize = 256 * 1024;
@@ -68,6 +70,7 @@ const MAX_FETCH_TOTAL_TIME: Duration = Duration::from_secs(6);
 #[derive(Default)]
 struct FetchState {
     page_url: Option<url::Url>,
+    policy: wisp_net::NetworkPolicy,
     used: usize,
     /// Fecha límite compartida por todas las peticiones de la página.
     deadline: Option<Instant>,
@@ -128,7 +131,26 @@ pub fn execute_scripts(
     page_url: Option<&str>,
     viewport_width: f32,
 ) -> Result<ScriptResult> {
+    execute_scripts_with_policy(
+        document,
+        external_scripts,
+        module_scripts,
+        page_url,
+        viewport_width,
+        &wisp_net::NetworkPolicy::from_env(),
+    )
+}
+
+pub fn execute_scripts_with_policy(
+    document: &Html,
+    external_scripts: &HashMap<String, String>,
+    module_scripts: &HashMap<String, String>,
+    page_url: Option<&str>,
+    viewport_width: f32,
+    policy: &wisp_net::NetworkPolicy,
+) -> Result<ScriptResult> {
     let page_url_owned = page_url.map(str::to_owned);
+    let policy = *policy;
     let script_selector =
         Selector::parse("script").map_err(|error| anyhow!("invalid script selector: {error}"))?;
     let mut classic = Vec::new();
@@ -360,6 +382,7 @@ pub fn execute_scripts(
         module_scripts,
         page_url_owned,
         viewport_width,
+        policy,
     )?;
     for warning in script_warnings {
         push_warning(&mut warnings, warning);
@@ -392,17 +415,40 @@ pub fn evaluate_expression(
     viewport_width: f32,
     source: &str,
 ) -> Result<EvalResult> {
+    evaluate_expression_with_policy(
+        html,
+        page_url,
+        viewport_width,
+        source,
+        &wisp_net::NetworkPolicy::from_env(),
+    )
+}
+
+pub fn evaluate_expression_with_policy(
+    html: &str,
+    page_url: Option<&str>,
+    viewport_width: f32,
+    source: &str,
+    policy: &wisp_net::NetworkPolicy,
+) -> Result<EvalResult> {
     let document = Html::parse_document(html);
     let initial = build_initial_document(&document)?;
     let page_url = page_url.map(str::to_owned);
     let source = source.to_owned();
+    let policy = *policy;
     // Boa puede necesitar más pila nativa que la que da el hilo llamante.
     std::thread::scope(|scope| {
         let handle = std::thread::Builder::new()
             .name("wisp-eval".to_owned())
             .stack_size(SCRIPT_THREAD_STACK_BYTES)
             .spawn_scoped(scope, move || {
-                evaluate_expression_on_thread(initial, page_url.as_deref(), viewport_width, &source)
+                evaluate_expression_on_thread(
+                    initial,
+                    page_url.as_deref(),
+                    viewport_width,
+                    &source,
+                    policy,
+                )
             })
             .map_err(|error| anyhow!("could not start Wisp's evaluator: {error}"))?;
         match handle.join() {
@@ -417,6 +463,7 @@ fn evaluate_expression_on_thread(
     page_url: Option<&str>,
     viewport_width: f32,
     source: &str,
+    policy: wisp_net::NetworkPolicy,
 ) -> Result<EvalResult> {
     let mut warnings = Vec::new();
     let mut context = Context::builder()
@@ -425,6 +472,7 @@ fn evaluate_expression_on_thread(
     FETCH_STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.page_url = page_url.and_then(|url| url::Url::parse(url).ok());
+        state.policy = policy;
         state.used = 0;
         state.deadline = Some(Instant::now() + MAX_FETCH_TOTAL_TIME);
         state.warnings.clear();
@@ -749,6 +797,7 @@ fn run_scripts_on_thread(
     module_scripts: &HashMap<String, String>,
     page_url: Option<String>,
     viewport_width: f32,
+    policy: wisp_net::NetworkPolicy,
 ) -> Result<(Option<String>, Vec<String>)> {
     // Boa can need more native stack than the Windows main thread provides.
     std::thread::scope(|scope| {
@@ -763,6 +812,7 @@ fn run_scripts_on_thread(
                     module_scripts,
                     page_url.as_deref(),
                     viewport_width,
+                    policy,
                 )
             }) {
             Ok(handle) => handle,
@@ -792,6 +842,7 @@ fn evaluate_scripts(
     module_scripts: &HashMap<String, String>,
     page_url: Option<&str>,
     viewport_width: f32,
+    policy: wisp_net::NetworkPolicy,
 ) -> Result<(Option<String>, Vec<String>)> {
     let mut warnings = Vec::new();
     let loader = Rc::new(WispModuleLoader::new(module_scripts, page_url));
@@ -802,6 +853,7 @@ fn evaluate_scripts(
     FETCH_STATE.with(|state| {
         let mut state = state.borrow_mut();
         state.page_url = page_url.and_then(|url| url::Url::parse(url).ok());
+        state.policy = policy;
         state.used = 0;
         state.deadline = Some(Instant::now() + MAX_FETCH_TOTAL_TIME);
         state.warnings.clear();
@@ -1042,9 +1094,14 @@ fn record_fetch_warning(warning: &str) {
 /// origen requieren `Access-Control-Allow-Origin`, igual que en un navegador.
 /// Cada fallo devuelve el motivo en texto para poder avisar.
 fn fetch_json(request: &str, method: &str) -> Result<String, String> {
-    let (page_url, used, deadline) = FETCH_STATE.with(|state| {
+    let (page_url, policy, used, deadline) = FETCH_STATE.with(|state| {
         let state = state.borrow();
-        (state.page_url.clone(), state.used, state.deadline)
+        (
+            state.page_url.clone(),
+            state.policy,
+            state.used,
+            state.deadline,
+        )
     });
     if used >= MAX_FETCHES_PER_PAGE {
         return Err(format!(
@@ -1080,6 +1137,8 @@ fn fetch_json(request: &str, method: &str) -> Result<String, String> {
     {
         return Err("fetch(): sólo se permiten URL HTTP(S) sin credenciales.".to_owned());
     }
+    wisp_net::validate_url(target.as_str(), &policy)
+        .map_err(|error| format!("fetch(): {error}"))?;
     FETCH_STATE.with(|state| state.borrow_mut().used += 1);
 
     let host = target.host_str().unwrap_or_default().to_owned();
@@ -1089,10 +1148,19 @@ fn fetch_json(request: &str, method: &str) -> Result<String, String> {
     if timeout.is_zero() {
         return Err(budget_exhausted());
     }
+    let redirect_policy = policy;
     let client = Client::builder()
         .connect_timeout(Duration::from_secs(3).min(timeout))
         .timeout(timeout)
-        .redirect(Policy::limited(5))
+        .redirect(Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 5 {
+                attempt.stop()
+            } else if wisp_net::validate_url(attempt.url().as_str(), &redirect_policy).is_err() {
+                attempt.error("fetch(): redirección bloqueada por política SSRF")
+            } else {
+                attempt.follow()
+            }
+        }))
         .user_agent("GhostWisp/0.1")
         .build()
         .map_err(|error| format!("fetch(): no se pudo preparar la petición: {error}"))?;
@@ -1875,5 +1943,24 @@ mod tests {
         let result = run(r#"<p>Static</p><script>const value = 1 + 1;</script>"#);
         assert!(result.html.is_none());
         assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn fetch_blocks_private_ips_under_strict_policy() {
+        let eval = evaluate_expression_with_policy(
+            "<p>ok</p>",
+            Some("https://example.com/"),
+            1280.0,
+            "fetch('http://127.0.0.1:47820/health').catch(e => String(e))",
+            &wisp_net::NetworkPolicy::strict(),
+        )
+        .expect("eval");
+        assert!(
+            eval.warnings
+                .iter()
+                .any(|w| w.contains("SSRF") || w.contains("127.0.0.1")),
+            "warnings={:?}",
+            eval.warnings
+        );
     }
 }

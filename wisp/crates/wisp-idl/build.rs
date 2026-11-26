@@ -567,7 +567,11 @@ fn split_top_level_commas(text: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 fn str_lit(text: &str) -> String {
-    let escaped = text.replace('\\', "\\\\").replace('"', "\\\"");
+    let escaped = text
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r");
     format!("\"{escaped}\"")
 }
 
@@ -693,5 +697,64 @@ fn generate(interfaces: &[InterfaceDef]) -> String {
     }
 
     writeln!(out, "];").unwrap();
+    writeln!(out).unwrap();
+    let js_bindings = generate_js_bindings(interfaces);
+    writeln!(
+        out,
+        "pub static JS_IDL_BINDINGS: &str = {};",
+        str_lit(&js_bindings)
+    )
+    .unwrap();
     out
+}
+
+fn generate_js_bindings(interfaces: &[InterfaceDef]) -> String {
+    let mut js = String::new();
+    writeln!(js, "// @generado por wisp-idl/build.rs").unwrap();
+    writeln!(js, "(function (g) {{").unwrap();
+    writeln!(js, "  \"use strict\";").unwrap();
+    writeln!(js, "  function link(child, parent) {{").unwrap();
+    writeln!(
+        js,
+        "    if (typeof g[child] === \"function\" && typeof g[parent] === \"function\") {{"
+    )
+    .unwrap();
+    writeln!(
+        js,
+        "      Object.setPrototypeOf(g[child].prototype, g[parent].prototype);"
+    )
+    .unwrap();
+    writeln!(js, "    }}").unwrap();
+    writeln!(js, "  }}").unwrap();
+
+    for iface in interfaces {
+        if let Some(parent) = &iface.parent {
+            writeln!(js, "  link(\"{}\", \"{}\");", iface.name, parent).unwrap();
+        }
+        if !iface.constants.is_empty() {
+            writeln!(
+                js,
+                "  if (typeof g[\"{}\"] === \"function\") {{",
+                iface.name
+            )
+            .unwrap();
+            for c in &iface.constants {
+                writeln!(
+                    js,
+                    "    Object.defineProperty(g[\"{}\"], \"{}\", {{ value: {}, enumerable: true }});",
+                    iface.name, c.name, c.value
+                )
+                .unwrap();
+                writeln!(
+                    js,
+                    "    Object.defineProperty(g[\"{}\"].prototype, \"{}\", {{ value: {}, enumerable: true }});",
+                    iface.name, c.name, c.value
+                )
+                .unwrap();
+            }
+            writeln!(js, "  }}").unwrap();
+        }
+    }
+    writeln!(js, "}})(globalThis);").unwrap();
+    js
 }

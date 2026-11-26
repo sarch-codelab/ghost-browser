@@ -14,7 +14,7 @@ jobs:
   build-and-test:
     name: Build & Test (Windows)
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -26,24 +26,24 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-root-cargo-${{ hashFiles('Cargo.lock', 'wisp/Cargo.lock') }}
 
-      - name: Check formatting
+      - name: Check formatting (root)
         run: cargo fmt --all -- --check
 
-      - name: Clippy
+      - name: Clippy (root)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build
+      - name: Build (root)
         run: cargo build --release --locked
 
-      - name: Run tests
+      - name: Run tests (root)
         run: cargo test --locked
 
   build-linux:
     name: Build (Linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -60,16 +60,81 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-root-cargo-${{ hashFiles('Cargo.lock', 'wisp/Cargo.lock') }}
 
-      - name: Check formatting
+      - name: Check formatting (root)
         run: cargo fmt --all -- --check
 
-      - name: Clippy
+      - name: Clippy (root)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build
+      - name: Build (root)
         run: cargo build --release --locked
 
-      - name: Run tests
+      - name: Run tests (root)
         run: cargo test --locked
+
+  wisp-windows:
+    name: Wisp (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wisp -> wisp/target
+          key: ${{ runner.os }}-wisp-cargo-${{ hashFiles('wisp/Cargo.lock') }}
+
+      - name: Check formatting (wisp)
+        run: cargo fmt --manifest-path wisp/Cargo.toml --all -- --check
+
+      - name: Clippy (wisp)
+        run: cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build (wisp)
+        run: cargo build --manifest-path wisp/Cargo.toml --workspace --release --locked
+
+      - name: Run tests (wisp)
+        run: cargo test --manifest-path wisp/Cargo.toml --workspace --locked
+
+  wisp-linux:
+    name: Wisp (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: wisp -> wisp/target
+          key: ${{ runner.os }}-wisp-cargo-${{ hashFiles('wisp/Cargo.lock') }}
+
+      - name: Check formatting (wisp)
+        run: cargo fmt --manifest-path wisp/Cargo.toml --all -- --check
+
+      - name: Clippy (wisp)
+        run: cargo clippy --manifest-path wisp/Cargo.toml --workspace --all-targets --all-features -- -D warnings
+
+      - name: Build (wisp)
+        run: cargo build --manifest-path wisp/Cargo.toml --workspace --release --locked
+
+      - name: Run tests (wisp)
+        run: cargo test --manifest-path wisp/Cargo.toml --workspace --locked

@@ -50,14 +50,22 @@ pub enum Route {
     Close(u64),
     Activate(u64),
     Text(u64),
+    Snapshot(u64),
     Eval(u64),
     Click(u64),
+    Fill(u64),
+    SelectOption(u64),
     Type(u64),
     Press(u64),
     Scroll(u64),
     Move(u64),
+    WaitFor(u64),
+    NetworkRequests(u64),
+    ConsoleMessages(u64),
+    Events(u64),
     Cdp(u64),
     Screenshot(u64),
+    Pdf(u64),
     Unknown,
 }
 
@@ -70,6 +78,17 @@ impl Request {
             ("GET", ["health"]) => Route::Health,
             ("GET", ["tabs"]) => Route::ListTabs,
             ("POST", ["tabs"]) => Route::OpenTab,
+            ("GET", ["tabs", id, tail]) => {
+                let Ok(id) = id.parse::<u64>() else {
+                    return Route::Unknown;
+                };
+                match *tail {
+                    "network" => Route::NetworkRequests(id),
+                    "console" => Route::ConsoleMessages(id),
+                    "events" => Route::Events(id),
+                    _ => Route::Unknown,
+                }
+            }
             ("POST", ["tabs", id, tail]) => {
                 let Ok(id) = id.parse::<u64>() else {
                     return Route::Unknown;
@@ -82,14 +101,22 @@ impl Request {
                     "close" => Route::Close(id),
                     "activate" => Route::Activate(id),
                     "text" => Route::Text(id),
+                    "snapshot" => Route::Snapshot(id),
                     "eval" => Route::Eval(id),
                     "click" => Route::Click(id),
+                    "fill" => Route::Fill(id),
+                    "select_option" => Route::SelectOption(id),
                     "type" => Route::Type(id),
                     "press" => Route::Press(id),
                     "scroll" => Route::Scroll(id),
                     "move" => Route::Move(id),
+                    "wait_for" => Route::WaitFor(id),
+                    "network" => Route::NetworkRequests(id),
+                    "console" => Route::ConsoleMessages(id),
+                    "events" => Route::Events(id),
                     "cdp" => Route::Cdp(id),
                     "screenshot" => Route::Screenshot(id),
+                    "pdf" => Route::Pdf(id),
                     _ => Route::Unknown,
                 }
             }

@@ -25,10 +25,14 @@ src/
 ```
 
 El motor Wisp y su capa de agentes viven en el workspace `wisp/`, con crates
-separados: `wisp-cdp` (subconjunto CDP + captura PNG), `wisp-mcp` (puente MCP
-stdio, agnóstico de host), `wisp-agent` (binario headless, sin UI), `wisp-idl`
-(descriptores de interfaz generados desde fragmentos WebIDL) y `wisp-js` /
-`wisp-paint` (JS y pintado propios).
+modulares: `wisp-dom` (modelo `Page -> Navigable -> Document` y orígenes),
+`wisp-css` (`default.css` + parser CSS propio), `wisp-style` (`StyleComputer`
+con buckets), `wisp-layout` (BFC/IFC/FFC/TFC y `LayoutState`), `wisp-paint`
+(display list inmutable), `wisp-net` (protección SSRF y presupuestos duros),
+`wisp-idl` (descriptores y bindings JS generados desde `.webidl`), `wisp-js`
+(Boa acotado + VM propia `wisp_js::vm`), `wisp-cdp` (capa CDP para WebView2),
+`wisp-mcp` (puente MCP stdio agnóstico de host), `wisp-agent` (binario headless
+sin UI) y `wisp-benchmark` (harness de 6 tracks).
 
 ---
 
@@ -168,10 +172,10 @@ pub struct Settings {
 
 ## 8. API Remota / MCP
 
-- **HTTP API** (`remote.rs`): rutas `health`, `tabs` (GET/POST), `navigate`, back/forward/reload/close/activate, `text`, `eval`, `click`, `type`, `press`, `scroll`, `move`, `cdp` y `screenshot`.
-- **MCP** (crate `wisp-mcp`, binarios `wisp-mcp` y el alias histórico `ghost-mcp`): expone `tools/list`, `tools/call` vía stdio JSON-RPC 2.0. Herramientas: `ghost_health`, `ghost_tabs`, `ghost_open_tab`, `ghost_navigate`, `ghost_tab_action`, `ghost_eval`, `ghost_click`, `ghost_type`, `ghost_press`, `ghost_scroll`, `ghost_move`, `ghost_screenshot` y `ghost_cdp`.
+- **HTTP API** (`remote.rs` en Ghost, `serve.rs` en `wisp-agent`): rutas `health`, `tabs` (GET/POST), `navigate`, `back`/`forward`/`reload`/`close`/`activate`, `text`, `snapshot` (`@e1`, `@e2`…), `eval`, `click` (por `@ref` o `x,y`), `fill`, `select_option`, `type`, `press`, `scroll`, `move`, `wait_for`, `network`, `console`, `events`, `cdp`, `screenshot` y `pdf`.
+- **MCP** (crate `wisp-mcp`, binarios `wisp-mcp` y `ghost-mcp`): expone `tools/list` y `tools/call` vía stdio JSON-RPC 2.0 con herramientas unificadas (`browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_pdf`, `browser_click`, `browser_fill`, `browser_type`, `browser_press_key`, `browser_select_option`, `browser_evaluate`, `browser_wait_for`, `browser_network_requests`, `browser_console_messages`, `browser_close`) y las herramientas `ghost_*`.
 
-Ambas hablan el contrato compartido `wisp_mcp::control`: el mismo cliente MCP funciona contra Ghost y contra `wisp-agent serve` sin cambiar configuración. En Ghost, `eval`, `cdp` y `screenshot` se resuelven con WebView2 (`oneshot` / IPC).
+Ambas hablan el contrato compartido `wisp_mcp::control`: el mismo cliente MCP funciona contra Ghost (WebView2 o pestañas Wisp) y contra `wisp-agent serve` sin cambiar configuración. En Ghost, `eval`, `snapshot`, `click`, `move` y `fill` funcionan también en pestañas Wisp; `wisp-agent` implementa además un dispatcher CDP headless y exportación PDF 1.4 propia.
 
 ---
 

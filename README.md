@@ -1,7 +1,7 @@
 <div align="center">
   <img src="ghost-mark.png" alt="Logotipo de Ghost" width="128">
   <h1>Ghost Browser</h1>
-  <p>Un navegador de escritorio ligero, hecho con Rust y WebView2.</p>
+  <p>Un navegador de escritorio ligero en Rust con motor propio experimental (<strong>Wisp</strong>) y WebView2 opcional, más binario headless y servidor MCP para agentes.</p>
   <p>
     <a href="https://github.com/sarch-codelab/ghost-browser/releases/latest"><img src="https://img.shields.io/github/v/release/sarch-codelab/ghost-browser" alt="Última release"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-MIT-blue" alt="Licencia MIT"></a>
@@ -127,8 +127,12 @@ con variables de entorno con prefijo `GHOST_`. Ejemplos:
 | `GHOST_SUSPEND_AFTER_SECS` | Segundos antes de suspender pestaña | `60` |
 | `GHOST_MEMORY_SAVER` | Activar ahorro de memoria | `true` |
 | `GHOST_AUTO_ENGINE` | Elegir motor automáticamente por URL | `false` |
+| `GHOST_ENGINE` | Forzar motor al arrancar (`wisp` o `webview2`) | (según ajuste) |
 | `GHOST_DOWNLOAD_DIR` | Carpeta de descargas | (sistema) |
 | `GHOST_TIMING_LOG` | Archivo de log de rendimiento/timing | (desactivado) |
+| `WISP_REMOTE_PORT` / `GHOST_REMOTE_PORT` | Puerto del API de control local | `47820` |
+| `WISP_ALLOW_PRIVATE_NETWORK` | Permitir IPs privadas/localhost en Wisp (`1`/`true`) | `false` |
+| `WISP_SCRIPT_DEADLINE_MS` / `WISP_MODULE_BUDGET_MS` / `WISP_FETCH_DEADLINE_MS` | Presupuestos duros de red y JS | `120` / `500` / `8000` |
 
 Todas las opciones están definidas en `src/store.rs` (`Settings::from_env()`).
 
@@ -146,29 +150,39 @@ entorno `GHOST_REMOTE_PORT`.
 | `POST /tabs` | `{"url": "..."}` abre una pestaña nueva |
 | `POST /tabs/{id}/navigate` | `{"url": "..."}` navega la pestaña |
 | `POST /tabs/{id}/back` `/forward` `/reload` `/close` `/activate` | Acciones de historial y gestión |
-| `POST /tabs/{id}/eval` | `{"js": "..."}` ejecuta JS en WebView2 y devuelve el resultado |
+| `POST /tabs/{id}/eval` | `{"js": "..."}` ejecuta JS (WebView2 por IPC o Wisp vía `eval_js`) y devuelve el resultado |
 | `POST /tabs/{id}/text` | Texto legible de la página (reader en Wisp, `innerText` en WebView2) |
-| `POST /tabs/{id}/click` | `{"x","y","button"?,"clicks"?}` clic real vía CDP `Input.dispatchMouseEvent` |
-| `POST /tabs/{id}/type` | `{"text": "..."}` inserta texto en el foco (`Input.insertText`) |
+| `POST /tabs/{id}/snapshot` | `{"width"?}` snapshot accesible con referencias estables `@e1`, `@e2`…, rol y centralidad |
+| `POST /tabs/{id}/click` | `{"ref"?,"x"?,"y"?,"button"?,"clicks"?}` clic por `@ref` o coordenadas CSS |
+| `POST /tabs/{id}/fill` / `select_option` | `{"ref"?,"name"?,"value"}` rellena o selecciona un control del formulario |
+| `POST /tabs/{id}/type` | `{"ref"?,"text": "..."}` inserta texto en el foco o `@ref` |
 | `POST /tabs/{id}/press` | `{"key": "enter"}` pulsa una tecla (enter, tab, esc, flechas, etc.) |
 | `POST /tabs/{id}/scroll` | `{"deltaX","deltaY","x"?,"y"?}` rueda del ratón |
-| `POST /tabs/{id}/move` | `{"x","y"}` mueve el cursor sin clicar |
-| `POST /tabs/{id}/cdp` | `{"method","params"}` llama cualquier método del Chrome DevTools Protocol y devuelve el resultado |
-| `POST /tabs/{id}/screenshot` | `{"path"?}` captura la pestaña en PNG (`CapturePreview`) y devuelve la ruta del archivo |
+| `POST /tabs/{id}/move` | `{"x","y"}` mueve el cursor o resuelve el enlace bajo `(x, y)` |
+| `POST /tabs/{id}/wait_for` | `{"text"?}` espera/comprueba la presencia de texto |
+| `GET /tabs/{id}/network` / `console` / `events` | Registro de red, mensajes de consola y eventos CDP |
+| `POST /tabs/{id}/cdp` | `{"method","params"}` método CDP (WebView2 nativo o dispatcher headless en `wisp-agent`, incl. `LP.getMarkdown`) |
+| `POST /tabs/{id}/screenshot` | `{"path"?}` captura PNG (WebView2 `CapturePreview` o rasterizador de `wisp-agent`) |
+| `POST /tabs/{id}/pdf` | `{"path"?}` exporta la página actual a PDF (`wisp-agent`) |
 
-Las acciones de entrada (`click`/`type`/`press`/`scroll`/`move`), `cdp` y
-`screenshot` usan el Chrome DevTools Protocol y `CapturePreview` de
-WebView2: coordenadas en píxeles CSS del viewport de la página. Combinadas
-con `eval` y `text`, un agente puede ver la pantalla, hacer clic, escribir
-y leer el resultado — control total del navegador.
+### `wisp-agent`: motor headless sin UI ni Chromium
 
-Ejemplo:
+El binario `wisp-agent` (dentro del workspace `wisp/`) ejecuta únicamente el motor Wisp sin `egui`, `wgpu`, `wry` ni WebView2, bloqueando IPs privadas/loopback por defecto (protección SSRF, desactivable con `--allow-private-network`):
+
+```powershell
+cargo run --manifest-path wisp/Cargo.toml --release -p wisp-agent -- fetch https://example.com --dump markdown
+cargo run --manifest-path wisp/Cargo.toml --release -p wisp-agent -- screenshot https://example.com --out out.png
+cargo run --manifest-path wisp/Cargo.toml --release -p wisp-agent -- serve --port 47820 --workers 4
+```
+
+Ejemplo contra la API HTTP:
 
 ```powershell
 curl http://127.0.0.1:47820/tabs
-curl -X POST http://127.0.0.1:47820/tabs/3/eval -d '{\"js\":\"document.title\"}'
-curl -X POST http://127.0.0.1:47820/tabs/3/click -d '{\"x\":400,\"y\":300}'
-curl -X POST http://127.0.0.1:47820/tabs/3/screenshot -d '{}'
+curl -X POST http://127.0.0.1:47820/tabs/1/snapshot -d '{}'
+curl -X POST http://127.0.0.1:47820/tabs/1/eval -d '{"js":"document.title"}'
+curl -X POST http://127.0.0.1:47820/tabs/1/click -d '{"ref":"@e1"}'
+curl -X POST http://127.0.0.1:47820/tabs/1/screenshot -d '{}'
 ```
 
 ### `wisp-mcp`: Ghost (y el motor headless) como herramienta MCP
@@ -181,10 +195,10 @@ scripts propios — puede usar el navegador como herramienta nativa sin tocar la
 API HTTP directamente:
 
 ```powershell
-cargo build --release -p wisp-mcp   # se ejecuta dentro de wisp/
+cargo build --manifest-path wisp/Cargo.toml --release -p wisp-mcp
 ```
 
-El **mismo binario y la misma configuración** controlan Ghost (WebView2) o el
+El **mismo binario y la misma configuración** controlan Ghost (WebView2/Wisp) o el
 motor headless `wisp-agent serve`; solo cambia el puerto, que se fija con
 `WISP_REMOTE_PORT` / `GHOST_REMOTE_PORT` (por defecto `127.0.0.1:47820`).
 
@@ -200,19 +214,13 @@ Configuración MCP de ejemplo:
 }
 ```
 
-Herramientas expuestas: `ghost_health`, `ghost_tabs`, `ghost_open_tab`,
-`ghost_navigate`, `ghost_tab_action` (back/forward/reload/close/activate/
-text), `ghost_eval`, `ghost_click`, `ghost_type`, `ghost_press`,
-`ghost_scroll`, `ghost_move`, `ghost_screenshot` y `ghost_cdp` (acceso
-crudo al Chrome DevTools Protocol).
-
-> Contra `wisp-agent`, las rutas que dependen del motor nativo (eval, click,
-> type, press, scroll, move, cdp, screenshot) aún devuelven un error explícito;
-> se habilitan al completar los bloques de DOM/JS e Input del backlog.
+Herramientas expuestas:
+- **Unificadas (`browser_*`)**: `browser_navigate`, `browser_snapshot` (`@e1`, `@e2`…), `browser_screenshot`, `browser_pdf`, `browser_click` (por `ref` o `x,y`), `browser_fill`, `browser_type`, `browser_press_key`, `browser_select_option`, `browser_evaluate`, `browser_wait_for`, `browser_network_requests`, `browser_console_messages`, `browser_close`.
+- **Históricas (`ghost_*`)**: `ghost_health`, `ghost_tabs`, `ghost_open_tab`, `ghost_navigate`, `ghost_tab_action`, `ghost_eval`, `ghost_click`, `ghost_type`, `ghost_press`, `ghost_scroll`, `ghost_move`, `ghost_screenshot` y `ghost_cdp`.
 
 > **Aviso de seguridad**: la API no tiene autenticación porque solo escucha
 > en loopback, pero cualquier proceso local de tu equipo puede controlar el
-> navegador mientras Ghost esté abierto. No la expongas a la red.
+> navegador mientras Ghost o `wisp-agent serve` estén abiertos. No la expongas a la red.
 
 ## Privacidad y datos
 
@@ -238,8 +246,14 @@ Para comprobar el formato y ejecutar las pruebas:
 ```powershell
 cargo fmt --all -- --check
 cargo check --all-targets
-cargo test --bin ghost
-cargo test -p wisp-engine
+cargo test --locked
+cargo test --manifest-path wisp/Cargo.toml --workspace --locked
+```
+
+Para ejecutar los benchmarks del motor (`wisp-benchmark`, tabla en [`WISP_RESULTS.md`](WISP_RESULTS.md)):
+
+```bash
+./scripts/run-all.sh
 ```
 
 Para probar con la feature de rendimiento:

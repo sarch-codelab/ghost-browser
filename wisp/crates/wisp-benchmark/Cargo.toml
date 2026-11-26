@@ -1,0 +1,10 @@
+[package]
+name = "wisp-benchmark"
+version = "0.1.0"
+edition = "2024"
+description = "Wisp benchmark harness matching Obscura's 6 tracks: WPT, obstacle, compare, realworld, reliability, perf."
+license = "MIT"
+
+[dependencies]
+serde_json = "1.0"
+wisp-engine = { path = "../.." }

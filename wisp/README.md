@@ -1,16 +1,34 @@
 # Wisp Engine
 
-Wisp is an experimental Rust rendering-engine project for Ghost. It fetches
-HTTP/HTTPS HTML documents when used by Ghost, parses them with an HTML5 parser,
-computes a small block-flow layout, and emits paint commands for Ghost's UI.
+Wisp is an experimental Rust web engine workspace (`wisp-engine` + modular crates).
+It powers both Ghost's optional in-process engine and the standalone headless
+`wisp-agent` binary (zero UI/WebView dependencies).
 
-## Run the prototype
+## Workspace structure
+
+- `wisp-dom`: `Page -> Navigable -> Document` model, origins (`Opaque` / `Http`), history, iframes, and `document.write()`.
+- `wisp-css`: User-Agent stylesheet (`default.css`), custom CSS parser (`CssSheet`, `@media`, `@supports`), `var()`, `calc()`, `min()`, `max()`, `clamp()`, and specificity.
+- `wisp-style`: `StyleComputer` with right-most selector buckets (`#id`, `.class`, `tag`, `*`) and `UA -> Author -> Inline` cascade.
+- `wisp-layout`: own layout IR and formatting contexts (`Block`, `Inline`, `Flex`, `Table`), `LayoutState`, CSS 2.1 margin collapse, and anonymous block wrapping (running alongside `taffy` during migration).
+- `wisp-paint`: immutable `PaintCommand` display list (`FillRect`, `StrokeRect`, `Text`, `Image`, `BackgroundImage`, `Clip`/`ClipEnd`).
+- `wisp-js`: bounded Boa runtime + `dom.js` + native bytecode VM (`wisp_js::vm`, lexer -> parser -> AST -> bytecode -> stack VM).
+- `wisp-idl`: build-time WebIDL parser generating Rust descriptors (`INTERFACES`) and JS prototype/constant bindings (`JS_IDL_BINDINGS`).
+- `wisp-net`: SSRF guardrails (private/loopback/link-local/metadata IP & DNS-rebinding checks, `--allow-private-network`) and hard deadline budgets (`WISP_SCRIPT_DEADLINE_MS`, `WISP_MODULE_BUDGET_MS`, `WISP_FETCH_DEADLINE_MS`).
+- `wisp-cdp`: CDP helper for WebView2 hosts.
+- `wisp-mcp`: shared HTTP control contract (`control`) and stdio JSON-RPC 2.0 MCP server (`browser_*` and `ghost_*` tools).
+- `wisp-agent`: headless CLI (`fetch`, `screenshot`, `serve`) with PNG rasterizer, PDF 1.4 export, `@ref` snapshots, headless CDP dispatcher, SSRF protection, and `--workers` pool.
+- `wisp-benchmark`: 6-track benchmark harness (`wpt`, `obstacle`, `compare`, `realworld`, `reliability`, `perf`; invoked via `scripts/run-all.sh`).
+
+## Run the prototype & headless agent
 
 From the repository root:
 
 ```powershell
 cargo run --manifest-path wisp/Cargo.toml -- wisp/examples/hello.html 800
 cargo run --manifest-path wisp/Cargo.toml -- wisp/examples/dom.html 800
+cargo run --manifest-path wisp/Cargo.toml -p wisp-agent -- fetch https://example.com --dump markdown
+cargo run --manifest-path wisp/Cargo.toml -p wisp-agent -- screenshot https://example.com
+cargo run --manifest-path wisp/Cargo.toml -p wisp-agent -- serve --port 47820 --workers 4
 ```
 
 `hello.html` covers inline text updates; `dom.html` creates nodes, attaches a

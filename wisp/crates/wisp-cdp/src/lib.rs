@@ -6,7 +6,9 @@
 //! WebView2 comparta la misma capa CDP. Sólo Windows compila la implementación
 //! real; en otras plataformas las funciones devuelven un error limpio.
 
-use serde_json::{Value, json};
+use serde_json::Value;
+#[cfg(windows)]
+use serde_json::json;
 use std::sync::mpsc::Sender;
 
 /// Lanza un método CDP sin esperar resultado (fire-and-forget). El handler

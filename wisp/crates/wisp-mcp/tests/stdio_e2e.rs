@@ -86,8 +86,10 @@ impl Drop for Host {
 }
 
 fn spawn_host(binary: &Path, port: u16) -> Host {
+    let port_str = port.to_string();
+    let args = ["serve", "--port", &port_str, "--allow-private-network"];
     let child = Command::new(binary)
-        .args(["serve", "--port", &port.to_string()])
+        .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -288,6 +290,16 @@ fn the_mcp_bridge_drives_wisp_agent_over_stdio() {
         "la captura debe ser un PNG"
     );
 
+    // Snapshot accesible con referencias `@e1` antes de clicar.
+    let snap = bridge.tool("browser_snapshot", json!({"tab_id": tab_id}));
+    let snap_ok = snap.get("ok").and_then(Value::as_bool);
+    assert_eq!(snap_ok, Some(true), "{snap}");
+    assert_eq!(
+        snap.pointer("/refs/0/ref").and_then(Value::as_str),
+        Some("@e1"),
+        "{snap}"
+    );
+
     // `click` sobre el enlace navega. El hit-testing depende de la maquetación,
     // así que se prueban unas cuantas alturas hasta acertar el enlace.
     let mut navigated = String::new();
@@ -320,5 +332,35 @@ fn the_mcp_bridge_drives_wisp_agent_over_stdio() {
         "{title_after}"
     );
 
+    // CDP headless (`LP.getMarkdown`) y `browser_network_requests`.
+    let md = bridge.tool(
+        "ghost_cdp",
+        json!({"tab_id": tab_id, "method": "LP.getMarkdown", "params": {}}),
+    );
+    assert_eq!(md.get("ok").and_then(Value::as_bool), Some(true), "{md}");
+    assert!(
+        md.pointer("/result/markdown")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .contains("llegaste"),
+        "{md}"
+    );
+    let net = bridge.tool("browser_network_requests", json!({"tab_id": tab_id}));
+    assert_eq!(net.get("ok").and_then(Value::as_bool), Some(true), "{net}");
+
+    let pdf_path = std::env::temp_dir().join("wisp_mcp_e2e.pdf");
+    let pdf_res = bridge.tool(
+        "browser_pdf",
+        json!({"tab_id": tab_id, "path": pdf_path.to_string_lossy()}),
+    );
+    assert_eq!(
+        pdf_res.get("ok").and_then(Value::as_bool),
+        Some(true),
+        "{pdf_res}"
+    );
+    let pdf_bytes = std::fs::read(&pdf_path).expect("leer el PDF exportado");
+    assert!(pdf_bytes.starts_with(b"%PDF-1.4"), "el export debe ser PDF");
+
     let _ = std::fs::remove_file(&shot_path);
+    let _ = std::fs::remove_file(&pdf_path);
 }

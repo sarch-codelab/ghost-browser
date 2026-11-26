@@ -1,0 +1,8 @@
+[package]
+name = "wisp-net"
+version = "0.1.0"
+edition = "2024"
+description = "Wisp networking guardrails: SSRF protection, DNS rebinding check and hard budgets."
+license = "MIT"
+
+[dependencies]
