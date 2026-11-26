@@ -75,11 +75,19 @@ jobs:
       - name: Run tests (root)
         run: |
           bin=$(cargo test --locked --no-run --message-format=json | python3 -c 'import json,sys; [print(d["executable"]) for l in sys.stdin if l.startswith("{") for d in [json.loads(l)] if d.get("reason")=="compiler-artifact" and d.get("profile",{}).get("test") and d.get("executable")]' | head -n1)
-          for i in $(seq 1 10); do
-            out=$(gdb -batch -ex "run" -ex "thread apply all bt" "$bin" 2>&1)
-            rc=$?
-            if echo "$out" | grep -qE "SIGABRT|received signal|Program terminated"; then
-              msg=$(python3 -c 'import sys; print(sys.stdin.read().replace("\n"," | ")[-3500:])' <<< "ITER=$i RC=$rc | $out")
+          ulimit -c unlimited
+          for i in $(seq 1 20); do
+            if ! out=$("$bin" 2>&1); then
+              rc=$?
+              bt=$(gdb -batch -ex "run" -ex "thread apply all bt" "$bin" 2>&1 | tail -n 80 || true)
+              core=$(ls -t core* 2>/dev/null | head -n1 || true)
+              cbt=""
+              if [ -n "$core" ]; then
+                cbt=$(gdb -batch -ex "thread apply all bt" "$bin" "$core" 2>&1 | tail -n 80 || true)
+              elif command -v coredumpctl >/dev/null 2>&1; then
+                cbt=$(coredumpctl debug --debugger=gdb --debugger-arguments="-batch -ex 'thread apply all bt'" 2>&1 | tail -n 80 || true)
+              fi
+              msg=$(python3 -c 'import sys; print(sys.stdin.read().replace("\n"," | ")[-3500:])' <<< "ITER=$i RC=$rc CORE=$core | OUT=${out: -800} | CBT=$cbt | BT=$bt")
               echo "::error::$msg"
               exit 1
             fi
