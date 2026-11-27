@@ -477,10 +477,8 @@ impl CookieJar {
                         "none" => same_site = SameSite::None,
                         _ => same_site = SameSite::Lax,
                     },
-                    "max-age" => {
-                        if v_trim.parse::<i64>().is_ok_and(|s| s <= 0) {
-                            max_age_zero = true;
-                        }
+                    "max-age" if v_trim.parse::<i64>().is_ok_and(|s| s <= 0) => {
+                        max_age_zero = true;
                     }
                     _ => {}
                 }
@@ -587,10 +585,10 @@ fn path_matches(req_path: &str, cookie_path: &str) -> bool {
     if req_path == cookie_path {
         return true;
     }
-    if req_path.starts_with(cookie_path) {
-        return cookie_path.ends_with('/') || req_path[cookie_path.len()..].starts_with('/');
+    match req_path.strip_prefix(cookie_path) {
+        Some(rest) => cookie_path.ends_with('/') || rest.starts_with('/'),
+        None => false,
     }
-    false
 }
 
 #[cfg(test)]

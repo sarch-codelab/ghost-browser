@@ -517,7 +517,7 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             let options = state.options.clone();
             let id = state.next_id;
             state.next_id += 1;
-            let mut tab = Tab::new(id, &url);
+            let mut tab = Tab::new(id, url);
             let response = load(&mut tab, &options);
             state.tabs.push(tab);
             state.active = Some(id);
@@ -1896,7 +1896,7 @@ fn collect_selector_ids(
     }
 }
 
-fn find_dom_node<'a>(node: &'a Value, node_id: u64) -> Option<&'a Value> {
+fn find_dom_node(node: &Value, node_id: u64) -> Option<&Value> {
     if node.get("nodeId").and_then(Value::as_u64) == Some(node_id) {
         return Some(node);
     }

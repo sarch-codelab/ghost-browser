@@ -668,9 +668,10 @@ fn render_victory_table(report: &Value) -> String {
 
     // Solo cifras propias: mezclar estos tracks con los informes de otros motores
     // (que miden WPT y corpus reales) haría parecer una victoria lo que no lo es.
+    let platform = format!("{} {}", std::env::consts::OS, std::env::consts::ARCH);
     let table = format!(
         "# WISP_RESULTS.md — Resultados medidos de Wisp\n\n\
-         Mediciones de `wisp-benchmark --track all` en {}. El motor es propio (`wisp-js::vm`\n\
+         Mediciones de `wisp-benchmark --track all` en {platform}. El motor es propio (`wisp-js::vm`\n\
          en Rust puro, sin V8 ni Boa).\n\n\
          | Métrica | Wisp (medido) |\n\
          |---|---|\n\
@@ -688,7 +689,6 @@ fn render_victory_table(report: &Value) -> String {
          > ningún otro motor. Las filas «WPT» cuentan casos escritos a mano, no subtests de\n\
          > WPT, y las de React/Preact/Vue miden un script propio que crea unos pocos nodos,\n\
          > no los frameworks. Estas cifras sirven para seguir la evolución de Wisp.{rss}\n",
-        format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
         sample_str("react"),
         sample_str("preact"),
         sample_str("vue"),

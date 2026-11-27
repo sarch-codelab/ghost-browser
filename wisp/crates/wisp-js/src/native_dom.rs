@@ -2670,6 +2670,9 @@ impl HostBridge for NativeDomHost<'_> {
     }
 }
 
+// Entrada del pipeline de scripts: recibe cada pieza del documento ya
+// resuelta por el llamador; agruparlas en una struct solo movería el mismo ruido.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_scripts_native(
     document: &Html,
     classic: Vec<(String, String)>,
@@ -3250,8 +3253,6 @@ fn fill_random_bytes(out: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn geometry_computed_style_and_element_from_point() {
         let html = r#"<html><body><div id="box" style="width: 240px; height: 80px; color: red;">Hola</div></body></html>"#;

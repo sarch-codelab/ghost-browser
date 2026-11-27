@@ -9281,7 +9281,9 @@ fetch("http://{data_address}/data.json").then(function () {{
 
     #[test]
     fn taffy_flex_geometry_feeds_get_bounding_client_rect() {
-        let html = r#"<html><body><div style="display: flex; width: 400px;"><div id="a" style="width: 100px; height: 50px;">A</div><div id="b" style="width: 120px; height: 50px;">B</div></div></body></html>"#;
+        // El fixture fija `margin: 0` en el body: la prueba mide el layout flex,
+        // no el margen por defecto del UA (8 px), que desplazaría el origen.
+        let html = r#"<html><body style="margin: 0"><div style="display: flex; width: 400px;"><div id="a" style="width: 100px; height: 50px;">A</div><div id="b" style="width: 120px; height: 50px;">B</div></div></body></html>"#;
         let page = FetchedPage::new(
             "https://example.com/".to_owned(),
             "Layout".to_owned(),
@@ -9298,7 +9300,8 @@ fetch("http://{data_address}/data.json").then(function () {{
             return [a.x, a.width, b.x, b.width];
         })()"#;
         let res = page.eval_js(js).expect("eval ok");
-        let expected = serde_json::json!([0.0, 100.0, 100.0, 120.0]);
+        // La VM serializa números en su forma canónica (0.0 → 0), como Chrome.
+        let expected = serde_json::json!([0, 100, 100, 120]);
         assert_eq!(res.value, Some(expected));
     }
 }

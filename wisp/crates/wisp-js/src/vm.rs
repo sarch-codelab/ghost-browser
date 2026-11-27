@@ -626,7 +626,7 @@ enum Expr {
     SetIndex(Box<Expr>, Box<Expr>, Box<Expr>),
     UpdateVar(String, f64, bool),
     NewDyn(Box<Expr>, Vec<ArrayElem>),
-    ClassExpr(
+    Class(
         Option<String>,
         Option<String>,
         Option<(Vec<String>, Vec<Stmt>)>,
@@ -1599,7 +1599,7 @@ impl Parser {
             }
             Tok::KwClass => {
                 let (name, parent, ctor, methods, statics) = self.parse_class_tail()?;
-                Ok(Expr::ClassExpr(name, parent, ctor, methods, statics))
+                Ok(Expr::Class(name, parent, ctor, methods, statics))
             }
             Tok::KwNew => {
                 // `new Foo(...)` es el caso común; `new (expr)(...)` aparece en
@@ -2247,7 +2247,7 @@ impl Compiler {
                 self.compile_expr(rhs, code);
                 code.push(Op::IndexSet);
             }
-            Expr::ClassExpr(name, parent, ctor, methods, statics) => {
+            Expr::Class(name, parent, ctor, methods, statics) => {
                 let ctor_id = ctor.as_ref().map(|(p, b)| self.compile_fn(p, b));
                 let mut compiled = Vec::with_capacity(methods.len());
                 for (mname, params, body) in methods {
@@ -3576,7 +3576,16 @@ impl VmRuntime {
                 let len = s.encode_utf16().count() as f64;
                 Ok(JsVal::Number(len))
             }
+            // Un constructor de clase expone sus métodos `static`; el resto de
+            // handles (Math, JSON, window…) los resuelve el host.
             JsVal::NativeHandle(h) => {
+                if h == "Math" {
+                    return Ok(match prop {
+                        "PI" => JsVal::Number(std::f64::consts::PI),
+                        "E" => JsVal::Number(std::f64::consts::E),
+                        _ => JsVal::Undefined,
+                    });
+                }
                 let mid = self
                     .classes
                     .get(h)
@@ -3587,11 +3596,6 @@ impl VmRuntime {
                     None => host.get_prop(self, &JsVal::NativeHandle(h.clone()), prop),
                 }
             }
-            JsVal::NativeHandle(h) if h == "Math" => Ok(match prop {
-                "PI" => JsVal::Number(std::f64::consts::PI),
-                "E" => JsVal::Number(std::f64::consts::E),
-                _ => JsVal::Undefined,
-            }),
             JsVal::Object(id) => {
                 let map = self.objects.get(*id);
                 if let Some(m) = map {
