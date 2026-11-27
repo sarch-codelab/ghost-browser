@@ -8,9 +8,12 @@ use crate::cdp::{CdpEvent, base64_encode};
 use crate::pdf;
 use crate::ws::{self, WsMessage};
 use anyhow::{Context, Result, bail};
+use scraper::{ElementRef, Html, Selector};
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::collections::{HashMap, HashSet};
+use std::io::Read;
+#[cfg(test)]
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -44,6 +47,31 @@ struct ServeConfig {
     options: FetchOptions,
 }
 
+/// Viewport emulado por `Emulation.setDeviceMetricsOverride`.
+#[derive(Clone, Debug)]
+struct Viewport {
+    width: u32,
+    height: u32,
+    screen_width: u32,
+    screen_height: u32,
+    device_scale_factor: f64,
+    mobile: bool,
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        let width = crate::DEFAULT_VIEWPORT_WIDTH.round() as u32;
+        Self {
+            width,
+            height: 800,
+            screen_width: width,
+            screen_height: 800,
+            device_scale_factor: 1.0,
+            mobile: false,
+        }
+    }
+}
+
 struct Tab {
     id: u64,
     url: String,
@@ -60,6 +88,55 @@ struct Tab {
     io_streams: HashMap<String, Vec<u8>>,
     screencast_active: bool,
     fetch_intercept: bool,
+    /// Viewport que pidió el cliente por CDP; manda en layout y capturas.
+    viewport: Viewport,
+    network_enabled: bool,
+    log_enabled: bool,
+    /// Identificador del contexto de ejecución del documento actual. Chrome
+    /// crea uno nuevo por navegación y Playwright lo necesita para evaluar.
+    execution_context: u64,
+    /// Mundo aislado creado por el cliente (`Page.createIsolatedWorld`).
+    world_name: Option<String>,
+    /// Handles sintéticos para `Runtime.callFunctionOn` (el DOM es efímero,
+    /// así que un `objectId` guarda el valor serializado, no una referencia).
+    object_handles: HashMap<String, Value>,
+    next_handle: u64,
+    /// Contexto de navegador CDP al que pertenece la pestaña.
+    context_id: String,
+}
+
+impl Tab {
+    fn new(id: u64, url: &str) -> Self {
+        Self {
+            id,
+            url: url.to_owned(),
+            title: String::new(),
+            history: vec![url.to_owned()],
+            index: 0,
+            page: None,
+            error: None,
+            focused_ref: None,
+            network_log: Vec::new(),
+            console_log: Vec::new(),
+            events: Vec::new(),
+            cookies: HashMap::new(),
+            io_streams: HashMap::new(),
+            screencast_active: false,
+            fetch_intercept: false,
+            viewport: Viewport::default(),
+            network_enabled: false,
+            log_enabled: false,
+            execution_context: 1,
+            world_name: None,
+            object_handles: HashMap::new(),
+            next_handle: 1,
+            context_id: "default".to_owned(),
+        }
+    }
+
+    fn viewport_width(&self) -> f32 {
+        self.viewport.width as f32
+    }
 }
 
 struct State {
@@ -71,6 +148,14 @@ struct State {
     started_at: Instant,
     requests_served: u64,
     worker_recycles: u64,
+    /// Eventos de nivel navegador (`Target.attachedToTarget`), que no
+    /// pertenecen a ninguna pestaña concreta.
+    events: Vec<CdpEvent>,
+    /// Contextos CDP creados por el cliente con `Target.createBrowserContext`.
+    browser_contexts: Vec<String>,
+    /// Targets ya anunciados con `Target.attachedToTarget`. Playwright reenvía
+    /// `Target.setAutoAttach` y falla con «Duplicate target» si se repiten.
+    announced_targets: HashSet<u64>,
 }
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -169,6 +254,9 @@ pub fn run(args: &[String]) -> Result<()> {
         started_at: Instant::now(),
         requests_served: 0,
         worker_recycles: 0,
+        events: Vec::new(),
+        browser_contexts: Vec::new(),
+        announced_targets: HashSet::new(),
     }));
 
     // Pool acotado de workers con reciclado por edad/RSS.
@@ -429,23 +517,7 @@ fn handle(request: &control::Request, state: &Arc<Mutex<State>>) -> Value {
             let options = state.options.clone();
             let id = state.next_id;
             state.next_id += 1;
-            let mut tab = Tab {
-                id,
-                url: url.to_string(),
-                title: String::new(),
-                history: vec![url.to_string()],
-                index: 0,
-                page: None,
-                error: None,
-                focused_ref: None,
-                network_log: Vec::new(),
-                console_log: Vec::new(),
-                events: Vec::new(),
-                cookies: HashMap::new(),
-                io_streams: HashMap::new(),
-                screencast_active: false,
-                fetch_intercept: false,
-            };
+            let mut tab = Tab::new(id, &url);
             let response = load(&mut tab, &options);
             state.tabs.push(tab);
             state.active = Some(id);
@@ -878,6 +950,104 @@ fn handle_cdp(state: &Arc<Mutex<State>>, tab_id: u64, body: &Value) -> Value {
             }
         }),
         "Target.setDiscoverTargets" => json!({"ok": true, "result": {}}),
+        "Target.getBrowserContexts" => {
+            json!({"ok": true, "result": {"browserContextIds": s.browser_contexts}})
+        }
+        "Target.disposeBrowserContext" => {
+            if let Some(id) = params.get("browserContextId").and_then(Value::as_str) {
+                s.browser_contexts.retain(|known| known != id);
+                s.tabs.retain(|tab| tab.context_id != id);
+            }
+            json!({"ok": true, "result": {}})
+        }
+        // Playwright los emite al adjuntarse al navegador. No hay descargas
+        // gestionadas ni permisos que conceder en el motor headless.
+        "Browser.setDownloadBehavior"
+        | "Browser.grantPermissions"
+        | "Browser.resetPermissions"
+        | "Browser.setWindowBounds"
+        | "Browser.getWindowBounds"
+        | "Browser.getBrowserCommandLine"
+        | "Browser.crash"
+        | "Browser.close" => json!({"ok": true, "result": {}}),
+        "Target.createBrowserContext" => {
+            // Ids únicos por contexto: un id fijo hace que Playwright reutilice
+            // un contexto ya cerrado y pierda la página recién creada.
+            let id = format!("ctx-{}", s.browser_contexts.len() + 1);
+            s.browser_contexts.push(id.clone());
+            json!({"ok": true, "result": {"browserContextId": id}})
+        }
+        "Target.activateTarget" => json!({"ok": true, "result": {}}),
+        "Target.getTargetInfo" => {
+            let target_id = params.get("targetId").and_then(Value::as_str).unwrap_or("");
+            let found = s
+                .tabs
+                .iter()
+                .find(|tab| target_id.is_empty() || format!("tab-{}", tab.id) == target_id);
+            match found {
+                Some(tab) => json!({
+                    "ok": true,
+                    "result": {"targetInfo": {
+                        "targetId": format!("tab-{}", tab.id),
+                        "type": "page",
+                        "title": tab.title,
+                        "url": tab.url,
+                        "attached": true,
+                        "browserContextId": tab.context_id,
+                    }}
+                }),
+                // Sin pestañas, el objetivo del navegador sigue siendo válido.
+                None if target_id.is_empty() => json!({
+                    "ok": true,
+                    "result": {"targetInfo": {
+                        "targetId": "wisp-browser",
+                        "type": "browser",
+                        "title": "",
+                        "url": "",
+                        "attached": true,
+                        "browserContextId": "default",
+                    }}
+                }),
+                None => json!({"ok": false, "error": format!("target {target_id} no encontrado")}),
+            }
+        }
+        "Target.detachFromTarget" => json!({"ok": true, "result": {}}),
+        // Playwright conecta en modo «flatten» y espera un
+        // `Target.attachedToTarget` por cada pestaña existente.
+        "Target.setAutoAttach" => {
+            let pending: Vec<(u64, String, String, String)> = s
+                .tabs
+                .iter()
+                .filter(|t| !s.announced_targets.contains(&t.id))
+                .map(|t| (t.id, t.title.clone(), t.url.clone(), t.context_id.clone()))
+                .collect();
+            for (id, title, url, context_id) in pending {
+                s.announced_targets.insert(id);
+                // El cliente nuevo no debe recibir notificaciones anteriores a
+                // su adjunción: reproducirlas hace que Playwright cree frames
+                // que luego descarta («Frame has been detached»).
+                if let Some(tab) = s.tabs.iter_mut().find(|t| t.id == id) {
+                    tab.events.clear();
+                    tab.network_log.clear();
+                }
+                s.events.push(CdpEvent {
+                    method: "Target.attachedToTarget".into(),
+                    params: json!({
+                        "sessionId": format!("sess-tab-{id}"),
+                        "targetInfo": {
+                            "targetId": format!("tab-{id}"),
+                            "type": "page",
+                            "title": title,
+                            "url": url,
+                            "attached": true,
+                            "browserContextId": context_id,
+                        },
+                        "waitingForDebugger": false,
+                    }),
+                });
+            }
+            json!({"ok": true, "result": {}})
+        }
         "Target.getTargets" => {
             let target_infos: Vec<Value> = s
                 .tabs
@@ -889,6 +1059,7 @@ fn handle_cdp(state: &Arc<Mutex<State>>, tab_id: u64, body: &Value) -> Value {
                         "title": t.title,
                         "url": t.url,
                         "attached": true,
+                        "browserContextId": t.context_id,
                     })
                 })
                 .collect();
@@ -898,8 +1069,43 @@ fn handle_cdp(state: &Arc<Mutex<State>>, tab_id: u64, body: &Value) -> Value {
             let target_id = params
                 .get("targetId")
                 .and_then(Value::as_str)
-                .unwrap_or("tab-1");
-            json!({"ok": true, "result": {"sessionId": format!("sess-{target_id}")}})
+                .unwrap_or("tab-1")
+                .to_owned();
+            let session_id = format!("sess-{target_id}");
+            let pending = s.tabs.iter().find_map(|tab| {
+                (format!("tab-{}", tab.id) == target_id && !s.announced_targets.contains(&tab.id))
+                    .then(|| {
+                        (
+                            tab.id,
+                            tab.title.clone(),
+                            tab.url.clone(),
+                            tab.context_id.clone(),
+                        )
+                    })
+            });
+            if let Some((id, title, url, context_id)) = pending {
+                s.announced_targets.insert(id);
+                if let Some(tab) = s.tabs.iter_mut().find(|t| t.id == id) {
+                    tab.events.clear();
+                }
+                let event = CdpEvent {
+                    method: "Target.attachedToTarget".into(),
+                    params: json!({
+                        "sessionId": session_id,
+                        "targetInfo": {
+                            "targetId": target_id,
+                            "type": "page",
+                            "title": title,
+                            "url": url,
+                            "attached": true,
+                            "browserContextId": context_id,
+                        },
+                        "waitingForDebugger": false,
+                    }),
+                };
+                s.events.push(event);
+            }
+            json!({"ok": true, "result": {"sessionId": session_id}})
         }
         "Target.createTarget" => {
             let url = params
@@ -908,36 +1114,63 @@ fn handle_cdp(state: &Arc<Mutex<State>>, tab_id: u64, body: &Value) -> Value {
                 .unwrap_or("about:blank");
             let id = s.next_id;
             s.next_id += 1;
-            let mut tab = Tab {
-                id,
-                url: url.to_owned(),
-                title: String::new(),
-                history: vec![url.to_owned()],
-                index: 0,
-                page: None,
-                error: None,
-                focused_ref: None,
-                network_log: Vec::new(),
-                console_log: Vec::new(),
-                events: Vec::new(),
-                cookies: HashMap::new(),
-                io_streams: HashMap::new(),
-                screencast_active: false,
-                fetch_intercept: false,
-            };
+            let context_id = params
+                .get("browserContextId")
+                .and_then(Value::as_str)
+                .unwrap_or("default")
+                .to_owned();
+            let mut tab = Tab::new(id, url);
+            tab.context_id = context_id;
             if is_web_url(url) {
                 let _ = load(&mut tab, &options);
             }
+            let target_id = format!("tab-{id}");
+            let title = tab.title.clone();
+            let current_url = tab.url.clone();
+            let tab_context = tab.context_id.clone();
             s.active = Some(id);
+            s.announced_targets.insert(id);
             s.tabs.push(tab);
-            json!({"ok": true, "result": {"targetId": format!("tab-{id}")}})
+            s.events.push(CdpEvent {
+                method: "Target.attachedToTarget".into(),
+                params: json!({
+                    "sessionId": format!("sess-tab-{id}"),
+                    "targetInfo": {
+                        "targetId": target_id.clone(),
+                        "type": "page",
+                        "title": title,
+                        "url": current_url,
+                        "attached": true,
+                        "browserContextId": tab_context,
+                    },
+                    "waitingForDebugger": false,
+                }),
+            });
+            json!({"ok": true, "result": {"targetId": target_id}})
         }
         "Target.closeTarget" => {
-            if let Some(target_id) = params.get("targetId").and_then(Value::as_str)
-                && let Some(id_str) = target_id.strip_prefix("tab-")
+            let target_id = params
+                .get("targetId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_default();
+            if let Some(id_str) = target_id.strip_prefix("tab-")
                 && let Ok(id) = id_str.parse::<u64>()
             {
                 s.tabs.retain(|t| t.id != id);
+                s.announced_targets.remove(&id);
+                if s.active == Some(id) {
+                    s.active = s.tabs.last().map(|t| t.id);
+                }
+                // Chrome anuncia el desmontaje; Playwright espera este evento
+                // para completar `page.close()`.
+                s.events.push(CdpEvent {
+                    method: "Target.detachedFromTarget".into(),
+                    params: json!({
+                        "sessionId": format!("sess-tab-{id}"),
+                        "targetId": target_id,
+                    }),
+                });
             }
             json!({"ok": true, "result": {"success": true}})
         }
@@ -952,19 +1185,107 @@ fn handle_cdp(state: &Arc<Mutex<State>>, tab_id: u64, body: &Value) -> Value {
 
 fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, options: &FetchOptions) -> Value {
     match method {
-        "Page.enable"
-        | "DOM.enable"
+        // Chrome publica el contexto del documento en cuanto se habilita Page;
+        // sin él Playwright no puede evaluar nada en el frame (`title()`, `locator`).
+        "Page.enable" => {
+            emit_execution_context(tab);
+            json!({"ok": true, "result": {}})
+        }
+        "DOM.enable"
         | "Page.setLifecycleEventsEnabled"
-        | "Emulation.setDeviceMetricsOverride" => json!({"ok": true, "result": {}}),
+        | "Page.setBypassCSP"
+        | "Page.setDownloadBehavior"
+        | "Page.bringToFront"
+        | "Runtime.runIfWaitingForDebugger"
+        | "Network.setCacheDisabled"
+        | "Network.setExtraHTTPHeaders"
+        | "Network.setUserAgentOverride"
+        | "Network.clearBrowserCache"
+        | "Network.setBlockedURLs"
+        | "Security.setIgnoreCertificateErrors"
+        | "Emulation.setLocaleOverride"
+        | "Emulation.setUserAgentOverride"
+        | "Emulation.setFocusEmulationEnabled"
+        | "Emulation.setEmulatedMedia"
+        | "Emulation.setScrollbarsHidden"
+        | "Emulation.setDefaultBackgroundColorOverride"
+        | "Inspector.enable"
+        | "Inspector.disable"
+        | "Debugger.enable"
+        | "Debugger.disable"
+        | "Debugger.setAsyncCallStackDepth"
+        | "Runtime.setAsyncCallStackDepth"
+        | "Runtime.discardConsoleEntries"
+        | "Page.setPrerenderAllowed"
+        | "Target.setAutoAttach"
+        | "Target.setDiscoverTargets" => json!({"ok": true, "result": {}}),
+        // Playwright/Puppeteer inyectan su script de utilidades al conectar.
+        // El motor no ejecuta ese bundle (usa sintaxis fuera del alcance del
+        // VM acotado), así que se acepta la petición sin romper el handshake.
+        "Page.addScriptToEvaluateOnNewDocument" => json!({
+            "ok": true,
+            "result": {"identifier": format!("wisp-script-{}", now_ms())}
+        }),
+        "Emulation.setDeviceMetricsOverride" => {
+            let width = params.get("width").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let height = params.get("height").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let dsf = params
+                .get("deviceScaleFactor")
+                .and_then(Value::as_f64)
+                .unwrap_or(1.0);
+            let mobile = params
+                .get("mobile")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if width > 0 {
+                tab.viewport.width = width;
+                tab.viewport.screen_width = width;
+            }
+            if height > 0 {
+                tab.viewport.height = height;
+                tab.viewport.screen_height = height;
+            }
+            if dsf > 0.0 {
+                tab.viewport.device_scale_factor = dsf;
+            }
+            tab.viewport.mobile = mobile;
+            json!({"ok": true, "result": {}})
+        }
+        "Emulation.clearDeviceMetricsOverride" => {
+            tab.viewport = Viewport::default();
+            json!({"ok": true, "result": {}})
+        }
+        "Page.getLayoutMetrics" => {
+            let width = tab.viewport_width();
+            let Some(page) = &tab.page else {
+                return page_missing_error(tab);
+            };
+            let doc = match page.layout(width) {
+                Ok(doc) => doc,
+                Err(error) => return json!({"ok": false, "error": error.to_string()}),
+            };
+            let w = doc.viewport_width as f64;
+            let h = doc.content_height.max(tab.viewport.height as f32) as f64;
+            json!({
+                "ok": true,
+                "result": {
+                    "layoutViewport": {"pageX": 0, "pageY": 0, "clientWidth": w, "clientHeight": f64::from(tab.viewport.height)},
+                    "contentSize": {"x": 0, "y": 0, "width": w, "height": h},
+                    "cssLayoutViewport": {"pageX": 0, "pageY": 0, "clientWidth": w, "clientHeight": f64::from(tab.viewport.height)},
+                    "cssContentSize": {"x": 0, "y": 0, "width": w, "height": h},
+                }
+            })
+        }
         "Page.getFrameTree" => json!({
             "ok": true,
             "result": {
                 "frameTree": {
                     "frame": {
-                        "id": format!("frame-{}", tab.id),
-                        "loaderId": format!("loader-{}", tab.id),
+                        "id": frame_id(tab),
+                        "loaderId": loader_id(tab),
                         "url": tab.url,
                         "mimeType": "text/html",
+                        "securityOrigin": origin_of(&tab.url),
                     }
                 }
             }
@@ -982,12 +1303,24 @@ fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, options: &Fetch
             if wait_until == "networkidle0" {
                 settle_network_idle(tab, &mut res);
             }
+            // Chrome responde `Page.navigate` con éxito de protocolo y
+            // `errorText` cuando la carga falla; un `ok:false` lo convertiría
+            // Playwright en "CDP error" en vez de un error de navegación.
+            let error_text = if res.get("ok").and_then(Value::as_bool) == Some(true) {
+                String::new()
+            } else {
+                res.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("navegación fallida")
+                    .to_owned()
+            };
             json!({
-                "ok": res.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                "ok": true,
                 "result": {
-                    "frameId": format!("frame-{}", tab.id),
-                    "loaderId": format!("loader-{}", tab.id),
+                    "frameId": frame_id(tab),
+                    "loaderId": loader_id(tab),
                     "url": tab.url,
+                    "errorText": error_text,
                 },
                 "events": tab.events.iter().map(CdpEvent::to_json).collect::<Vec<_>>(),
             })
@@ -995,6 +1328,18 @@ fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, options: &Fetch
         "Page.reload" => {
             let res = load(tab, options);
             json!({"ok": res.get("ok").and_then(Value::as_bool).unwrap_or(false), "result": {}})
+        }
+        "Page.createIsolatedWorld" => {
+            let world = params
+                .get("worldName")
+                .and_then(Value::as_str)
+                .unwrap_or("wisp-utility")
+                .to_owned();
+            tab.execution_context += 1;
+            let context = tab.execution_context;
+            tab.world_name = Some(world.clone());
+            emit_context(tab, context, Some(world));
+            json!({"ok": true, "result": {"executionContextId": context}})
         }
         "Page.getNavigationHistory" => {
             let entries: Vec<Value> = tab
@@ -1006,10 +1351,11 @@ fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, options: &Fetch
             json!({"ok": true, "result": {"currentIndex": tab.index, "entries": entries}})
         }
         "Page.captureScreenshot" => {
+            let width = tab.viewport_width();
             let Some(page) = &tab.page else {
                 return page_missing_error(tab);
             };
-            match crate::render::render(page, crate::DEFAULT_VIEWPORT_WIDTH) {
+            match crate::render::render(page, width) {
                 Ok(shot) => json!({
                     "ok": true,
                     "result": {"data": base64_encode(&shot.png)}
@@ -1053,7 +1399,79 @@ fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, options: &Fetch
             tab.screencast_active = false;
             json!({"ok": true, "result": {}})
         }
-        "Runtime.enable" | "Network.enable" => json!({"ok": true, "result": {}}),
+        "Runtime.enable" => json!({"ok": true, "result": {}}),
+        "Runtime.getProperties" => json!({"ok": true, "result": {"result": []}}),
+        "Runtime.releaseObject" => {
+            if let Some(handle) = params.get("objectId").and_then(Value::as_str) {
+                tab.object_handles.remove(handle);
+            }
+            json!({"ok": true, "result": {}})
+        }
+        "Runtime.releaseObjectGroup" => {
+            tab.object_handles.clear();
+            json!({"ok": true, "result": {}})
+        }
+        "Network.enable" => {
+            tab.network_enabled = true;
+            json!({"ok": true, "result": {}})
+        }
+        "Network.disable" => {
+            tab.network_enabled = false;
+            json!({"ok": true, "result": {}})
+        }
+        "Log.enable" => {
+            tab.log_enabled = true;
+            json!({"ok": true, "result": {}})
+        }
+        "Log.disable" => {
+            tab.log_enabled = false;
+            json!({"ok": true, "result": {}})
+        }
+        "Log.clear" => json!({"ok": true, "result": {}}),
+        "Runtime.callFunctionOn" => {
+            let Some(decl) = params.get("functionDeclaration").and_then(Value::as_str) else {
+                return json!({"ok": false, "error": "falta 'functionDeclaration'"});
+            };
+            let mut args = Vec::new();
+            for arg in params
+                .get("arguments")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+            {
+                if let Some(value) = arg.get("value") {
+                    args.push(serde_json::to_string(value).unwrap_or_else(|_| "null".into()));
+                } else if let Some(handle) = arg.get("objectId").and_then(Value::as_str) {
+                    let stored = tab
+                        .object_handles
+                        .get(handle)
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    args.push(serde_json::to_string(&stored).unwrap_or_else(|_| "null".into()));
+                } else {
+                    args.push("undefined".to_owned());
+                }
+            }
+            let return_by_value = params
+                .get("returnByValue")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let source = format!("({decl})({})", args.join(","));
+            let res = eval_in_tab(tab, &source);
+            let value = res.get("result").cloned().unwrap_or(Value::Null);
+            let mut remote = json!({"type": cdp_type_of(&value), "value": value.clone()});
+            if !return_by_value {
+                let handle = format!("obj-{}", tab.next_handle);
+                tab.next_handle += 1;
+                tab.object_handles.insert(handle.clone(), value);
+                remote["objectId"] = json!(handle);
+            }
+            json!({
+                "ok": res.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                "result": {"result": remote},
+                "error": res.get("error").cloned().unwrap_or(Value::Null),
+            })
+        }
         "Runtime.evaluate" => {
             let expr = params
                 .get("expression")
@@ -1062,37 +1480,60 @@ fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, options: &Fetch
             if expr.is_empty() {
                 return json!({"ok": false, "error": "falta 'expression'"});
             }
+            let return_by_value = params
+                .get("returnByValue")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let res = eval_in_tab(tab, expr);
             let value = res.get("result").cloned().unwrap_or(Value::Null);
-            let cdp_type = match &value {
-                Value::Null => "object",
-                Value::Bool(_) => "boolean",
-                Value::Number(_) => "number",
-                Value::String(_) => "string",
-                Value::Array(_) | Value::Object(_) => "object",
-            };
+            let mut remote = json!({"type": cdp_type_of(&value), "value": value.clone()});
+            if !return_by_value {
+                let handle = format!("obj-{}", tab.next_handle);
+                tab.next_handle += 1;
+                tab.object_handles.insert(handle.clone(), value);
+                remote["objectId"] = json!(handle);
+            }
+            if res.get("ok").and_then(Value::as_bool) != Some(true) {
+                return json!({
+                    "ok": false,
+                    "error": res
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("evaluación fallida"),
+                });
+            }
             json!({
-                "ok": res.get("ok").and_then(Value::as_bool).unwrap_or(false),
-                "result": {"result": {"type": cdp_type, "value": value}},
+                "ok": true,
+                "result": {"result": remote},
             })
         }
         "DOM.getDocument" => {
-            let html = tab
-                .page
-                .as_ref()
-                .and_then(|p| p.document_html().ok())
-                .unwrap_or_default();
+            let depth = params.get("depth").and_then(Value::as_i64).unwrap_or(-1);
+            match build_dom_root(tab, depth) {
+                Ok(root) => json!({"ok": true, "result": {"root": root}}),
+                Err(response) => response,
+            }
+        }
+        "DOM.describeNode" => {
+            let node_id = params.get("nodeId").and_then(Value::as_u64).unwrap_or(0);
+            match build_dom_root(tab, -1) {
+                Ok(root) => match find_dom_node(&root, node_id) {
+                    Some(node) => json!({"ok": true, "result": {"node": node}}),
+                    None => json!({"ok": false, "error": format!("nodo {node_id} no encontrado")}),
+                },
+                Err(response) => response,
+            }
+        }
+        "DOM.resolveNode" => {
+            let node_id = params.get("nodeId").and_then(Value::as_u64).unwrap_or(0);
             json!({
                 "ok": true,
-                "result": {
-                    "root": {
-                        "nodeId": 1,
-                        "nodeType": 9,
-                        "nodeName": "#document",
-                        "documentURL": tab.url,
-                        "outerHTMLLength": html.len(),
-                    }
-                }
+                "result": {"object": {
+                    "type": "object",
+                    "subtype": "node",
+                    "objectId": format!("node-{node_id}"),
+                    "description": format!("Wisp node {node_id}"),
+                }}
             })
         }
         "DOM.getOuterHTML" => {
@@ -1103,18 +1544,20 @@ fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, options: &Fetch
                 .unwrap_or_default();
             json!({"ok": true, "result": {"outerHTML": html}})
         }
-        "DOM.querySelector" | "DOM.querySelectorAll" => {
+        "DOM.querySelector" => {
             let selector = params.get("selector").and_then(Value::as_str).unwrap_or("");
-            let Some(page) = &tab.page else {
-                return page_missing_error(tab);
-            };
-            let js = format!(
-                "Array.from(document.querySelectorAll({})).map(e => e.outerHTML)",
-                serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into())
-            );
-            match page.eval_js(&js) {
-                Ok(eval) => json!({"ok": true, "result": {"matches": eval.value}}),
-                Err(error) => json!({"ok": false, "error": error.to_string()}),
+            match dom_query_ids(tab, selector) {
+                Ok(ids) => {
+                    json!({"ok": true, "result": {"nodeId": ids.first().copied().unwrap_or(0)}})
+                }
+                Err(response) => response,
+            }
+        }
+        "DOM.querySelectorAll" => {
+            let selector = params.get("selector").and_then(Value::as_str).unwrap_or("");
+            match dom_query_ids(tab, selector) {
+                Ok(ids) => json!({"ok": true, "result": {"nodeIds": ids}}),
+                Err(response) => response,
             }
         }
         "Network.getResponseBody" => {
@@ -1162,28 +1605,51 @@ fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, options: &Fetch
                 .get("type")
                 .and_then(Value::as_str)
                 .unwrap_or("mousePressed");
-            let hit = hit_target(tab, x, y).ok().flatten();
-            if event_type == "mouseReleased"
-                && let Some(ref target) = hit
-                && let Some(url) = &target.url
-            {
-                let nav = navigate(tab, url, options);
-                return json!({"ok": true, "result": {"navigated": nav}});
+            match event_type {
+                "mouseMoved" => {
+                    let hit = hit_target(tab, x, y).ok().flatten();
+                    json!({"ok": true, "result": {"target": hit.as_ref().map(target_json)}})
+                }
+                // El foco se guarda como atributo del DOM porque el contexto de
+                // JavaScript de Wisp es efímero entre evaluaciones.
+                "mousePressed" => {
+                    let focused = eval_and_commit(tab, &focus_at_point_js(x, y));
+                    json!({
+                        "ok": focused.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                        "result": {"focused": focused.get("value").cloned().unwrap_or(Value::Null)},
+                        "error": focused.get("error").cloned().unwrap_or(Value::Null),
+                    })
+                }
+                "mouseReleased" => {
+                    let clicked = eval_and_commit(tab, &click_at_point_js(x, y));
+                    let hit = hit_target(tab, x, y).ok().flatten();
+                    if let Some(target) = hit
+                        && let Some(url) = target.url.clone()
+                    {
+                        let nav = navigate(tab, &url, options);
+                        let ok = nav.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                        return json!({
+                            "ok": ok,
+                            "result": {"navigated": true, "url": url},
+                            "error": nav.get("error").cloned().unwrap_or(Value::Null),
+                        });
+                    }
+                    json!({
+                        "ok": true,
+                        "result": {"clicked": clicked.get("value").cloned().unwrap_or(Value::Null)},
+                    })
+                }
+                _ => json!({"ok": true, "result": {}}),
             }
-            json!({"ok": true, "result": {"target": hit.as_ref().map(target_json)}})
         }
         "Input.insertText" => {
             let text = params.get("text").and_then(Value::as_str).unwrap_or("");
-            let target_ref = tab.focused_ref.clone();
-            fill_control(tab, target_ref.as_deref(), None, text)
+            input_insert_text(tab, text)
         }
         "Input.dispatchKeyEvent" => {
             let key = params.get("key").and_then(Value::as_str).unwrap_or("");
-            tab.events.push(CdpEvent {
-                method: "Input.dispatchKeyEvent".into(),
-                params: json!({"key": key}),
-            });
-            json!({"ok": true, "result": {}})
+            let text = params.get("text").and_then(Value::as_str).unwrap_or("");
+            input_key(tab, key, text)
         }
         "LP.getMarkdown" => {
             let Some(page) = &tab.page else {
@@ -1203,6 +1669,248 @@ fn dispatch_tab_cdp(tab: &mut Tab, method: &str, params: &Value, options: &Fetch
 
 fn js_quote(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
+}
+
+fn cdp_type_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "object",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) | Value::Object(_) => "object",
+    }
+}
+
+/// Envuelve el resultado interno (`{ok, value}`) en la forma de respuesta CDP.
+fn shape_result(res: Value, result: Value) -> Value {
+    if res.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        json!({"ok": true, "result": result})
+    } else {
+        json!({
+            "ok": false,
+            "error": res
+                .get("error")
+                .cloned()
+                .unwrap_or_else(|| json!("error desconocido")),
+        })
+    }
+}
+
+/// Guarda el HTML mutado por un script como nueva versión viva de la página,
+/// igual que hace `fill_control` después de escribir en un control.
+fn commit_html(tab: &mut Tab, html: String) {
+    let Some(page) = &tab.page else { return };
+    let updated = FetchedPage::new(
+        page.final_url.clone(),
+        page.title.clone(),
+        html,
+        page.stylesheets.clone(),
+        page.external_scripts.clone(),
+        page.module_scripts.clone(),
+        page.images.clone(),
+        page.warnings.clone(),
+    );
+    tab.page = Some(updated);
+}
+
+/// Evalúa `js`, persiste las mutaciones del DOM y devuelve `{ok, value}`.
+/// Las advertencias del motor se publican como `Log.entryAdded` cuando el
+/// cliente activó `Log.enable`.
+fn eval_and_commit(tab: &mut Tab, js: &str) -> Value {
+    let Some(page) = &tab.page else {
+        return page_missing_error(tab);
+    };
+    match page.eval_js(js) {
+        Ok(result) => {
+            let value = result.value.clone().unwrap_or(Value::Null);
+            for warning in &result.warnings {
+                tab.console_log.push(ConsoleRecord {
+                    level: "warning".into(),
+                    text: warning.clone(),
+                    timestamp_ms: now_ms(),
+                });
+                if tab.log_enabled {
+                    tab.events.push(CdpEvent {
+                        method: "Log.entryAdded".into(),
+                        params: json!({"entry": {
+                            "source": "javascript",
+                            "level": "warning",
+                            "text": warning,
+                            "timestamp": now_ms() as f64,
+                        }}),
+                    });
+                }
+            }
+            if let Some(html) = result.html {
+                commit_html(tab, html);
+            }
+            json!({"ok": true, "value": value})
+        }
+        Err(error) => json!({"ok": false, "error": error.to_string()}),
+    }
+}
+
+// El foco no puede vivir en el runtime de JavaScript porque el contexto de Wisp
+// es efímero entre evaluaciones: se marca el nodo con un atributo del DOM.
+// El marcador es una clase porque el motor de selectores del DOM nativo solo
+// entiende `tag`, `#id` y `.class` (no selectores de atributo).
+const JS_FOCUS_AT: &str = r#"(function(){var el=document.elementFromPoint(X,Y);if(!el)return '';var old=document.querySelectorAll('.__wisp_focus');for(var i=0;i<old.length;i++){old[i].classList.remove('__wisp_focus');}el.classList.add('__wisp_focus');return (el.getAttribute('name')||el.getAttribute('id')||el.nodeName||'');})()"#;
+const JS_CLICK_AT: &str = r#"(function(){var el=document.elementFromPoint(X,Y);if(!el)return false;el.click();return true;})()"#;
+const JS_INSERT_TEXT: &str = r#"(function(t){var el=document.querySelector('.__wisp_focus');if(!el)return false;el.value=(el.value||'')+t;el.setAttribute('value',el.value);return true;})"#;
+const JS_KEY_ENTER: &str = r#"(function(){var el=document.querySelector('.__wisp_focus');if(!el)return 'none';var f=el.form;if(f&&f.submit){f.submit();return 'submit';}el.click();return 'click';})()"#;
+const JS_KEY_TAB: &str = r#"(function(){var els=document.querySelectorAll('a,button,input,select,textarea');if(!els.length)return false;var cur=document.querySelector('.__wisp_focus');var idx=-1;for(var i=0;i<els.length;i++){if(els[i]===cur){idx=i;}}var next=els[idx+1];if(!next){next=els[0];}if(cur){cur.classList.remove('__wisp_focus');}next.classList.add('__wisp_focus');return true;})()"#;
+const JS_KEY_BACKSPACE: &str = r#"(function(){var el=document.querySelector('.__wisp_focus');if(!el)return false;var v=el.value||'';el.value=v.substring(0,v.length-1);el.setAttribute('value',el.value);return true;})()"#;
+const JS_KEY_ESCAPE: &str = r#"(function(){var all=document.querySelectorAll('.__wisp_focus');for(var i=0;i<all.length;i++){all[i].classList.remove('__wisp_focus');}return true;})()"#;
+
+fn focus_at_point_js(x: f64, y: f64) -> String {
+    JS_FOCUS_AT
+        .replace('X', &x.to_string())
+        .replace('Y', &y.to_string())
+}
+
+fn click_at_point_js(x: f64, y: f64) -> String {
+    JS_CLICK_AT
+        .replace('X', &x.to_string())
+        .replace('Y', &y.to_string())
+}
+
+fn input_insert_text(tab: &mut Tab, text: &str) -> Value {
+    let source = format!("{JS_INSERT_TEXT}({})", js_quote(text));
+    shape_result(eval_and_commit(tab, &source), json!({}))
+}
+
+/// Traduce `Input.dispatchKeyEvent` a acciones del DOM. Las teclas sin efecto
+/// propio se tratan como texto (`text`), que es lo que envía Playwright al
+/// escribir carácter a carácter.
+fn input_key(tab: &mut Tab, key: &str, text: &str) -> Value {
+    let normalized = key.to_ascii_lowercase();
+    let handler = match normalized.as_str() {
+        "enter" | "return" => Some(JS_KEY_ENTER),
+        "tab" => Some(JS_KEY_TAB),
+        "backspace" | "delete" => Some(JS_KEY_BACKSPACE),
+        "escape" | "esc" => Some(JS_KEY_ESCAPE),
+        _ => None,
+    };
+    if let Some(js) = handler {
+        let res = eval_and_commit(tab, js);
+        let applied = res.get("value").cloned().unwrap_or(Value::Null);
+        return shape_result(res, json!({"applied": applied}));
+    }
+    if !text.is_empty() {
+        return input_insert_text(tab, text);
+    }
+    json!({"ok": true, "result": {"applied": false}})
+}
+
+/// HTML vivo de la pestaña tal como lo ve el motor (ya con las mutaciones de
+/// los scripts), o el cuerpo original si la etapa de scripts falló.
+fn live_html(tab: &Tab) -> Option<String> {
+    let page = tab.page.as_ref()?;
+    Some(page.document_html().unwrap_or_else(|_| page.html.clone()))
+}
+
+/// Árbol DOM en la forma de `DOM.getDocument`: `nodeId` 1 es el documento y los
+/// elementos se numeran en pre-orden desde 2, igual que `dom_query_ids`.
+///
+/// Se construye en Rust con el mismo parser del motor y no en JavaScript: el
+/// VM acotado de Wisp no conserva contadores mutables entre llamadas anidadas,
+/// así que un recorrido en JS devolvía `nodeId: null`.
+fn build_dom_root(tab: &Tab, depth: i64) -> std::result::Result<Value, Value> {
+    let Some(html) = live_html(tab) else {
+        return Err(page_missing_error(tab));
+    };
+    let document = Html::parse_document(&html);
+    let mut next = 1u64;
+    let root = element_to_cdp(&document.root_element(), &mut next, depth);
+    Ok(json!({
+        "nodeId": 1,
+        "backendNodeId": 1,
+        "nodeType": 9,
+        "nodeName": "#document",
+        "localName": "",
+        "nodeValue": "",
+        "documentURL": tab.url,
+        "childNodeCount": 1,
+        "children": [root],
+    }))
+}
+
+fn element_to_cdp(element: &ElementRef, next: &mut u64, depth: i64) -> Value {
+    *next += 1;
+    let id = *next;
+    let attributes: Vec<Value> = element
+        .value()
+        .attrs()
+        .flat_map(|(name, value)| [json!(name), json!(value)])
+        .collect();
+    let children: Vec<ElementRef> = element.children().filter_map(ElementRef::wrap).collect();
+    let mut node = json!({
+        "nodeId": id,
+        "backendNodeId": id,
+        "nodeType": 1,
+        "nodeName": element.value().name().to_ascii_uppercase(),
+        "localName": element.value().name(),
+        "nodeValue": "",
+        "attributes": attributes,
+        "childNodeCount": children.len(),
+    });
+    if depth != 0 && !children.is_empty() {
+        let child_depth = if depth < 0 { depth } else { depth - 1 };
+        let kids: Vec<Value> = children
+            .iter()
+            .map(|child| element_to_cdp(child, next, child_depth))
+            .collect();
+        node["children"] = json!(kids);
+    }
+    node
+}
+
+fn dom_query_ids(tab: &Tab, selector: &str) -> std::result::Result<Vec<u64>, Value> {
+    let Some(html) = live_html(tab) else {
+        return Err(page_missing_error(tab));
+    };
+    let Ok(parsed) = Selector::parse(selector) else {
+        return Ok(Vec::new());
+    };
+    let document = Html::parse_document(&html);
+    let mut next = 1u64;
+    let mut found = Vec::new();
+    collect_selector_ids(&document.root_element(), &parsed, &mut next, &mut found);
+    Ok(found)
+}
+
+fn collect_selector_ids(
+    element: &ElementRef,
+    selector: &Selector,
+    next: &mut u64,
+    found: &mut Vec<u64>,
+) {
+    *next += 1;
+    let id = *next;
+    if selector.matches(element) {
+        found.push(id);
+    }
+    let children: Vec<ElementRef> = element.children().filter_map(ElementRef::wrap).collect();
+    for child in &children {
+        collect_selector_ids(child, selector, next, found);
+    }
+}
+
+fn find_dom_node<'a>(node: &'a Value, node_id: u64) -> Option<&'a Value> {
+    if node.get("nodeId").and_then(Value::as_u64) == Some(node_id) {
+        return Some(node);
+    }
+    for child in node
+        .get("children")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(found) = find_dom_node(child, node_id) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn fill_by_name_js(name: &str, value: &str) -> String {
@@ -1364,6 +2072,51 @@ fn navigate(tab: &mut Tab, url: &str, options: &FetchOptions) -> Value {
     load(tab, options)
 }
 
+/// En Chrome el frame principal comparte identificador con el target de la
+/// pestaña, y Playwright indexa sus sesiones por ese id.
+fn frame_id(tab: &Tab) -> String {
+    format!("tab-{}", tab.id)
+}
+
+fn loader_id(tab: &Tab) -> String {
+    format!("loader-{}", tab.id)
+}
+
+fn origin_of(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => format!("{scheme}://{}", rest.split('/').next().unwrap_or("")),
+        None => "null".to_owned(),
+    }
+}
+
+fn emit_context(tab: &mut Tab, context: u64, world: Option<String>) {
+    let frame = frame_id(tab);
+    let origin = origin_of(&tab.url);
+    // Playwright distingue el mundo principal por `isDefault` y el aislado por
+    // `name`: sin este último no puede evaluar en el mundo de utilidades.
+    let (name, is_default, kind) = match &world {
+        Some(name) => (name.clone(), false, "isolated"),
+        None => ("main".to_owned(), true, "default"),
+    };
+    tab.events.push(CdpEvent {
+        method: "Runtime.executionContextCreated".into(),
+        params: json!({
+            "context": {
+                "id": context,
+                "origin": origin,
+                "name": name,
+                "uniqueId": format!("ctx-{context}"),
+                "auxData": {"frameId": frame, "isDefault": is_default, "type": kind},
+            }
+        }),
+    });
+}
+
+fn emit_execution_context(tab: &mut Tab) {
+    let context = tab.execution_context;
+    emit_context(tab, context, None);
+}
+
 fn load(tab: &mut Tab, options: &FetchOptions) -> Value {
     let started = Instant::now();
     let now = now_ms();
@@ -1397,13 +2150,43 @@ fn load(tab: &mut Tab, options: &FetchOptions) -> Value {
                     timestamp_ms: now,
                 });
             }
+            let frame = frame_id(tab);
+            let loader = loader_id(tab);
+            let origin = origin_of(&tab.url);
             tab.events.push(CdpEvent {
                 method: "Page.frameNavigated".into(),
-                params: json!({"frame": {"id": format!("frame-{}", tab.id), "url": tab.url}}),
+                params: json!({
+                    "frame": {
+                        "id": frame,
+                        "loaderId": loader,
+                        "url": tab.url,
+                        "mimeType": "text/html",
+                        "securityOrigin": origin,
+                    }
+                }),
             });
+            tab.execution_context += 1;
+            emit_execution_context(tab);
+            if let Some(world) = tab.world_name.clone() {
+                tab.execution_context += 1;
+                let context = tab.execution_context;
+                emit_context(tab, context, Some(world));
+            }
+            let stamp = elapsed as f64 / 1000.0;
+            for name in ["DOMContentLoaded", "load"] {
+                tab.events.push(CdpEvent {
+                    method: "Page.lifecycleEvent".into(),
+                    params: json!({
+                        "frameId": frame,
+                        "loaderId": loader,
+                        "name": name,
+                        "timestamp": stamp,
+                    }),
+                });
+            }
             tab.events.push(CdpEvent {
                 method: "Page.loadEventFired".into(),
-                params: json!({"timestamp": elapsed as f64 / 1000.0}),
+                params: json!({"timestamp": stamp}),
             });
             tab.error = None;
             let response = json!({"ok": true, "id": tab.id, "url": tab.url, "title": tab.title});
@@ -1436,8 +2219,8 @@ fn settle_network_idle(tab: &mut Tab, response: &mut Value) {
         tab.events.push(CdpEvent {
             method: "Page.lifecycleEvent".into(),
             params: json!({
-                "frameId": format!("frame-{}", tab.id),
-                "loaderId": format!("loader-{}", tab.id),
+                "frameId": frame_id(tab),
+                "loaderId": loader_id(tab),
                 "name": "networkIdle",
                 "timestamp": now_ms() as f64 / 1000.0,
             }),
@@ -1467,23 +2250,7 @@ fn handle_cdp_discovery(request: &control::Request, state: &Arc<Mutex<State>>) -
             if s.tabs.is_empty() {
                 let id = s.next_id;
                 s.next_id += 1;
-                s.tabs.push(Tab {
-                    id,
-                    url: "about:blank".to_owned(),
-                    title: String::new(),
-                    history: vec!["about:blank".to_owned()],
-                    index: 0,
-                    page: None,
-                    error: None,
-                    focused_ref: None,
-                    network_log: Vec::new(),
-                    console_log: Vec::new(),
-                    events: Vec::new(),
-                    cookies: HashMap::new(),
-                    io_streams: HashMap::new(),
-                    screencast_active: false,
-                    fetch_intercept: false,
-                });
+                s.tabs.push(Tab::new(id, "about:blank"));
                 s.active = Some(id);
             }
             let port = s.port;
@@ -1521,23 +2288,7 @@ fn handle_cdp_discovery(request: &control::Request, state: &Arc<Mutex<State>>) -
             let options = s.options.clone();
             let id = s.next_id;
             s.next_id += 1;
-            let mut tab = Tab {
-                id,
-                url: url.clone(),
-                title: String::new(),
-                history: vec![url.clone()],
-                index: 0,
-                page: None,
-                error: None,
-                focused_ref: None,
-                network_log: Vec::new(),
-                console_log: Vec::new(),
-                events: Vec::new(),
-                cookies: HashMap::new(),
-                io_streams: HashMap::new(),
-                screencast_active: false,
-                fetch_intercept: false,
-            };
+            let mut tab = Tab::new(id, &url);
             if is_web_url(&url) {
                 let _ = load(&mut tab, &options);
             }
@@ -1604,6 +2355,13 @@ fn serve_ws_cdp(mut stream: TcpStream, state: Arc<Mutex<State>>, tab_hint: Optio
                     .to_owned();
                 let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
 
+                // Los métodos de navegador no pertenecen a ninguna pestaña y
+                // un navegador CDP recién conectado no tiene páginas: crear
+                // una pestaña fantasma aquí rompe el contexto de Playwright
+                // (ve una página que luego no puede reconstruir).
+                let browser_level = method.starts_with("Browser.")
+                    || method.starts_with("Target.")
+                    || method.starts_with("SystemInfo.");
                 let target_tab_id = {
                     let mut s = lock(&state);
                     let chosen = tab_hint
@@ -1615,53 +2373,38 @@ fn serve_ws_cdp(mut stream: TcpStream, state: Arc<Mutex<State>>, tab_hint: Optio
                                 .and_then(|num| num.parse::<u64>().ok())
                         })
                         .or(s.active);
-                    if let Some(tid) = chosen
-                        && s.tabs.iter().any(|t| t.id == tid)
-                    {
-                        tid
-                    } else {
-                        let nid = s.next_id;
-                        s.next_id += 1;
-                        s.tabs.push(Tab {
-                            id: nid,
-                            url: "about:blank".to_owned(),
-                            title: String::new(),
-                            history: vec!["about:blank".to_owned()],
-                            index: 0,
-                            page: None,
-                            error: None,
-                            focused_ref: None,
-                            network_log: Vec::new(),
-                            console_log: Vec::new(),
-                            events: Vec::new(),
-                            cookies: HashMap::new(),
-                            io_streams: HashMap::new(),
-                            screencast_active: false,
-                            fetch_intercept: false,
-                        });
-                        s.active = Some(nid);
-                        nid
+                    match chosen {
+                        Some(tid) if s.tabs.iter().any(|t| t.id == tid) => tid,
+                        _ if browser_level => 0,
+                        _ => {
+                            let nid = s.next_id;
+                            s.next_id += 1;
+                            s.tabs.push(Tab::new(nid, "about:blank"));
+                            s.active = Some(nid);
+                            nid
+                        }
                     }
                 };
+
+                // Traza opcional del protocolo para depurar clientes CDP
+                // reales (Playwright, Puppeteer): WISP_CDP_TRACE=1.
+                let traced = std::env::var_os("WISP_CDP_TRACE").is_some();
+                if traced {
+                    eprintln!(
+                        "<- [{target_tab_id}] {method} {}{}",
+                        params,
+                        session_id
+                            .as_ref()
+                            .and_then(Value::as_str)
+                            .map(|sid| format!(" (session {sid})"))
+                            .unwrap_or_default()
+                    );
+                }
 
                 let cdp_body = json!({"method": method, "params": params});
                 let resp = handle_cdp(&state, target_tab_id, &cdp_body);
-
-                let pending_events: Vec<Value> = {
-                    let mut s = lock(&state);
-                    if let Some(tab) = s.tabs.iter_mut().find(|t| t.id == target_tab_id) {
-                        tab.events.drain(..).map(|e| e.to_json()).collect()
-                    } else {
-                        Vec::new()
-                    }
-                };
-                for mut ev in pending_events {
-                    if let Some(ref sid) = session_id {
-                        ev["sessionId"] = sid.clone();
-                    }
-                    if ws::write_ws_text(&mut stream, &ev.to_string()).is_err() {
-                        return;
-                    }
+                if traced {
+                    eprintln!("-> [{target_tab_id}] {method} {resp}");
                 }
 
                 let mut rpc = if resp.get("ok").and_then(Value::as_bool).unwrap_or(false) {
@@ -1682,9 +2425,41 @@ fn serve_ws_cdp(mut stream: TcpStream, state: Arc<Mutex<State>>, tab_hint: Optio
                         }
                     })
                 };
-                if let Some(sid) = session_id {
-                    rpc["sessionId"] = sid;
+                if let Some(ref sid) = session_id {
+                    rpc["sessionId"] = sid.clone();
                 }
+
+                // Las notificaciones salen **antes** de la respuesta, como en
+                // Chrome: Playwright hace `_crPages.get(targetId)._page` nada
+                // más resolver `Target.createTarget`, así que el
+                // `Target.attachedToTarget` de ese target tiene que haber
+                // llegado ya.
+                let pending_events: Vec<Value> = {
+                    let mut s = lock(&state);
+                    let mut events: Vec<Value> = s.events.drain(..).map(|e| e.to_json()).collect();
+                    if let Some(tab) = s.tabs.iter_mut().find(|t| t.id == target_tab_id) {
+                        events.extend(tab.events.drain(..).map(|e| e.to_json()));
+                    }
+                    events
+                };
+                for mut ev in pending_events {
+                    // `Target.attachedToTarget` anuncia una sesión nueva y viaja
+                    // a nivel navegador. Etiquetarlo con la sesión de la
+                    // petición en curso hace que Playwright lo lea como una
+                    // auto-adjunción de esa página y descarte el target.
+                    let session_scoped =
+                        ev.get("method").and_then(Value::as_str) != Some("Target.attachedToTarget");
+                    if session_scoped && let Some(ref sid) = session_id {
+                        ev["sessionId"] = sid.clone();
+                    }
+                    if traced {
+                        eprintln!("=> [{target_tab_id}] evento {ev}");
+                    }
+                    if ws::write_ws_text(&mut stream, &ev.to_string()).is_err() {
+                        return;
+                    }
+                }
+
                 if ws::write_ws_text(&mut stream, &rpc.to_string()).is_err() {
                     break;
                 }
@@ -1734,6 +2509,9 @@ mod tests {
             started_at: Instant::now(),
             requests_served: 0,
             worker_recycles: 0,
+            events: Vec::new(),
+            browser_contexts: Vec::new(),
+            announced_targets: HashSet::new(),
         }))
     }
 
@@ -1797,6 +2575,14 @@ mod tests {
                 io_streams: HashMap::new(),
                 screencast_active: false,
                 fetch_intercept: false,
+                viewport: Viewport::default(),
+                network_enabled: false,
+                log_enabled: false,
+                execution_context: 1,
+                world_name: None,
+                object_handles: HashMap::new(),
+                next_handle: 1,
+                context_id: "default".to_owned(),
             });
             s.active = Some(1);
         }
@@ -1860,5 +2646,362 @@ mod tests {
         // Close
         client.write_all(&[0x88, 0x80, 0, 0, 0, 0]).unwrap();
         srv.join().unwrap();
+    }
+
+    fn write_client_frame(client: &mut TcpStream, payload: &[u8]) {
+        let mask = [7u8, 11, 13, 17];
+        let mut frame = vec![0x81u8];
+        if payload.len() < 126 {
+            frame.push(0x80 | payload.len() as u8);
+        } else {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        for (i, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[i % 4]);
+        }
+        client.write_all(&frame).unwrap();
+    }
+
+    fn read_server_frame(client: &mut TcpStream) -> Value {
+        let mut head = [0u8; 2];
+        client.read_exact(&mut head).unwrap();
+        let len = match head[1] & 0x7f {
+            126 => {
+                let mut ext = [0u8; 2];
+                client.read_exact(&mut ext).unwrap();
+                u16::from_be_bytes(ext) as usize
+            }
+            127 => {
+                let mut ext = [0u8; 8];
+                client.read_exact(&mut ext).unwrap();
+                u64::from_be_bytes(ext) as usize
+            }
+            n => n as usize,
+        };
+        let mut buf = vec![0u8; len];
+        client.read_exact(&mut buf).unwrap();
+        serde_json::from_slice(&buf).unwrap()
+    }
+
+    /// Envía una petición CDP y devuelve `(respuesta, eventos)`.
+    fn cdp_call(
+        client: &mut TcpStream,
+        id: u64,
+        method: &str,
+        params: Value,
+        session: Option<&str>,
+    ) -> (Value, Vec<Value>) {
+        let mut request = json!({"id": id, "method": method, "params": params});
+        if let Some(session) = session {
+            request["sessionId"] = json!(session);
+        }
+        write_client_frame(client, request.to_string().as_bytes());
+        let mut events = Vec::new();
+        loop {
+            let frame = read_server_frame(client);
+            if frame.get("id").and_then(Value::as_u64) == Some(id) {
+                return (frame, events);
+            }
+            events.push(frame);
+        }
+    }
+
+    fn connect_cdp(
+        listener: TcpListener,
+        state: Arc<Mutex<State>>,
+        path: &'static str,
+    ) -> (TcpStream, std::thread::JoinHandle<()>) {
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            match read_incoming_http(&mut stream) {
+                IncomingHttp::WebSocket { path, key } => {
+                    ws::write_handshake(&mut stream, &key).unwrap();
+                    serve_ws_cdp(stream, state, parse_ws_tab_hint(&path));
+                }
+                _ => panic!("expected websocket upgrade"),
+            }
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        client.write_all(request.as_bytes()).unwrap();
+        let mut buffer = [0u8; 512];
+        let mut total = 0;
+        while !buffer[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+            let read = client.read(&mut buffer[total..]).unwrap();
+            total += read;
+        }
+        let head = String::from_utf8_lossy(&buffer[..total]);
+        assert!(head.contains("101 Switching Protocols"));
+        (client, server)
+    }
+
+    fn seeded_state(port: u16) -> Arc<Mutex<State>> {
+        let state = test_state(port);
+        {
+            let mut s = lock(&state);
+            let mut tab = Tab::new(1, "https://example.com/");
+            tab.title = "Test".into();
+            tab.page = Some(FetchedPage::new(
+                "https://example.com/".into(),
+                "Test".into(),
+                "<html><body><h1 id=\"h\">Hola</h1><input id=\"q\" value=\"\"><a href=\"https://example.com/next\">next</a></body></html>".into(),
+                vec![],
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                vec![],
+            ));
+            s.tabs.push(tab);
+            s.active = Some(1);
+        }
+        state
+    }
+
+    /// Reproduce la secuencia que Playwright emite al hacer `connectOverCDP`:
+    /// descubrimiento, auto-attach en modo flatten, habilitación de dominios y
+    /// después interacción por `Input`, `DOM` y `Network`.
+    #[test]
+    fn chromium_frame_lifecycle_uses_target_id_and_lifecycle_events() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = seeded_state(port);
+        let (mut client, _server) = connect_cdp(listener, state, "/devtools/browser/wisp");
+        let session = "sess-tab-1";
+
+        let (reply, events) = cdp_call(
+            &mut client,
+            1,
+            "Target.setAutoAttach",
+            json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}),
+            None,
+        );
+        assert!(reply.get("error").is_none(), "{reply}");
+        let target = events
+            .iter()
+            .find(|event| event["method"] == "Target.attachedToTarget")
+            .expect("Target.attachedToTarget")["params"]["targetInfo"]["targetId"]
+            .as_str()
+            .expect("targetId")
+            .to_owned();
+
+        let (reply, events) = cdp_call(&mut client, 2, "Page.enable", json!({}), Some(session));
+        assert!(reply.get("error").is_none(), "{reply}");
+        // Chrome publica el contexto del documento al habilitar Page; sin él
+        // Playwright no puede evaluar en el frame.
+        let context = events
+            .iter()
+            .find(|event| event["method"] == "Runtime.executionContextCreated")
+            .expect("Runtime.executionContextCreated");
+        assert_eq!(
+            context["params"]["context"]["auxData"]["frameId"],
+            target.as_str()
+        );
+        assert_eq!(context["params"]["context"]["auxData"]["isDefault"], true);
+
+        let (reply, _) = cdp_call(
+            &mut client,
+            3,
+            "Page.getFrameTree",
+            json!({}),
+            Some(session),
+        );
+        // En Chrome el frame principal comparte identificador con el target.
+        assert_eq!(
+            reply["result"]["frameTree"]["frame"]["id"],
+            target.as_str(),
+            "{reply}"
+        );
+        assert!(
+            reply["result"]["frameTree"]["frame"]["loaderId"].is_string(),
+            "{reply}"
+        );
+
+        let (reply, _) = cdp_call(
+            &mut client,
+            4,
+            "Page.createIsolatedWorld",
+            json!({"frameId": target, "worldName": "utility"}),
+            Some(session),
+        );
+        assert!(
+            reply["result"]["executionContextId"].as_u64().is_some(),
+            "{reply}"
+        );
+
+        // Un fallo de carga es `errorText` dentro de una respuesta válida, no
+        // un error de protocolo (que Playwright reportaría como CDP error).
+        let (reply, events) = cdp_call(
+            &mut client,
+            5,
+            "Page.navigate",
+            json!({"url": "http://127.0.0.1:1/"}),
+            Some(session),
+        );
+        assert!(reply.get("error").is_none(), "{reply}");
+        assert_eq!(reply["result"]["frameId"], target.as_str(), "{reply}");
+        assert!(
+            reply["result"]["errorText"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "{reply}"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event["method"] != "Page.lifecycleEvent"),
+            "sin carga no debe anunciarse load"
+        );
+    }
+
+    #[test]
+    fn playwright_connect_over_cdp_handshake_serves_input_dom_and_network() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = seeded_state(port);
+        let (mut client, server) = connect_cdp(listener, state, "/devtools/browser/wisp");
+        let session = "sess-tab-1";
+
+        let (reply, _) = cdp_call(
+            &mut client,
+            1,
+            "Target.setDiscoverTargets",
+            json!({"discover": true}),
+            None,
+        );
+        assert!(reply.get("error").is_none(), "{reply}");
+
+        let (reply, events) = cdp_call(
+            &mut client,
+            2,
+            "Target.setAutoAttach",
+            json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}),
+            None,
+        );
+        assert!(reply.get("error").is_none(), "{reply}");
+        let attached = events
+            .iter()
+            .find(|event| event["method"] == "Target.attachedToTarget")
+            .expect("Target.attachedToTarget");
+        assert_eq!(attached["params"]["sessionId"], session);
+        assert_eq!(attached["params"]["targetInfo"]["type"], "page");
+
+        for (id, method) in [
+            (3, "Runtime.enable"),
+            (4, "Page.enable"),
+            (5, "Network.enable"),
+            (6, "Log.enable"),
+        ] {
+            let (reply, _) = cdp_call(&mut client, id, method, json!({}), Some(session));
+            assert!(reply.get("error").is_none(), "{method}: {reply}");
+        }
+
+        let (reply, _) = cdp_call(
+            &mut client,
+            7,
+            "Emulation.setDeviceMetricsOverride",
+            json!({"width": 640, "height": 480, "deviceScaleFactor": 1, "mobile": false}),
+            Some(session),
+        );
+        assert!(reply.get("error").is_none(), "{reply}");
+        let (reply, _) = cdp_call(
+            &mut client,
+            8,
+            "Page.getLayoutMetrics",
+            json!({}),
+            Some(session),
+        );
+        assert_eq!(reply["result"]["contentSize"]["width"], 640.0);
+
+        let (reply, _) = cdp_call(
+            &mut client,
+            9,
+            "DOM.getDocument",
+            json!({"depth": -1, "pierce": true}),
+            Some(session),
+        );
+        let root = &reply["result"]["root"];
+        assert_eq!(root["nodeId"], 1);
+        assert_eq!(root["nodeType"], 9);
+        assert_eq!(root["nodeName"], "#document");
+        assert_eq!(root["children"][0]["nodeName"], "HTML", "{reply}");
+        assert_eq!(root["children"][0]["nodeId"], 2, "{reply}");
+
+        let (reply, _) = cdp_call(
+            &mut client,
+            10,
+            "DOM.querySelector",
+            json!({"nodeId": 1, "selector": "#h"}),
+            Some(session),
+        );
+        let heading_id = reply["result"]["nodeId"].as_u64().expect("nodeId");
+        assert!(heading_id > 1, "{reply}");
+        let (reply, _) = cdp_call(
+            &mut client,
+            11,
+            "DOM.describeNode",
+            json!({"nodeId": heading_id}),
+            Some(session),
+        );
+        assert_eq!(reply["result"]["node"]["nodeName"], "H1");
+
+        let (reply, _) = cdp_call(
+            &mut client,
+            12,
+            "Input.dispatchMouseEvent",
+            json!({"type": "mousePressed", "x": 8.0, "y": 8.0, "button": "left", "clickCount": 1}),
+            Some(session),
+        );
+        assert!(reply.get("error").is_none(), "{reply}");
+        let (reply, _) = cdp_call(
+            &mut client,
+            13,
+            "Input.insertText",
+            json!({"text": "hola"}),
+            Some(session),
+        );
+        assert!(reply.get("error").is_none(), "{reply}");
+        let (reply, _) = cdp_call(
+            &mut client,
+            14,
+            "Input.dispatchKeyEvent",
+            json!({"type": "keyDown", "key": "Backspace"}),
+            Some(session),
+        );
+        assert!(reply.get("error").is_none(), "{reply}");
+        let (reply, _) = cdp_call(
+            &mut client,
+            15,
+            "Input.dispatchKeyEvent",
+            json!({"type": "char", "key": "a", "text": "a"}),
+            Some(session),
+        );
+        assert!(reply.get("error").is_none(), "{reply}");
+
+        let (reply, _) = cdp_call(
+            &mut client,
+            16,
+            "Network.getResponseBody",
+            json!({"requestId": "req-1"}),
+            Some(session),
+        );
+        assert!(reply.get("error").is_none(), "{reply}");
+
+        let (reply, _) = cdp_call(
+            &mut client,
+            17,
+            "Page.captureScreenshot",
+            json!({"format": "png"}),
+            Some(session),
+        );
+        let data = reply["result"]["data"].as_str().expect("data");
+        assert!(data.starts_with("iVBORw0KGgo"), "no es un PNG");
+
+        client.write_all(&[0x88, 0x80, 0, 0, 0, 0]).unwrap();
+        server.join().unwrap();
     }
 }

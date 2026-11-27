@@ -1,0 +1,12 @@
+{
+  "name": "wisp-cdp-smoke",
+  "private": true,
+  "type": "module",
+  "description": "Prueba de conexión Playwright -> wisp-agent serve por connectOverCDP",
+  "scripts": {
+    "test": "node cdp-smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.65.1"
+  }
+}

@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 ab_glyph = "0.2.32"
 anyhow = "1.0"
+scraper = "0.29"
 serde_json = "1.0"
 wisp-engine = { path = "../.." }
 wisp-mcp = { path = "../wisp-mcp" }

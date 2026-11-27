@@ -2169,9 +2169,10 @@ pub fn fetch_url_with_options(url: &str, options: &FetchOptions) -> Result<Fetch
     if let Ok(parsed_final) = url::Url::parse(&final_url) {
         let host = parsed_final.host_str().unwrap_or_default();
         let path = parsed_final.path();
+        let is_https = parsed_final.scheme() == "https";
         for hv in response.headers().get_all(reqwest::header::SET_COOKIE) {
             if let Ok(raw) = hv.to_str() {
-                cookie_jar.set_from_header(raw, host, path);
+                cookie_jar.set_from_header(host, path, is_https, raw);
             }
         }
     }

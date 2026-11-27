@@ -13,6 +13,16 @@ use std::fmt;
 
 const MAX_VM_STEPS: usize = 200_000;
 const MAX_RECURSION_DEPTH: usize = 128;
+/// Presupuesto de pila nativa para la recursión de JavaScript. El límite de
+/// profundidad por sí solo no basta: cada llamada JS consume varios frames de
+/// Rust y los hilos de test (o de Rayon) traen 2 MiB, así que 128 niveles
+/// revientan la pila antes de que el contador los alcance. Igual que V8,
+/// paramos cuando se ha gastado una porción acotada del stack de la hebra.
+const MAX_RECURSION_STACK_BYTES: usize = 512 * 1024;
+
+/// Ámbito de variables compartible: los cierres lo retienen y ven, por
+/// referencia, los cambios que hagan otros callbacks sobre la misma llamada.
+type ScopeRef = std::rc::Rc<std::cell::RefCell<HashMap<String, JsVal>>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JsVal {
@@ -92,7 +102,9 @@ impl fmt::Display for JsVal {
                 let parts: Vec<String> = items.iter().map(ToString::to_string).collect();
                 write!(f, "{}", parts.join(","))
             }
-            JsVal::Object(_) => write!(f, "[object Object]"),
+            // Un `Error` se imprime con su mensaje: es lo que espera cualquier
+            // diagnóstico (y lo que el `throw` deja ver al usuario).
+            JsVal::Object(id) => write!(f, "[object Object#{id}]"),
             JsVal::DomNode(id) => write!(f, "[DomNode #{id}]"),
             JsVal::Function(idx) => write!(f, "[Function #{idx}]"),
             JsVal::NativeHandle(name) => write!(f, "[{name}]"),
@@ -164,7 +176,9 @@ impl HostBridge for NoopHost {
         method: &str,
         _args: Vec<JsVal>,
     ) -> Result<JsVal, JsVal> {
-        Err(JsVal::Str(format!("método no definido `{method}`")))
+        Err(JsVal::Str(format!(
+            "método no definido `{method}` en {_target:?}"
+        )))
     }
 
     fn call_global(
@@ -205,6 +219,7 @@ enum Tok {
     KwSuper,
     KwOf,
     KwIn,
+    KwInstanceof,
     KwReturn,
     KwIf,
     KwElse,
@@ -251,6 +266,13 @@ enum Tok {
     Bang,
     AndAnd,
     OrOr,
+    Pipe,
+    Amp,
+    Caret,
+    Tilde,
+    Shl,
+    Shr,
+    UShr,
     NullishCoalesce,
     OptionalDot,
     DotDotDot,
@@ -363,8 +385,24 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             let quote = b;
             i += 1;
             let mut s = String::new();
+            // Un template con interpolaciones guarda su texto *sin* desescapar:
+            // el contenido se vuelve a analizar (por ejemplo un regex como
+            // `/["\\]/`), y quitarle los escapes cambiaría el programa.
+            let mut raw = String::new();
             while i < bytes.len() && bytes[i] != quote {
+                // Dentro de `${...}` puede haber otro template: se copia entero
+                // para no confundir sus comillas con el cierre del actual.
+                if quote == b'`' && bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    let rel = interpolation_end(&src[i + 2..])
+                        .ok_or("interpolación `${...}` sin cerrar")?;
+                    let close = i + 2 + rel;
+                    raw.push_str(&src[i..=close]);
+                    i = close + 1;
+                    continue;
+                }
                 if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    raw.push('\\');
+                    raw.push(bytes[i + 1] as char);
                     i += 1;
                     match bytes[i] {
                         b'n' => s.push('\n'),
@@ -375,6 +413,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                 } else {
                     let ch = src[i..].chars().next().ok_or("cadena sin cerrar")?;
                     s.push(ch);
+                    raw.push(ch);
                     i += ch.len_utf8();
                     continue;
                 }
@@ -384,8 +423,8 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                 return Err("cadena sin cerrar".into());
             }
             i += 1;
-            if quote == b'`' && s.contains("${") {
-                out.push(Tok::Template(s));
+            if quote == b'`' && raw.contains("${") {
+                out.push(Tok::Template(raw));
             } else {
                 out.push(Tok::Str(s));
             }
@@ -405,6 +444,19 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             }
             while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
                 i += 1;
+            }
+            // Exponente decimal: `1e-7`, `2.5E+3`.
+            if matches!(bytes.get(i), Some(b'e' | b'E')) {
+                let mut j = i + 1;
+                if matches!(bytes.get(j), Some(b'+' | b'-')) {
+                    j += 1;
+                }
+                if bytes.get(j).is_some_and(u8::is_ascii_digit) {
+                    i = j;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
             }
             let n: f64 = src[start..i]
                 .parse()
@@ -431,6 +483,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                 "super" => Tok::KwSuper,
                 "of" => Tok::KwOf,
                 "in" => Tok::KwIn,
+                "instanceof" => Tok::KwInstanceof,
                 "return" => Tok::KwReturn,
                 "if" => Tok::KwIf,
                 "else" => Tok::KwElse,
@@ -473,6 +526,12 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             (Tok::Le, 2)
         } else if rest.starts_with(">=") {
             (Tok::Ge, 2)
+        } else if rest.starts_with(">>>") {
+            (Tok::UShr, 3)
+        } else if rest.starts_with("<<") {
+            (Tok::Shl, 2)
+        } else if rest.starts_with(">>") {
+            (Tok::Shr, 2)
         } else if rest.starts_with("&&") {
             (Tok::AndAnd, 2)
         } else if rest.starts_with("||") {
@@ -502,6 +561,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                 b'<' => Tok::Lt,
                 b'>' => Tok::Gt,
                 b'!' => Tok::Bang,
+                b'|' => Tok::Pipe,
+                b'&' => Tok::Amp,
+                b'^' => Tok::Caret,
+                b'~' => Tok::Tilde,
                 b'?' => Tok::Question,
                 b':' => Tok::Colon,
                 b'.' => Tok::Dot,
@@ -562,6 +625,16 @@ enum Expr {
     SetPropCompound(Box<Expr>, String, BinOp, Box<Expr>),
     SetIndex(Box<Expr>, Box<Expr>, Box<Expr>),
     UpdateVar(String, f64, bool),
+    NewDyn(Box<Expr>, Vec<ArrayElem>),
+    ClassExpr(
+        Option<String>,
+        Option<String>,
+        Option<(Vec<String>, Vec<Stmt>)>,
+        Vec<(String, Vec<String>, Vec<Stmt>)>,
+        Vec<(String, Vec<String>, Vec<Stmt>)>,
+    ),
+    UpdateProp(Box<Expr>, String, f64, bool),
+    UpdateIndex(Box<Expr>, Box<Expr>, f64, bool),
     Unary(UnaryOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Nullish(Box<Expr>, Box<Expr>),
@@ -580,6 +653,7 @@ enum UnaryOp {
     Not,
     Typeof,
     Void,
+    BitNot,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -598,6 +672,13 @@ enum BinOp {
     Gt,
     Ge,
     In,
+    InstanceOf,
+    BitOr,
+    BitXor,
+    BitAnd,
+    Shl,
+    Shr,
+    UShr,
     And,
     Or,
 }
@@ -621,6 +702,7 @@ enum Stmt {
         String,
         Option<String>,
         Option<(Vec<String>, Vec<Stmt>)>,
+        Vec<(String, Vec<String>, Vec<Stmt>)>,
         Vec<(String, Vec<String>, Vec<Stmt>)>,
     ),
     Return(Option<Expr>),
@@ -679,19 +761,25 @@ impl Parser {
         if !matches!(self.peek(), Tok::LParen) {
             return false;
         }
+        // Escaneo por paréntesis balanceados: cubre params rest (`(...args)`),
+        // valores por defecto y patrones sin enumerar cada forma.
+        let mut depth = 0usize;
         let mut idx = 1usize;
-        if matches!(self.peek_at(idx), Tok::RParen) {
-            return matches!(self.peek_at(idx + 1), Tok::Arrow);
-        }
         loop {
-            if !matches!(self.peek_at(idx), Tok::Ident(_)) {
-                return false;
+            match self.peek_at(idx) {
+                Tok::LParen | Tok::LBracket | Tok::LBrace => depth += 1,
+                Tok::RParen | Tok::RBracket | Tok::RBrace => {
+                    if depth == 0 {
+                        return matches!(self.peek_at(idx + 1), Tok::Arrow);
+                    }
+                    depth -= 1;
+                }
+                Tok::Eof => return false,
+                _ => {}
             }
             idx += 1;
-            match self.peek_at(idx) {
-                Tok::Comma => idx += 1,
-                Tok::RParen => return matches!(self.peek_at(idx + 1), Tok::Arrow),
-                _ => return false,
+            if idx > 4096 {
+                return false;
             }
         }
     }
@@ -784,16 +872,115 @@ impl Parser {
 
     fn parse_var_decl(&mut self, consume_semi: bool) -> Result<Stmt, String> {
         self.next();
-        let pat = self.parse_pattern()?;
-        let init = if self.eat(&Tok::Eq) {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
+        let mut decls = Vec::new();
+        loop {
+            let pat = self.parse_pattern()?;
+            // `const X = class { ... }` registra la clase con el nombre del
+            // binding para que `new X()` la encuentre, como el motor original.
+            if matches!(self.peek(), Tok::Eq) && matches!(self.peek_at(1), Tok::KwClass) {
+                self.next();
+                self.next();
+                let (inner, parent, ctor, methods, statics) = self.parse_class_tail()?;
+                let name = match pat {
+                    Pattern::Ident(binding) => binding,
+                    _ => inner.unwrap_or_else(|| "Anónima".to_owned()),
+                };
+                decls.push(Stmt::ClassDecl(name, parent, ctor, methods, statics));
+            } else {
+                let init = if self.eat(&Tok::Eq) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                decls.push(Stmt::VarDecl(pat, init));
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
         if consume_semi {
             let _ = self.eat(&Tok::Semi);
         }
-        Ok(Stmt::VarDecl(pat, init))
+        if decls.len() == 1 {
+            Ok(decls.remove(0))
+        } else {
+            Ok(Stmt::Block(decls))
+        }
+    }
+
+    /// Resto de una clase tras `class`: nombre opcional, `extends` y cuerpo.
+    #[allow(clippy::type_complexity)]
+    fn parse_class_tail(
+        &mut self,
+    ) -> Result<
+        (
+            Option<String>,
+            Option<String>,
+            Option<(Vec<String>, Vec<Stmt>)>,
+            Vec<(String, Vec<String>, Vec<Stmt>)>,
+            Vec<(String, Vec<String>, Vec<Stmt>)>,
+        ),
+        String,
+    > {
+        let name = if matches!(self.peek(), Tok::Ident(_)) {
+            match self.next() {
+                Tok::Ident(n) => Some(n),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let parent = if self.eat(&Tok::KwExtends) {
+            match self.next() {
+                Tok::Ident(p) => Some(p),
+                other => return Err(format!("superclase inválida: {other:?}")),
+            }
+        } else {
+            None
+        };
+        self.expect(&Tok::LBrace)?;
+        let mut ctor = None;
+        let mut methods = Vec::new();
+        let mut statics = Vec::new();
+        while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+            while self.eat(&Tok::Semi) {}
+            if matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                break;
+            }
+            // `static`/`async name(...) {}`: los modificadores solo preceden a un
+            // nombre, así que `static() {}` sigue siendo un método llamado así.
+            let mut is_static = false;
+            loop {
+                match self.peek() {
+                    Tok::KwAsync => {
+                        self.next();
+                    }
+                    Tok::Ident(word)
+                        if word == "static"
+                            && matches!(self.toks.get(self.pos + 1), Some(Tok::Ident(_))) =>
+                    {
+                        is_static = true;
+                        self.next();
+                    }
+                    _ => break,
+                }
+            }
+            let mname = match tok_as_prop_name(self.next()) {
+                Some(n) => n,
+                None => return Err("nombre de método inválido en class".into()),
+            };
+            let params = self.parse_param_list()?;
+            let body = self.parse_block_stmts()?;
+            if mname == "constructor" && !is_static {
+                ctor = Some((params, body));
+            } else if is_static {
+                statics.push((mname, params, body));
+            } else {
+                methods.push((mname, params, body));
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok((name, parent, ctor, methods, statics))
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, String> {
@@ -822,40 +1009,11 @@ impl Parser {
             }
             Tok::KwClass => {
                 self.next();
-                let name = match self.next() {
-                    Tok::Ident(n) => n,
-                    other => return Err(format!("nombre de clase inválido: {other:?}")),
+                let (name, parent, ctor, methods, statics) = self.parse_class_tail()?;
+                let Some(name) = name else {
+                    return Err("una declaración de clase necesita nombre".into());
                 };
-                let parent = if self.eat(&Tok::KwExtends) {
-                    match self.next() {
-                        Tok::Ident(p) => Some(p),
-                        other => return Err(format!("superclase inválida: {other:?}")),
-                    }
-                } else {
-                    None
-                };
-                self.expect(&Tok::LBrace)?;
-                let mut ctor = None;
-                let mut methods = Vec::new();
-                while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
-                    while self.eat(&Tok::Semi) {}
-                    if matches!(self.peek(), Tok::RBrace | Tok::Eof) {
-                        break;
-                    }
-                    let mname = match tok_as_prop_name(self.next()) {
-                        Some(n) => n,
-                        None => return Err("nombre de método inválido en class".into()),
-                    };
-                    let params = self.parse_param_list()?;
-                    let body = self.parse_block_stmts()?;
-                    if mname == "constructor" {
-                        ctor = Some((params, body));
-                    } else {
-                        methods.push((mname, params, body));
-                    }
-                }
-                self.expect(&Tok::RBrace)?;
-                Ok(Stmt::ClassDecl(name, parent, ctor, methods))
+                Ok(Stmt::ClassDecl(name, parent, ctor, methods, statics))
             }
             Tok::KwReturn => {
                 self.next();
@@ -1033,7 +1191,23 @@ impl Parser {
                 let _ = self.eat(&Tok::Comma);
                 break;
             }
-            if let Tok::Ident(p) = self.next() {
+            if let Tok::LBracket = self.peek() {
+                self.next();
+                let mut names = Vec::new();
+                while !matches!(self.peek(), Tok::RBracket | Tok::Eof) {
+                    match self.next() {
+                        Tok::Ident(name) => names.push(name),
+                        other => return Err(format!("elemento inválido en parámetro: {other:?}")),
+                    }
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&Tok::RBracket)?;
+                // La lista se guarda con corchetes: el marco la reconoce como
+                // patrón de array y reparte el argumento entre sus nombres.
+                params.push(format!("[{}]", names.join(",")));
+            } else if let Tok::Ident(p) = self.next() {
                 if self.eat(&Tok::Eq) {
                     let _ = self.parse_assign()?;
                 }
@@ -1149,8 +1323,51 @@ impl Parser {
         Ok(lhs)
     }
 
-    fn parse_rel(&mut self) -> Result<Expr, String> {
+    fn parse_bit_or(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.parse_bit_xor()?;
+        while self.eat(&Tok::Pipe) {
+            let rhs = self.parse_bit_xor()?;
+            lhs = Expr::Binary(BinOp::BitOr, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bit_xor(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.parse_bit_and()?;
+        while self.eat(&Tok::Caret) {
+            let rhs = self.parse_bit_and()?;
+            lhs = Expr::Binary(BinOp::BitXor, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bit_and(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.parse_shift()?;
+        while self.eat(&Tok::Amp) {
+            let rhs = self.parse_shift()?;
+            lhs = Expr::Binary(BinOp::BitAnd, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_shift(&mut self) -> Result<Expr, String> {
         let mut lhs = self.parse_add()?;
+        loop {
+            let op = match self.peek() {
+                Tok::Shl => BinOp::Shl,
+                Tok::Shr => BinOp::Shr,
+                Tok::UShr => BinOp::UShr,
+                _ => break,
+            };
+            self.next();
+            let rhs = self.parse_add()?;
+            lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs));
+        }
+        Ok(lhs)
+    }
+
+    fn parse_rel(&mut self) -> Result<Expr, String> {
+        let mut lhs = self.parse_bit_or()?;
         loop {
             let op = match self.peek() {
                 Tok::Lt => BinOp::Lt,
@@ -1158,10 +1375,11 @@ impl Parser {
                 Tok::Gt => BinOp::Gt,
                 Tok::Ge => BinOp::Ge,
                 Tok::KwIn => BinOp::In,
+                Tok::KwInstanceof => BinOp::InstanceOf,
                 _ => break,
             };
             self.next();
-            let rhs = self.parse_add()?;
+            let rhs = self.parse_shift()?;
             lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
@@ -1208,6 +1426,11 @@ impl Parser {
                 self.next();
                 self.parse_unary()
             }
+            Tok::Tilde => {
+                self.next();
+                let inner = self.parse_unary()?;
+                Ok(Expr::Unary(UnaryOp::BitNot, Box::new(inner)))
+            }
             Tok::Bang => {
                 self.next();
                 Ok(Expr::Unary(UnaryOp::Not, Box::new(self.parse_unary()?)))
@@ -1232,6 +1455,10 @@ impl Parser {
                 };
                 match self.parse_postfix()? {
                     Expr::Var(name) => Ok(Expr::UpdateVar(name, delta, false)),
+                    Expr::Prop(target, prop) => Ok(Expr::UpdateProp(target, prop, delta, false)),
+                    Expr::Index(target, index) => {
+                        Ok(Expr::UpdateIndex(target, index, delta, false))
+                    }
                     _ => Err("incremento inválido".into()),
                 }
             }
@@ -1283,17 +1510,19 @@ impl Parser {
                 self.expect(&Tok::RBracket)?;
                 expr = Expr::Index(Box::new(expr), Box::new(idx));
             } else if self.eat(&Tok::PlusPlus) {
-                if let Expr::Var(name) = expr {
-                    expr = Expr::UpdateVar(name, 1.0, true);
-                } else {
-                    return Err("incremento inválido".into());
-                }
+                expr = match expr {
+                    Expr::Var(name) => Expr::UpdateVar(name, 1.0, true),
+                    Expr::Prop(target, prop) => Expr::UpdateProp(target, prop, 1.0, true),
+                    Expr::Index(target, index) => Expr::UpdateIndex(target, index, 1.0, true),
+                    _ => return Err("incremento inválido".into()),
+                };
             } else if self.eat(&Tok::MinusMinus) {
-                if let Expr::Var(name) = expr {
-                    expr = Expr::UpdateVar(name, -1.0, true);
-                } else {
-                    return Err("decremento inválido".into());
-                }
+                expr = match expr {
+                    Expr::Var(name) => Expr::UpdateVar(name, -1.0, true),
+                    Expr::Prop(target, prop) => Expr::UpdateProp(target, prop, -1.0, true),
+                    Expr::Index(target, index) => Expr::UpdateIndex(target, index, -1.0, true),
+                    _ => return Err("decremento inválido".into()),
+                };
             } else {
                 break;
             }
@@ -1307,25 +1536,10 @@ impl Parser {
         while let Some(start) = rest.find("${") {
             let prefix = &rest[..start];
             if !prefix.is_empty() {
-                parts.push(Expr::Lit(JsVal::Str(prefix.to_owned())));
+                parts.push(Expr::Lit(JsVal::Str(unescape_template(prefix))));
             }
             let after = &rest[start + 2..];
-            let mut depth = 1usize;
-            let mut end_idx = None;
-            for (idx, ch) in after.char_indices() {
-                match ch {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end_idx = Some(idx);
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let end = end_idx.ok_or("interpolación `${...}` sin cerrar")?;
+            let end = interpolation_end(after).ok_or("interpolación `${...}` sin cerrar")?;
             let expr_src = &after[..end];
             let sub_toks = tokenize(expr_src)?;
             let sub_expr = Parser::new(sub_toks).parse_expr()?;
@@ -1333,7 +1547,7 @@ impl Parser {
             rest = &after[end + 1..];
         }
         if !rest.is_empty() || parts.is_empty() {
-            parts.push(Expr::Lit(JsVal::Str(rest.to_owned())));
+            parts.push(Expr::Lit(JsVal::Str(unescape_template(rest))));
         }
         let mut acc = if matches!(parts.first(), Some(Expr::Lit(JsVal::Str(_)))) {
             parts.remove(0)
@@ -1383,17 +1597,42 @@ impl Parser {
                 let body = self.parse_block_stmts()?;
                 Ok(Expr::Lambda(params, body))
             }
+            Tok::KwClass => {
+                let (name, parent, ctor, methods, statics) = self.parse_class_tail()?;
+                Ok(Expr::ClassExpr(name, parent, ctor, methods, statics))
+            }
             Tok::KwNew => {
-                let ctor = match self.next() {
-                    Tok::Ident(name) => name,
-                    other => return Err(format!("constructor inválido tras `new`: {other:?}")),
-                };
-                let args = if self.eat(&Tok::LParen) {
-                    self.parse_arg_list()?
+                // `new Foo(...)` es el caso común; `new (expr)(...)` aparece en
+                // bundles y se resuelve con la misma semántica de construcción.
+                if matches!(self.peek(), Tok::Ident(_)) {
+                    let ctor = match self.next() {
+                        Tok::Ident(name) => name,
+                        _ => unreachable!(),
+                    };
+                    let args = if self.eat(&Tok::LParen) {
+                        self.parse_arg_list()?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Expr::New(ctor, args))
                 } else {
-                    Vec::new()
-                };
-                Ok(Expr::New(ctor, args))
+                    // `new (expr)(args)`: el paréntesis delimita el constructor,
+                    // así que no puede tomarse como lista de argumentos de una
+                    // llamada (`new ((expr)(args))` sería otro programa).
+                    let callee = if self.eat(&Tok::LParen) {
+                        let inner = self.parse_expr()?;
+                        self.expect(&Tok::RParen)?;
+                        inner
+                    } else {
+                        self.parse_postfix()?
+                    };
+                    let args = if self.eat(&Tok::LParen) {
+                        self.parse_arg_list()?
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Expr::NewDyn(Box::new(callee), args))
+                }
             }
             Tok::Ident(name) => {
                 if matches!(self.peek(), Tok::Arrow) {
@@ -1429,11 +1668,35 @@ impl Parser {
                     if self.eat(&Tok::DotDotDot) {
                         pairs.push(ObjProp::Spread(self.parse_expr()?));
                     } else {
+                        // `async name() {}` y `get name() {}` / `set name() {}`
+                        // son métodos del literal, no propiedades.
+                        loop {
+                            let modifier = match self.peek() {
+                                Tok::KwAsync => true,
+                                Tok::Ident(word) => {
+                                    (word == "get" || word == "set")
+                                        && matches!(
+                                            self.toks.get(self.pos + 1),
+                                            Some(Tok::Ident(_))
+                                        )
+                                }
+                                _ => false,
+                            };
+                            if !modifier {
+                                break;
+                            }
+                            self.next();
+                        }
                         let key = match self.next() {
                             Tok::Ident(k) | Tok::Str(k) => k,
                             other => return Err(format!("clave de objeto inválida: {other:?}")),
                         };
-                        if self.eat(&Tok::Colon) {
+                        if matches!(self.peek(), Tok::LParen) {
+                            // Método abreviado: `{ run(a) { ... } }`.
+                            let params = self.parse_param_list()?;
+                            let body = self.parse_block_stmts()?;
+                            pairs.push(ObjProp::Pair(key, Expr::Lambda(params, body)));
+                        } else if self.eat(&Tok::Colon) {
                             let val = self.parse_expr()?;
                             pairs.push(ObjProp::Pair(key, val));
                         } else {
@@ -1489,11 +1752,13 @@ enum Op {
     OptionalCallMethod(String, Vec<bool>),
     CallValue(Vec<bool>),
     Construct(String, Vec<bool>),
+    ConstructDynamic(Vec<bool>),
     RegisterClass {
         name: String,
         parent: Option<String>,
         ctor: Option<usize>,
         methods: Vec<(String, usize)>,
+        statics: Vec<(String, usize)>,
     },
     Return,
 }
@@ -1502,6 +1767,17 @@ enum Op {
 struct FunctionChunk {
     params: Vec<String>,
     code: Vec<Op>,
+    /// Función parcial: `fn.bind(this, ...)` crea un chunk que delega en otro.
+    bound: Option<BoundCall>,
+    /// Función nativa del host expuesta como valor (`window.setTimeout`).
+    native: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BoundCall {
+    target: usize,
+    this_val: JsVal,
+    args: Vec<JsVal>,
 }
 
 #[derive(Debug, Clone)]
@@ -1509,6 +1785,8 @@ struct ClassDef {
     parent: Option<String>,
     ctor: Option<usize>,
     methods: HashMap<String, usize>,
+    /// Métodos `static` de la clase, accesibles sobre el constructor.
+    statics: HashMap<String, usize>,
 }
 
 struct LoopContext {
@@ -1827,18 +2105,24 @@ impl Compiler {
                     code.push(Op::Pop);
                 }
             }
-            Stmt::ClassDecl(name, parent, ctor, methods) => {
+            Stmt::ClassDecl(name, parent, ctor, methods, statics) => {
                 let ctor_id = ctor.as_ref().map(|(p, b)| self.compile_fn(p, b));
                 let mut compiled_methods = Vec::with_capacity(methods.len());
                 for (mname, params, body) in methods {
                     let mid = self.compile_fn(params, body);
                     compiled_methods.push((mname.clone(), mid));
                 }
+                let mut compiled_statics = Vec::with_capacity(statics.len());
+                for (mname, params, body) in statics {
+                    let mid = self.compile_fn(params, body);
+                    compiled_statics.push((mname.clone(), mid));
+                }
                 code.push(Op::RegisterClass {
                     name: name.clone(),
                     parent: parent.clone(),
                     ctor: ctor_id,
                     methods: compiled_methods,
+                    statics: compiled_statics,
                 });
                 if !keep_value {
                     code.push(Op::Pop);
@@ -1872,6 +2156,8 @@ impl Compiler {
         self.functions.push(FunctionChunk {
             params: params.to_vec(),
             code: fn_code,
+            bound: None,
+            native: None,
         });
         id
     }
@@ -1961,6 +2247,63 @@ impl Compiler {
                 self.compile_expr(rhs, code);
                 code.push(Op::IndexSet);
             }
+            Expr::ClassExpr(name, parent, ctor, methods, statics) => {
+                let ctor_id = ctor.as_ref().map(|(p, b)| self.compile_fn(p, b));
+                let mut compiled = Vec::with_capacity(methods.len());
+                for (mname, params, body) in methods {
+                    let mid = self.compile_fn(params, body);
+                    compiled.push((mname.clone(), mid));
+                }
+                let mut compiled_statics = Vec::with_capacity(statics.len());
+                for (mname, params, body) in statics {
+                    let mid = self.compile_fn(params, body);
+                    compiled_statics.push((mname.clone(), mid));
+                }
+                let registry = name.clone().unwrap_or_else(|| self.next_temp("class"));
+                code.push(Op::RegisterClass {
+                    name: registry,
+                    parent: parent.clone(),
+                    ctor: ctor_id,
+                    methods: compiled,
+                    statics: compiled_statics,
+                });
+            }
+            Expr::UpdateProp(target, prop, delta, postfix) => {
+                let slot = self.next_temp("upd");
+                self.compile_expr(target, code);
+                code.push(Op::Store(slot.clone()));
+                code.push(Op::Load(slot));
+                code.push(Op::Push(JsVal::Number(*delta)));
+                code.push(Op::PropCompound(prop.clone(), BinOp::Add));
+                if *postfix {
+                    // `x = o.p++` devuelve el valor anterior.
+                    code.push(Op::Push(JsVal::Number(*delta)));
+                    code.push(Op::Binary(BinOp::Sub));
+                }
+            }
+            Expr::UpdateIndex(target, index, delta, postfix) => {
+                let obj_slot = self.next_temp("updobj");
+                let idx_slot = self.next_temp("updidx");
+                let val_slot = self.next_temp("updval");
+                self.compile_expr(target, code);
+                code.push(Op::Store(obj_slot.clone()));
+                self.compile_expr(index, code);
+                code.push(Op::Store(idx_slot.clone()));
+                code.push(Op::Load(obj_slot.clone()));
+                code.push(Op::Load(idx_slot.clone()));
+                code.push(Op::IndexGet);
+                code.push(Op::Push(JsVal::Number(*delta)));
+                code.push(Op::Binary(BinOp::Add));
+                code.push(Op::Store(val_slot.clone()));
+                code.push(Op::Load(obj_slot));
+                code.push(Op::Load(idx_slot));
+                code.push(Op::Load(val_slot));
+                code.push(Op::IndexSet);
+                if *postfix {
+                    code.push(Op::Push(JsVal::Number(*delta)));
+                    code.push(Op::Binary(BinOp::Sub));
+                }
+            }
             Expr::UpdateVar(name, delta, postfix) => {
                 code.push(Op::Load(name.clone()));
                 if *postfix {
@@ -2034,6 +2377,11 @@ impl Compiler {
                 let spreads = self.compile_arg_elems(args, code);
                 code.push(Op::Construct(ctor.clone(), spreads));
             }
+            Expr::NewDyn(callee, args) => {
+                self.compile_expr(callee, code);
+                let spreads = self.compile_arg_elems(args, code);
+                code.push(Op::ConstructDynamic(spreads));
+            }
             Expr::Lambda(params, body) => {
                 let id = self.compile_fn(params, body);
                 code.push(Op::Push(JsVal::Function(id)));
@@ -2048,12 +2396,22 @@ pub struct VmRuntime {
     fn_names: HashMap<String, usize>,
     classes: HashMap<String, ClassDef>,
     pub globals: HashMap<String, JsVal>,
+    /// Funciones del host ya envueltas como valores, para no duplicarlas.
+    global_fns: HashMap<String, usize>,
     pub objects: Vec<HashMap<String, JsVal>>,
     maps: Vec<Vec<(String, JsVal)>>,
     sets: Vec<Vec<JsVal>>,
     bytes_bufs: Vec<Vec<u8>>,
     steps: usize,
     depth: usize,
+    /// Dirección de pila de la primera evaluación; 0 si no hay ninguna activa.
+    stack_base: usize,
+    /// Ámbito que se está ejecutando ahora mismo, para que el host (listeners,
+    /// promesas, observers) pueda resolver las variables libres del callback.
+    current_scope: Option<ScopeRef>,
+    /// Últimas llamadas ejecutadas, para diagnosticar fallos sin depurador.
+    call_trace: std::collections::VecDeque<String>,
+    trace_enabled: bool,
 }
 
 impl Default for VmRuntime {
@@ -2069,12 +2427,17 @@ impl VmRuntime {
             fn_names: HashMap::new(),
             classes: HashMap::new(),
             globals: HashMap::new(),
+            global_fns: HashMap::new(),
             objects: Vec::new(),
             maps: Vec::new(),
             sets: Vec::new(),
             bytes_bufs: Vec::new(),
             steps: 0,
             depth: 0,
+            stack_base: 0,
+            current_scope: None,
+            call_trace: std::collections::VecDeque::new(),
+            trace_enabled: std::env::var_os("WISP_JS_TRACE").is_some(),
         };
         vm.globals
             .insert("Math".to_owned(), JsVal::NativeHandle("Math".to_owned()));
@@ -2138,7 +2501,16 @@ impl VmRuntime {
 
     pub fn eval_script(&mut self, src: &str, host: &mut dyn HostBridge) -> Result<JsVal, String> {
         let toks = tokenize(src)?;
-        let stmts = Parser::new(toks).parse_program()?;
+        let mut parser = Parser::new(toks);
+        let stmts = parser.parse_program().map_err(|error| {
+            let at = parser.pos.min(parser.toks.len().saturating_sub(1));
+            let start = at.saturating_sub(4);
+            let around: Vec<String> = parser.toks[start..=at]
+                .iter()
+                .map(|t| format!("{t:?}"))
+                .collect();
+            format!("{error} [token {at}: {}]", around.join(" "))
+        })?;
         let base_fn_id = self.functions.len();
         let mut compiler = Compiler::new();
         let mut main_code = compiler.compile_program(&stmts);
@@ -2153,9 +2525,76 @@ impl VmRuntime {
             self.fn_names.insert(name, id + base_fn_id);
         }
 
-        let mut locals = HashMap::new();
-        self.exec_code(&main_code, host, &mut locals)
-            .map_err(|thrown| thrown.to_string())
+        let locals: ScopeRef = ScopeRef::default();
+        let owned_base = self.begin_stack_watch();
+        let result = self.exec_code(&main_code, host, &locals);
+        if owned_base {
+            self.stack_base = 0;
+        }
+        result.map_err(|thrown| {
+            // Un `Error` lanzado desde el script se reporta con su mensaje:
+            // `[object Object]` no dice nada al diagnosticar.
+            let thrown = match &thrown {
+                JsVal::Object(id)
+                    if self
+                        .objects
+                        .get(*id)
+                        .is_some_and(|o| o.contains_key("message")) =>
+                {
+                    let obj = self.objects.get(*id).cloned().unwrap_or_default();
+                    let message = obj
+                        .get("message")
+                        .map(ToString::to_string)
+                        .unwrap_or_default();
+                    let name = obj
+                        .get("name")
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| "Error".to_owned());
+                    JsVal::Str(format!("{name}: {message}"))
+                }
+                other => other.clone(),
+            };
+            if self.trace_enabled && !self.call_trace.is_empty() {
+                let trace: Vec<String> = self.call_trace.iter().cloned().collect();
+                format!(
+                    "{thrown}
+  traza: {}",
+                    trace.join(" <- ")
+                )
+            } else {
+                thrown.to_string()
+            }
+        })
+    }
+
+    /// Marca la base de pila si aún no hay una evaluación en curso. Devuelve
+    /// `true` si esta llamada la fijó (y por tanto debe limpiarla al salir).
+    fn begin_stack_watch(&mut self) -> bool {
+        if self.stack_base != 0 {
+            return false;
+        }
+        let probe = 0u8;
+        self.stack_base = &probe as *const u8 as usize;
+        true
+    }
+
+    fn record_call(&mut self, label: String) {
+        if !self.trace_enabled {
+            return;
+        }
+        if self.call_trace.len() >= 24 {
+            self.call_trace.pop_front();
+        }
+        self.call_trace.push_back(label);
+    }
+
+    fn stack_budget_exhausted(&self) -> bool {
+        if self.stack_base == 0 {
+            return false;
+        }
+        let probe = 0u8;
+        let here = &probe as *const u8 as usize;
+        self.stack_base.saturating_sub(here) >= MAX_RECURSION_STACK_BYTES
     }
 
     pub fn invoke_fn(
@@ -2164,8 +2603,29 @@ impl VmRuntime {
         args: Vec<JsVal>,
         host: &mut dyn HostBridge,
     ) -> Result<JsVal, String> {
-        self.call_fn_id(fn_id, args, host)
-            .map_err(|thrown| thrown.to_string())
+        let owned_base = self.begin_stack_watch();
+        let result = self.call_fn_id(fn_id, args, host);
+        if owned_base {
+            self.stack_base = 0;
+        }
+        result.map_err(|thrown| thrown.to_string())
+    }
+
+    /// Envuelve una función global del host (`setTimeout`, …) como valor para
+    /// que pueda pasarse y recibir métodos como `bind`.
+    pub fn function_for_global(&mut self, name: &str) -> JsVal {
+        if let Some(id) = self.global_fns.get(name) {
+            return JsVal::Function(*id);
+        }
+        let id = self.functions.len();
+        self.functions.push(FunctionChunk {
+            params: Vec::new(),
+            code: Vec::new(),
+            bound: None,
+            native: Some(name.to_owned()),
+        });
+        self.global_fns.insert(name.to_owned(), id);
+        JsVal::Function(id)
     }
 
     fn call_fn_id_with_this(
@@ -2175,34 +2635,98 @@ impl VmRuntime {
         args: Vec<JsVal>,
         host: &mut dyn HostBridge,
     ) -> Result<JsVal, JsVal> {
-        if self.depth >= MAX_RECURSION_DEPTH {
+        if self.depth >= MAX_RECURSION_DEPTH || self.stack_budget_exhausted() {
             return Err(JsVal::Str("límite de recursión excedido".into()));
         }
         let Some(chunk) = self.functions.get(fn_id).cloned() else {
             return Err(JsVal::Str(format!("función #{fn_id} no encontrada")));
         };
-        let mut fn_locals = HashMap::new();
-        if let Some(this_v) = this_val {
-            fn_locals.insert("this".to_owned(), this_v);
-        } else {
-            fn_locals.insert("this".to_owned(), JsVal::Undefined);
-        }
-        for (i, param) in chunk.params.iter().enumerate() {
-            if let Some(rest_name) = param.strip_prefix("...") {
-                let rest_items = if i < args.len() {
-                    args[i..].to_vec()
-                } else {
-                    Vec::new()
-                };
-                fn_locals.insert(rest_name.to_owned(), JsVal::Array(rest_items));
-                break;
+        // `bind` guarda el `this` y los argumentos iniciales; al invocar se
+        // delega en la función original con ellos delante.
+        if let Some(name) = chunk.native.clone() {
+            if let Some(res) = self.call_builtin_global(&name, &args) {
+                return Ok(res);
             }
-            let val = args.get(i).cloned().unwrap_or(JsVal::Undefined);
-            fn_locals.insert(param.clone(), val);
+            if let Some(res) = host.call_global(self, &name, args) {
+                return res;
+            }
+            return Err(JsVal::Str(format!("función no definida `{name}`")));
         }
+        if let Some(bound) = chunk.bound {
+            let mut all = bound.args;
+            all.extend(args);
+            let this = match &this_val {
+                Some(JsVal::Undefined) | None => Some(bound.this_val),
+                Some(_) => this_val,
+            };
+            return self.call_fn_id_with_this(bound.target, this, all, host);
+        }
+        // El ámbito que llama se copia al marco nuevo para que el callback vea
+        // sus variables libres; al volver se propagan los cambios, que es el
+        // efecto observable de un cierre sobre un ámbito todavía vivo.
+        let parent = self.current_scope.clone();
+        let parent_snapshot = parent.as_ref().map(|scope| scope.borrow().clone());
+        let fn_locals: ScopeRef = ScopeRef::default();
+        {
+            let mut vars = fn_locals.borrow_mut();
+            vars.insert("this".to_owned(), this_val.unwrap_or(JsVal::Undefined));
+            for (i, param) in chunk.params.iter().enumerate() {
+                if let Some(rest_name) = param.strip_prefix("...") {
+                    let rest_items = if i < args.len() {
+                        args[i..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    vars.insert(rest_name.to_owned(), JsVal::Array(rest_items));
+                    break;
+                }
+                if let Some(names) = param.strip_prefix('[').and_then(|p| p.strip_suffix(']')) {
+                    let val = args.get(i).cloned().unwrap_or(JsVal::Undefined);
+                    for (slot, name) in names.split(',').filter(|n| !n.is_empty()).enumerate() {
+                        let item = match &val {
+                            JsVal::Array(items) => {
+                                items.get(slot).cloned().unwrap_or(JsVal::Undefined)
+                            }
+                            _ => JsVal::Undefined,
+                        };
+                        vars.insert(name.to_owned(), item);
+                    }
+                    continue;
+                }
+                let val = args.get(i).cloned().unwrap_or(JsVal::Undefined);
+                vars.insert(param.clone(), val);
+            }
+            if let Some(snapshot) = &parent_snapshot {
+                for (name, value) in snapshot {
+                    vars.entry(name.clone()).or_insert_with(|| value.clone());
+                }
+            }
+        }
+        let previous_scope = self.current_scope.replace(fn_locals.clone());
         self.depth += 1;
-        let res = self.exec_code(&chunk.code, host, &mut fn_locals);
+        let res = self.exec_code(&chunk.code, host, &fn_locals);
         self.depth -= 1;
+        self.current_scope = previous_scope;
+        if let (Some(parent), Some(snapshot)) = (parent.as_ref(), parent_snapshot.as_ref()) {
+            let child = fn_locals.borrow();
+            let writes: Vec<(String, JsVal)> = snapshot
+                .iter()
+                // `this` pertenece al marco, no al ámbito: el hijo tiene el suyo
+                // (a menudo `undefined`) y no debe sobrescribir el del padre.
+                .filter(|(name, _)| name.as_str() != "this")
+                .filter_map(|(name, old)| match child.get(name) {
+                    Some(new) if new != old => Some((name.clone(), new.clone())),
+                    _ => None,
+                })
+                .collect();
+            drop(child);
+            if !writes.is_empty() {
+                let mut vars = parent.borrow_mut();
+                for (name, value) in writes {
+                    vars.insert(name, value);
+                }
+            }
+        }
         res
     }
 
@@ -2219,15 +2743,15 @@ impl VmRuntime {
         &mut self,
         pat: &Pattern,
         val: JsVal,
-        locals: &mut HashMap<String, JsVal>,
+        locals: &ScopeRef,
         host: &mut dyn HostBridge,
     ) -> Result<(), JsVal> {
         match pat {
             Pattern::Ident(name) => {
-                let in_locals = locals.contains_key(name);
-                let new_local = !locals.is_empty() && !self.globals.contains_key(name);
+                let in_locals = locals.borrow().contains_key(name);
+                let new_local = !locals.borrow().is_empty() && !self.globals.contains_key(name);
                 if in_locals || new_local {
-                    locals.insert(name.clone(), val);
+                    locals.borrow_mut().insert(name.clone(), val);
                 } else {
                     self.globals.insert(name.clone(), val);
                 }
@@ -2290,6 +2814,30 @@ impl VmRuntime {
                 match val {
                     JsVal::Array(items) => out.extend(items),
                     JsVal::Str(s) => out.extend(s.chars().map(|c| JsVal::Str(c.to_string()))),
+                    // `[...set]` y `[...map]` recorren la colección.
+                    JsVal::Object(id) => {
+                        let kind = self
+                            .objects
+                            .get(id)
+                            .and_then(|o| o.get("__wispType"))
+                            .map(ToString::to_string);
+                        let index =
+                            self.objects
+                                .get(id)
+                                .and_then(|o| o.get("__wispIdx"))
+                                .map_or(0.0, JsVal::to_number) as usize;
+                        match kind.as_deref() {
+                            Some("Set") => {
+                                out.extend(self.sets.get(index).cloned().unwrap_or_default())
+                            }
+                            Some("Map") => {
+                                for (k, v) in self.maps.get(index).cloned().unwrap_or_default() {
+                                    out.push(JsVal::Array(vec![JsVal::Str(k), v]));
+                                }
+                            }
+                            _ => out.push(JsVal::Object(id)),
+                        }
+                    }
                     other => out.push(other),
                 }
             } else {
@@ -2303,7 +2851,19 @@ impl VmRuntime {
         &mut self,
         code: &[Op],
         host: &mut dyn HostBridge,
-        locals: &mut HashMap<String, JsVal>,
+        locals: &ScopeRef,
+    ) -> Result<JsVal, JsVal> {
+        let previous_scope = self.current_scope.replace(locals.clone());
+        let result = self.exec_code_inner(code, host, locals);
+        self.current_scope = previous_scope;
+        result
+    }
+
+    fn exec_code_inner(
+        &mut self,
+        code: &[Op],
+        host: &mut dyn HostBridge,
+        locals: &ScopeRef,
     ) -> Result<JsVal, JsVal> {
         let mut stack: Vec<JsVal> = Vec::new();
         let mut try_stack: Vec<(usize, usize)> = Vec::new();
@@ -2328,6 +2888,7 @@ impl VmRuntime {
                     }
                     Op::Load(name) => {
                         let val = locals
+                            .borrow()
                             .get(name)
                             .or_else(|| self.globals.get(name))
                             .cloned()
@@ -2336,10 +2897,11 @@ impl VmRuntime {
                     }
                     Op::Store(name) => {
                         let val = stack.last().cloned().unwrap_or(JsVal::Undefined);
-                        let in_locals = locals.contains_key(name);
-                        let new_local = !locals.is_empty() && !self.globals.contains_key(name);
+                        let in_locals = locals.borrow().contains_key(name);
+                        let new_local =
+                            !locals.borrow().is_empty() && !self.globals.contains_key(name);
                         if in_locals || new_local {
-                            locals.insert(name.clone(), val);
+                            locals.borrow_mut().insert(name.clone(), val);
                         } else {
                             self.globals.insert(name.clone(), val);
                         }
@@ -2350,8 +2912,8 @@ impl VmRuntime {
                     }
                     Op::BindVar(name) => {
                         let val = stack.pop().unwrap_or(JsVal::Undefined);
-                        if !locals.is_empty() && !self.globals.contains_key(name) {
-                            locals.insert(name.clone(), val);
+                        if !locals.borrow().is_empty() && !self.globals.contains_key(name) {
+                            locals.borrow_mut().insert(name.clone(), val);
                         } else {
                             self.globals.insert(name.clone(), val);
                         }
@@ -2453,7 +3015,7 @@ impl VmRuntime {
                         let idx = stack.pop().unwrap_or(JsVal::Undefined);
                         let target = stack.pop().unwrap_or(JsVal::Undefined);
                         if let JsVal::Object(id) = target {
-                            if let Some(map) = self.objects.get(&id)
+                            if let Some(map) = self.objects.get(id)
                                 && map.get("__wispType")
                                     == Some(&JsVal::Str("Uint8Array".to_owned()))
                                 && let Some(JsVal::Number(bidx)) = map.get("__wispIdx")
@@ -2516,6 +3078,7 @@ impl VmRuntime {
                         stack.push(match op {
                             UnaryOp::Neg => JsVal::Number(-v.to_number()),
                             UnaryOp::Not => JsVal::Bool(!v.is_truthy()),
+                            UnaryOp::BitNot => JsVal::Number(!to_int32(&v) as f64),
                             UnaryOp::Void => JsVal::Undefined,
                             UnaryOp::Typeof => JsVal::Str(
                                 match v {
@@ -2549,6 +3112,8 @@ impl VmRuntime {
                                 _ => false,
                             };
                             stack.push(JsVal::Bool(found));
+                        } else if matches!(op, BinOp::InstanceOf) {
+                            stack.push(JsVal::Bool(self.is_instance_of(&lhs, &rhs)));
                         } else {
                             stack.push(eval_binary(*op, lhs, rhs));
                         }
@@ -2580,23 +3145,34 @@ impl VmRuntime {
                         let split = stack.len().saturating_sub(spreads.len());
                         let raw = stack.split_off(split);
                         let args = self.collect_spread_args(raw, spreads);
-                        let local_fn = locals.get(name).or_else(|| self.globals.get(name)).cloned();
+                        self.record_call(name.clone());
+                        let local_fn = locals
+                            .borrow()
+                            .get(name)
+                            .or_else(|| self.globals.get(name))
+                            .cloned();
                         let ret = if let Some(JsVal::Function(fn_id)) = local_fn {
                             self.call_fn_id(fn_id, args, host)?
                         } else if let Some(&fn_id) = self.fn_names.get(name) {
                             self.call_fn_id(fn_id, args, host)?
                         } else if name == "super" {
-                            if let Some(JsVal::Str(parent_name)) = locals
-                                .get("this")
-                                .and_then(|v| match v {
-                                    JsVal::Object(id) => self.objects.get(*id)?.get("__wispParent"),
-                                    _ => None,
-                                })
-                                .cloned()
+                            let parent_name = locals.borrow().get("this").and_then(|v| match v {
+                                JsVal::Object(id) => self
+                                    .objects
+                                    .get(*id)
+                                    .and_then(|m| m.get("__wispParent"))
+                                    .cloned(),
+                                _ => None,
+                            });
+                            let parent_name = match parent_name {
+                                Some(JsVal::Str(n)) => Some(n),
+                                _ => None,
+                            };
+                            if let Some(parent_name) = parent_name
                                 && let Some(parent_ctor) =
                                     self.classes.get(&parent_name).and_then(|c| c.ctor)
                             {
-                                let this_val = locals.get("this").cloned();
+                                let this_val = locals.borrow().get("this").cloned();
                                 self.call_fn_id_with_this(parent_ctor, this_val, args, host)?;
                             }
                             JsVal::Undefined
@@ -2627,8 +3203,8 @@ impl VmRuntime {
                         };
                         if let (Some(new_items), Some(vname)) = (updated_arr, var_name) {
                             let new_val = JsVal::Array(new_items);
-                            if locals.contains_key(vname) {
-                                locals.insert(vname.clone(), new_val);
+                            if locals.borrow().contains_key(vname) {
+                                locals.borrow_mut().insert(vname.clone(), new_val);
                             } else {
                                 self.globals.insert(vname.clone(), new_val);
                             }
@@ -2657,10 +3233,40 @@ impl VmRuntime {
                                 let ret = self.call_fn_id(fn_id, args, host)?;
                                 stack.push(ret);
                             }
-                            _ => {
+                            other => {
+                                self.record_call(format!("<valor {other:?}>"));
                                 return Err(JsVal::Str("el valor no es invocable".into()));
                             }
                         }
+                    }
+                    Op::ConstructDynamic(spreads) => {
+                        let split = stack.len().saturating_sub(spreads.len());
+                        let raw = stack.split_off(split);
+                        let args = self.collect_spread_args(raw, spreads);
+                        let callee = stack.pop().unwrap_or(JsVal::Undefined);
+                        let obj = match callee {
+                            JsVal::NativeHandle(name) | JsVal::Str(name) => {
+                                if let Some(def) = self.classes.get(&name).cloned() {
+                                    self.construct_class(&name, &def, args, host)?
+                                } else if let Some(obj) = self.construct_builtin(&name, &args) {
+                                    obj?
+                                } else {
+                                    host.construct(self, &name, args)?
+                                }
+                            }
+                            JsVal::Function(fn_id) => {
+                                let instance = self.alloc_object(HashMap::new());
+                                self.call_fn_id_with_this(
+                                    fn_id,
+                                    Some(instance.clone()),
+                                    args,
+                                    host,
+                                )?;
+                                instance
+                            }
+                            _ => return Err(JsVal::Str("el valor no es construible".into())),
+                        };
+                        stack.push(obj);
                     }
                     Op::Construct(ctor, spreads) => {
                         let split = stack.len().saturating_sub(spreads.len());
@@ -2680,15 +3286,21 @@ impl VmRuntime {
                         parent,
                         ctor,
                         methods,
+                        statics,
                     } => {
                         let mut mmap = HashMap::new();
+                        let mut smap = HashMap::new();
                         if let Some(p) = parent
                             && let Some(pdef) = self.classes.get(p)
                         {
                             mmap.extend(pdef.methods.clone());
+                            smap.extend(pdef.statics.clone());
                         }
                         for (mname, mid) in methods {
                             mmap.insert(mname.clone(), *mid);
+                        }
+                        for (mname, mid) in statics {
+                            smap.insert(mname.clone(), *mid);
                         }
                         self.classes.insert(
                             name.clone(),
@@ -2696,9 +3308,14 @@ impl VmRuntime {
                                 parent: parent.clone(),
                                 ctor: *ctor,
                                 methods: mmap,
+                                statics: smap,
                             },
                         );
-                        stack.push(JsVal::Undefined);
+                        let class_value = JsVal::NativeHandle(name.clone());
+                        locals
+                            .borrow_mut()
+                            .insert(name.clone(), class_value.clone());
+                        stack.push(class_value);
                     }
                     Op::Return => {
                         return Ok(Some(usize::MAX));
@@ -2726,14 +3343,54 @@ impl VmRuntime {
         Ok(stack.pop().unwrap_or(JsVal::Undefined))
     }
 
+    /// `x instanceof C`: el constructor se identifica por su nombre (las
+    /// clases del motor y los objetos nativos llevan marcadores propios).
+    fn is_instance_of(&self, value: &JsVal, ctor: &JsVal) -> bool {
+        let name = match ctor {
+            JsVal::Str(name) => name.clone(),
+            JsVal::NativeHandle(handle) => handle.clone(),
+            _ => return false,
+        };
+        match value {
+            JsVal::Array(_) => name == "Array",
+            JsVal::Object(id) => {
+                let Some(map) = self.objects.get(*id) else {
+                    return false;
+                };
+                if map.get("__wispType") == Some(&JsVal::Str(name.clone())) {
+                    return true;
+                }
+                if let Some(JsVal::Str(class)) = map.get("__wispCtor") {
+                    if *class == name {
+                        return true;
+                    }
+                    let mut current = self.classes.get(class).and_then(|def| def.parent.clone());
+                    for _ in 0..64 {
+                        match current {
+                            Some(parent) if parent == name => return true,
+                            Some(parent) => {
+                                current =
+                                    self.classes.get(&parent).and_then(|def| def.parent.clone());
+                            }
+                            None => break,
+                        }
+                    }
+                }
+                name == "Object"
+            }
+            _ => false,
+        }
+    }
+
     fn construct_class(
         &mut self,
-        _name: &str,
+        name: &str,
         def: &ClassDef,
         args: Vec<JsVal>,
         host: &mut dyn HostBridge,
     ) -> Result<JsVal, JsVal> {
         let mut map = HashMap::new();
+        map.insert("__wispCtor".to_owned(), JsVal::Str(name.to_owned()));
         if let Some(p) = &def.parent {
             map.insert("__wispParent".to_owned(), JsVal::Str(p.clone()));
         }
@@ -2852,6 +3509,14 @@ impl VmRuntime {
                 Some(JsVal::Str(s))
             }
             "Number" => Some(JsVal::Number(args.first().map_or(0.0, JsVal::to_number))),
+            // Sin un tipo símbolo, cada llamada produce una clave única y estable:
+            // basta para usarla como propiedad privada de un objeto.
+            "Symbol" => {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let desc = args.first().map(ToString::to_string).unwrap_or_default();
+                Some(JsVal::NativeHandle(format!("Symbol({desc})#{seq}")))
+            }
             "Boolean" => Some(JsVal::Bool(args.first().is_some_and(JsVal::is_truthy))),
             "parseInt" => {
                 let s = args.first().map(ToString::to_string).unwrap_or_default();
@@ -2910,6 +3575,17 @@ impl VmRuntime {
             JsVal::Str(s) if prop == "length" => {
                 let len = s.encode_utf16().count() as f64;
                 Ok(JsVal::Number(len))
+            }
+            JsVal::NativeHandle(h) => {
+                let mid = self
+                    .classes
+                    .get(h)
+                    .and_then(|d| d.statics.get(prop))
+                    .copied();
+                match mid {
+                    Some(mid) => Ok(JsVal::Function(mid)),
+                    None => host.get_prop(self, &JsVal::NativeHandle(h.clone()), prop),
+                }
             }
             JsVal::NativeHandle(h) if h == "Math" => Ok(match prop {
                 "PI" => JsVal::Number(std::f64::consts::PI),
@@ -3011,6 +3687,56 @@ impl VmRuntime {
         args: Vec<JsVal>,
         host: &mut dyn HostBridge,
     ) -> Result<JsVal, JsVal> {
+        // `call`, `apply` y `bind` de un valor función.
+        if let JsVal::Function(fn_id) = &target {
+            let fn_id = *fn_id;
+            match method {
+                "call" => {
+                    let mut it = args.into_iter();
+                    let this_val = it.next().unwrap_or(JsVal::Undefined);
+                    let rest: Vec<JsVal> = it.collect();
+                    return self.call_fn_id_with_this(fn_id, Some(this_val), rest, host);
+                }
+                "apply" => {
+                    let mut it = args.into_iter();
+                    let this_val = it.next().unwrap_or(JsVal::Undefined);
+                    let rest = match it.next() {
+                        Some(JsVal::Array(items)) => items,
+                        _ => Vec::new(),
+                    };
+                    return self.call_fn_id_with_this(fn_id, Some(this_val), rest, host);
+                }
+                "bind" => {
+                    let mut it = args.into_iter();
+                    let this_val = it.next().unwrap_or(JsVal::Undefined);
+                    let bound_args: Vec<JsVal> = it.collect();
+                    let id = self.functions.len();
+                    self.functions.push(FunctionChunk {
+                        params: Vec::new(),
+                        code: Vec::new(),
+                        native: None,
+                        bound: Some(BoundCall {
+                            target: fn_id,
+                            this_val,
+                            args: bound_args,
+                        }),
+                    });
+                    return Ok(JsVal::Function(id));
+                }
+                _ => {}
+            }
+        }
+        // Un método `static` se invoca sobre el propio constructor.
+        if let JsVal::NativeHandle(h) = &target {
+            let mid = self
+                .classes
+                .get(h)
+                .and_then(|d| d.statics.get(method))
+                .copied();
+            if let Some(mid) = mid {
+                return self.call_fn_id(mid, args, host);
+            }
+        }
         match &target {
             JsVal::NativeHandle(h) if h == "Math" => {
                 let n0 = args.first().map_or(f64::NAN, JsVal::to_number);
@@ -3171,7 +3897,7 @@ impl VmRuntime {
                     return Ok(JsVal::Array(out));
                 }
                 "map" => {
-                    if let Some(JsVal::Function(fn_id)) = args.first().copied() {
+                    if let Some(JsVal::Function(fn_id)) = args.first().cloned() {
                         let mut out = Vec::with_capacity(items.len());
                         for (i, item) in items.iter().enumerate() {
                             out.push(self.call_fn_id(
@@ -3184,7 +3910,7 @@ impl VmRuntime {
                     }
                 }
                 "filter" => {
-                    if let Some(JsVal::Function(fn_id)) = args.first().copied() {
+                    if let Some(JsVal::Function(fn_id)) = args.first().cloned() {
                         let mut out = Vec::new();
                         for (i, item) in items.iter().enumerate() {
                             let keep = self.call_fn_id(
@@ -3200,7 +3926,7 @@ impl VmRuntime {
                     }
                 }
                 "forEach" => {
-                    if let Some(JsVal::Function(fn_id)) = args.first().copied() {
+                    if let Some(JsVal::Function(fn_id)) = args.first().cloned() {
                         for (i, item) in items.iter().enumerate() {
                             self.call_fn_id(
                                 fn_id,
@@ -3212,7 +3938,7 @@ impl VmRuntime {
                     return Ok(JsVal::Undefined);
                 }
                 "reduce" => {
-                    if let Some(JsVal::Function(fn_id)) = args.first().copied() {
+                    if let Some(JsVal::Function(fn_id)) = args.first().cloned() {
                         let mut iter = items.iter().enumerate();
                         let mut acc = if let Some(init) = args.get(1) {
                             init.clone()
@@ -3234,7 +3960,7 @@ impl VmRuntime {
                     }
                 }
                 "find" => {
-                    if let Some(JsVal::Function(fn_id)) = args.first().copied() {
+                    if let Some(JsVal::Function(fn_id)) = args.first().cloned() {
                         for (i, item) in items.iter().enumerate() {
                             if self
                                 .call_fn_id(
@@ -3251,7 +3977,7 @@ impl VmRuntime {
                     return Ok(JsVal::Undefined);
                 }
                 "findIndex" => {
-                    if let Some(JsVal::Function(fn_id)) = args.first().copied() {
+                    if let Some(JsVal::Function(fn_id)) = args.first().cloned() {
                         for (i, item) in items.iter().enumerate() {
                             if self
                                 .call_fn_id(
@@ -3268,7 +3994,7 @@ impl VmRuntime {
                     return Ok(JsVal::Number(-1.0));
                 }
                 "some" => {
-                    if let Some(JsVal::Function(fn_id)) = args.first().copied() {
+                    if let Some(JsVal::Function(fn_id)) = args.first().cloned() {
                         for (i, item) in items.iter().enumerate() {
                             if self
                                 .call_fn_id(
@@ -3285,7 +4011,7 @@ impl VmRuntime {
                     return Ok(JsVal::Bool(false));
                 }
                 "every" => {
-                    if let Some(JsVal::Function(fn_id)) = args.first().copied() {
+                    if let Some(JsVal::Function(fn_id)) = args.first().cloned() {
                         for (i, item) in items.iter().enumerate() {
                             if !self
                                 .call_fn_id(
@@ -3610,7 +4336,7 @@ impl VmRuntime {
                             _ => {}
                         }
                     }
-                    if let Some(JsVal::Function(fn_id)) = m.get(method).copied() {
+                    if let Some(JsVal::Function(fn_id)) = m.get(method).cloned() {
                         return self.call_fn_id_with_this(fn_id, Some(target), args, host);
                     }
                 }
@@ -3944,6 +4670,7 @@ fn tok_as_prop_name(tok: Tok) -> Option<String> {
         Tok::KwSuper => Some("super".to_owned()),
         Tok::KwOf => Some("of".to_owned()),
         Tok::KwIn => Some("in".to_owned()),
+        Tok::KwInstanceof => Some("instanceof".to_owned()),
         Tok::KwReturn => Some("return".to_owned()),
         Tok::KwIf => Some("if".to_owned()),
         Tok::KwElse => Some("else".to_owned()),
@@ -3995,6 +4722,169 @@ pub fn eval_native(src: &str) -> Result<JsVal, String> {
     vm.eval_script(src, &mut host)
 }
 
+/// `ToInt32` de ECMAScript: envuelve el número en 32 bits con signo.
+/// Desescapa el texto literal de un template (el token conserva los escapes).
+fn unescape_template(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Devuelve la posición del `}` que cierra una interpolación de template.
+///
+/// Solo cuentan las llaves de código: las de cadenas, plantillas anidadas y
+/// expresiones regulares forman parte de sus literales.
+fn interpolation_end(source: &str) -> Option<usize> {
+    let chars: Vec<(usize, char)> = source.char_indices().collect();
+    let mut depth = 1usize;
+    let mut prev = '\0';
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (idx, ch) = chars[i];
+        match ch {
+            '"' | '\'' => {
+                i += 1;
+                while i < chars.len() {
+                    let c = chars[i].1;
+                    if c == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == ch {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // Los templates anidados se saltan enteros, con sus `${...}`.
+            '`' => {
+                i += 1;
+                while i < chars.len() {
+                    let c = chars[i].1;
+                    if c == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == '`' {
+                        break;
+                    }
+                    if c == '$' && matches!(chars.get(i + 1), Some((_, '{'))) {
+                        let open = chars[i + 1].0;
+                        let rel = interpolation_end(&source[open + 1..])?;
+                        let close = open + 1 + rel;
+                        i = chars.iter().position(|(pos, _)| *pos == close)?;
+                        continue;
+                    }
+                    i += 1;
+                }
+            }
+            // Un `/` tras un operador o un paréntesis abre un regex; tras un
+            // valor sería una división.
+            '/' if matches!(
+                prev,
+                '\0' | '('
+                    | ','
+                    | '='
+                    | ':'
+                    | '['
+                    | '!'
+                    | '&'
+                    | '|'
+                    | '?'
+                    | '{'
+                    | '}'
+                    | ';'
+                    | '+'
+                    | '-'
+                    | '*'
+                    | '%'
+                    | '<'
+                    | '>'
+                    | '~'
+                    | '^'
+            ) =>
+            {
+                i += 1;
+                let mut class = false;
+                while i < chars.len() {
+                    let c = chars[i].1;
+                    if c == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == '[' {
+                        class = true;
+                    } else if c == ']' {
+                        class = false;
+                    } else if c == '/' && !class {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+        if !ch.is_whitespace() {
+            prev = ch;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn loose_eq(lhs: &JsVal, rhs: &JsVal) -> bool {
+    let nullish = |v: &JsVal| matches!(v, JsVal::Null | JsVal::Undefined);
+    if nullish(lhs) || nullish(rhs) {
+        return nullish(lhs) && nullish(rhs);
+    }
+    match (lhs, rhs) {
+        (JsVal::Str(a), JsVal::Number(b)) | (JsVal::Number(b), JsVal::Str(a)) => {
+            a.trim().parse::<f64>().is_ok_and(|n| n == *b)
+        }
+        (JsVal::Bool(_), _) | (_, JsVal::Bool(_)) => lhs.to_number() == rhs.to_number(),
+        _ => lhs == rhs,
+    }
+}
+
+fn to_int32(value: &JsVal) -> i32 {
+    let n = value.to_number();
+    if !n.is_finite() {
+        return 0;
+    }
+    let wrapped = n.trunc() % 4_294_967_296.0;
+    let wrapped = if wrapped < 0.0 {
+        wrapped + 4_294_967_296.0
+    } else {
+        wrapped
+    };
+    wrapped as u32 as i32
+}
+
+/// `ToUint32` de ECMAScript, para los desplazamientos sin signo.
+fn to_u32(value: &JsVal) -> u32 {
+    to_int32(value) as u32
+}
+
 fn eval_binary(op: BinOp, lhs: JsVal, rhs: JsVal) -> JsVal {
     match op {
         BinOp::Add => match (&lhs, &rhs) {
@@ -4006,13 +4896,26 @@ fn eval_binary(op: BinOp, lhs: JsVal, rhs: JsVal) -> JsVal {
         BinOp::Mul => JsVal::Number(lhs.to_number() * rhs.to_number()),
         BinOp::Div => JsVal::Number(lhs.to_number() / rhs.to_number()),
         BinOp::Rem => JsVal::Number(lhs.to_number() % rhs.to_number()),
-        BinOp::StrictEq | BinOp::Eq => JsVal::Bool(lhs == rhs),
-        BinOp::StrictNe | BinOp::Ne => JsVal::Bool(lhs != rhs),
+        BinOp::StrictEq => JsVal::Bool(lhs == rhs),
+        BinOp::StrictNe => JsVal::Bool(lhs != rhs),
+        // `==` es la igualdad laxa: `null == undefined` es true, y un número
+        // y su cadena también son iguales.
+        BinOp::Eq => JsVal::Bool(loose_eq(&lhs, &rhs)),
+        BinOp::Ne => JsVal::Bool(!loose_eq(&lhs, &rhs)),
         BinOp::Lt => JsVal::Bool(lhs.to_number() < rhs.to_number()),
         BinOp::Le => JsVal::Bool(lhs.to_number() <= rhs.to_number()),
         BinOp::Gt => JsVal::Bool(lhs.to_number() > rhs.to_number()),
         BinOp::Ge => JsVal::Bool(lhs.to_number() >= rhs.to_number()),
-        BinOp::In => JsVal::Bool(false),
+        // `instanceof` necesita el runtime (clases, objetos nativos) y se
+        // resuelve en `exec_code`; si llega aquí no hay nada que comparar.
+        // Los operadores de bits convierten sus operandos a enteros de 32 bits.
+        BinOp::BitOr => JsVal::Number((to_int32(&lhs) | to_int32(&rhs)) as f64),
+        BinOp::BitXor => JsVal::Number((to_int32(&lhs) ^ to_int32(&rhs)) as f64),
+        BinOp::BitAnd => JsVal::Number((to_int32(&lhs) & to_int32(&rhs)) as f64),
+        BinOp::Shl => JsVal::Number(to_int32(&lhs).wrapping_shl(to_u32(&rhs) & 31) as f64),
+        BinOp::Shr => JsVal::Number((to_int32(&lhs) >> (to_u32(&rhs) & 31)) as f64),
+        BinOp::UShr => JsVal::Number((to_u32(&lhs) >> (to_u32(&rhs) & 31)) as f64),
+        BinOp::In | BinOp::InstanceOf => JsVal::Bool(false),
         BinOp::And => {
             if lhs.is_truthy() {
                 rhs

@@ -366,7 +366,7 @@ pub fn execute_scripts_with_geometry(
         module_scripts,
         page_url_owned,
         viewport_width,
-        policy,
+        &policy,
         geometry_hook,
     );
     for warning in script_warnings {

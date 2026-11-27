@@ -203,8 +203,9 @@ impl<'a> NativeDomHost<'a> {
         self.geometry_cache.clear();
         let mut preorder_map = Vec::new();
         self.collect_preorder_elements(self.doc_id, &mut preorder_map);
+        let serialized = self.geometry_hook.is_some().then(|| self.serialize_html());
         if let Some(hook) = self.geometry_hook.as_deref_mut() {
-            let html = self.serialize_html();
+            let html = serialized.unwrap_or_default();
             let by_preorder = hook(&html, self.viewport_width);
             for (pre_idx, nid) in preorder_map.into_iter().enumerate() {
                 if let Some(geom) = by_preorder.get(&pre_idx) {
@@ -460,6 +461,13 @@ impl<'a> NativeDomHost<'a> {
             "window".to_owned(),
             JsVal::NativeHandle("window".to_owned()),
         );
+        // `globalThis`/`self` apuntan al mismo objeto que `window`: los bundles
+        // (el script de utilidades de Playwright, por ejemplo) lo usan para
+        // inicializarse.
+        for alias in ["globalThis", "self"] {
+            vm.globals
+                .insert(alias.to_owned(), JsVal::NativeHandle("window".to_owned()));
+        }
         vm.globals.insert(
             "location".to_owned(),
             JsVal::NativeHandle("location".to_owned()),
@@ -1110,6 +1118,22 @@ impl HostBridge for NativeDomHost<'_> {
                     "closed" => Ok(JsVal::Bool(false)),
                     "name" => Ok(JsVal::Str(String::new())),
                     "event" => Ok(JsVal::Undefined),
+                    // Funciones del host que también deben existir como valor:
+                    // el script de utilidades hace `global.setTimeout?.bind(global)`.
+                    other
+                        if matches!(
+                            other,
+                            "setTimeout"
+                                | "setInterval"
+                                | "clearTimeout"
+                                | "clearInterval"
+                                | "requestAnimationFrame"
+                                | "cancelAnimationFrame"
+                                | "queueMicrotask"
+                        ) =>
+                    {
+                        Ok(vm.function_for_global(other))
+                    }
                     _ => Ok(JsVal::Undefined),
                 },
                 "navigator" => {
@@ -1354,14 +1378,16 @@ impl HostBridge for NativeDomHost<'_> {
                         .page_url
                         .as_deref()
                         .and_then(|u| url::Url::parse(u).ok());
-                    let (host, path) = match parsed {
+                    let (host, path, is_https) = match parsed {
                         Some(ref u) => (
                             u.host_str().unwrap_or("localhost").to_owned(),
                             u.path().to_owned(),
+                            u.scheme() == "https",
                         ),
-                        None => ("localhost".to_owned(), "/".to_owned()),
+                        None => ("localhost".to_owned(), "/".to_owned(), false),
                     };
-                    self.cookie_jar.set_from_header(&raw, &host, &path);
+                    self.cookie_jar
+                        .set_from_header(&host, &path, is_https, &raw);
                 } else if handle == "document" && prop == "title" {
                     let title_text = value.to_string();
                     if let Some(tid) = self.find_first_tag(self.doc_id, "title") {
@@ -1622,9 +1648,10 @@ impl HostBridge for NativeDomHost<'_> {
                 "crypto" => match method {
                     "getRandomValues" => {
                         if let Some(arg) = args.first() {
-                            if let Some(mut buf) = vm.read_uint8_array(arg) {
+                            if let Some(existing) = vm.read_uint8_array(arg) {
+                                let mut buf = existing.to_vec();
                                 fill_random_bytes(&mut buf);
-                                let _ = vm.write_uint8_array(arg, &buf);
+                                let _ = vm.write_uint8_array(arg, buf);
                                 return Ok(arg.clone());
                             }
                             if let JsVal::Array(items) = arg {
@@ -1740,7 +1767,7 @@ impl HostBridge for NativeDomHost<'_> {
                             Some(JsVal::Array(items)) => {
                                 items.iter().map(|v| v.to_number() as u8).collect()
                             }
-                            Some(other) => vm.read_uint8_array(other).unwrap_or_default(),
+                            Some(other) => vm.read_uint8_array(other).unwrap_or_default().to_vec(),
                             None => Vec::new(),
                         };
                         Ok(JsVal::Str(String::from_utf8_lossy(&bytes).into_owned()))
@@ -2491,9 +2518,13 @@ impl HostBridge for NativeDomHost<'_> {
                         _ => {}
                     }
                 }
-                Err(JsVal::Str(format!("método no definido `{method}`")))
+                Err(JsVal::Str(format!(
+                    "método no definido `{method}` en {target:?}"
+                )))
             }
-            _ => Err(JsVal::Str(format!("método no definido `{method}`"))),
+            _ => Err(JsVal::Str(format!(
+                "método no definido `{method}` en {target:?}"
+            ))),
         }
     }
 
@@ -3233,7 +3264,9 @@ mod tests {
             return [r.width, r.height, el.offsetWidth, cs.color, hit && hit.id];
         })()"#;
         let res = crate::evaluate_expression(html, url, 1280.0, js).expect("eval ok");
-        let expected = serde_json::json!([240.0, 80.0, 240.0, "red", "box"]);
+        // JavaScript tiene un único tipo numérico y `jsval_to_json` lo
+        // serializa en su forma canónica (240.0 → 240), igual que Chrome.
+        let expected = serde_json::json!([240, 80, 240, "red", "box"]);
         assert_eq!(res.value, Some(expected));
     }
 

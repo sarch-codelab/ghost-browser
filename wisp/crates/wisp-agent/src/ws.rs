@@ -95,20 +95,22 @@ pub fn write_handshake(stream: &mut TcpStream, client_key: &str) -> io::Result<(
 }
 
 pub fn write_ws_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> io::Result<()> {
-    let mut header = Vec::with_capacity(10);
-    header.push(0x80 | (opcode & 0x0f));
+    // Un solo `write_all`: un frame parcial deja al cliente esperando el resto
+    // y rompe lecturas que asumen que cabecera y payload llegan juntos.
+    let mut frame = Vec::with_capacity(payload.len() + 10);
+    frame.push(0x80 | (opcode & 0x0f));
     let len = payload.len();
     if len <= 125 {
-        header.push(len as u8);
+        frame.push(len as u8);
     } else if len <= 65535 {
-        header.push(126);
-        header.extend_from_slice(&(len as u16).to_be_bytes());
+        frame.push(126);
+        frame.extend_from_slice(&(len as u16).to_be_bytes());
     } else {
-        header.push(127);
-        header.extend_from_slice(&(len as u64).to_be_bytes());
+        frame.push(127);
+        frame.extend_from_slice(&(len as u64).to_be_bytes());
     }
-    stream.write_all(&header)?;
-    stream.write_all(payload)?;
+    frame.extend_from_slice(payload);
+    stream.write_all(&frame)?;
     stream.flush()
 }
 
