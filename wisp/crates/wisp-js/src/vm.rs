@@ -756,7 +756,9 @@ impl Parser {
                     let bind = if self.eat(&Tok::Colon) {
                         match self.next() {
                             Tok::Ident(n) => n,
-                            other => return Err(format!("alias destructuring inválido: {other:?}")),
+                            other => {
+                                return Err(format!("alias destructuring inválido: {other:?}"));
+                            }
                         }
                     } else {
                         key.clone()
@@ -982,7 +984,9 @@ impl Parser {
                     let cv = if self.eat(&Tok::LParen) {
                         let name = match self.next() {
                             Tok::Ident(n) => n,
-                            other => return Err(format!("identificador catch inválido: {other:?}")),
+                            other => {
+                                return Err(format!("identificador catch inválido: {other:?}"));
+                            }
                         };
                         self.expect(&Tok::RParen)?;
                         Some(name)
@@ -2405,9 +2409,9 @@ impl VmRuntime {
                                     ks.into_iter().map(JsVal::Str).collect()
                                 })
                                 .unwrap_or_default(),
-                            JsVal::Array(items) => {
-                                (0..items.len()).map(|i| JsVal::Str(i.to_string())).collect()
-                            }
+                            JsVal::Array(items) => (0..items.len())
+                                .map(|i| JsVal::Str(i.to_string()))
+                                .collect(),
                             _ => Vec::new(),
                         };
                         stack.push(JsVal::Array(keys));
@@ -2671,7 +2675,12 @@ impl VmRuntime {
                         };
                         stack.push(obj);
                     }
-                    Op::RegisterClass { name, parent, ctor, methods } => {
+                    Op::RegisterClass {
+                        name,
+                        parent,
+                        ctor,
+                        methods,
+                    } => {
                         let mut mmap = HashMap::new();
                         if let Some(p) = parent
                             && let Some(pdef) = self.classes.get(p)
@@ -2802,7 +2811,10 @@ impl VmRuntime {
                 let idx = self.maps.len();
                 self.maps.push(pairs);
                 let obj = self.alloc_object(HashMap::from([
-                    ("__wispType".to_owned(), JsVal::Str("URLSearchParams".to_owned())),
+                    (
+                        "__wispType".to_owned(),
+                        JsVal::Str("URLSearchParams".to_owned()),
+                    ),
                     ("__wispIdx".to_owned(), JsVal::Number(idx as f64)),
                 ]));
                 Some(Ok(obj))
@@ -3346,7 +3358,10 @@ impl VmRuntime {
                         && let Some(rmap) = self.objects.get(*rid)
                         && rmap.get("__wispType") == Some(&JsVal::Str("RegExp".to_owned()))
                     {
-                        let pat = rmap.get("source").map(ToString::to_string).unwrap_or_default();
+                        let pat = rmap
+                            .get("source")
+                            .map(ToString::to_string)
+                            .unwrap_or_default();
                         let ci = rmap.get("ignoreCase") == Some(&JsVal::Bool(true));
                         let global = rmap.get("global") == Some(&JsVal::Bool(true));
                         return Ok(JsVal::Str(regex_replace(s, &pat, &rep, ci, global)));
@@ -3364,7 +3379,10 @@ impl VmRuntime {
                         && let Some(rmap) = self.objects.get(*rid)
                         && rmap.get("__wispType") == Some(&JsVal::Str("RegExp".to_owned()))
                     {
-                        let pat = rmap.get("source").map(ToString::to_string).unwrap_or_default();
+                        let pat = rmap
+                            .get("source")
+                            .map(ToString::to_string)
+                            .unwrap_or_default();
                         let ci = rmap.get("ignoreCase") == Some(&JsVal::Bool(true));
                         let global = rmap.get("global") == Some(&JsVal::Bool(true));
                         let matches = regex_find_all(s, &pat, ci, global);
@@ -3615,7 +3633,10 @@ fn pct_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         if b.is_ascii_alphanumeric()
-            || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')')
+            || matches!(
+                b,
+                b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+            )
         {
             out.push(*b as char);
         } else {
@@ -3635,10 +3656,8 @@ fn pct_decode(s: &str) -> String {
             i += 1;
         } else if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(val) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                16,
-            )
+            && let Ok(val) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
         {
             out.push(val);
             i += 3;

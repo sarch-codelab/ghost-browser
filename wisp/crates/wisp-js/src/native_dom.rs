@@ -2244,8 +2244,14 @@ impl HostBridge for NativeDomHost<'_> {
                         ("top".to_owned(), JsVal::Number(geom.y as f64)),
                         ("width".to_owned(), JsVal::Number(geom.width as f64)),
                         ("height".to_owned(), JsVal::Number(geom.height as f64)),
-                        ("right".to_owned(), JsVal::Number((geom.x + geom.width) as f64)),
-                        ("bottom".to_owned(), JsVal::Number((geom.y + geom.height) as f64)),
+                        (
+                            "right".to_owned(),
+                            JsVal::Number((geom.x + geom.width) as f64),
+                        ),
+                        (
+                            "bottom".to_owned(),
+                            JsVal::Number((geom.y + geom.height) as f64),
+                        ),
                     ]));
                     Ok(rect)
                 }
@@ -2731,13 +2737,8 @@ pub(crate) fn evaluate_expression_native(
     let mut warnings = Vec::new();
     init_fetch_state(page_url, policy);
 
-    let mut host = NativeDomHost::from_html(
-        document,
-        page_url,
-        viewport_width,
-        policy,
-        geometry_hook,
-    );
+    let mut host =
+        NativeDomHost::from_html(document, page_url, viewport_width, policy, geometry_hook);
     let mut vm = VmRuntime::new();
     host.init_globals(&mut vm);
 

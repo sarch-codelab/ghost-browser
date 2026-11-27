@@ -105,11 +105,8 @@ pub fn run(args: &[String]) -> Result<()> {
             }
             "--proxy" => {
                 index += 1;
-                config.options.proxy_url = Some(
-                    args.get(index)
-                        .context("`--proxy` needs a URL")?
-                        .to_owned(),
-                );
+                config.options.proxy_url =
+                    Some(args.get(index).context("`--proxy` needs a URL")?.to_owned());
             }
             "--workers" => {
                 index += 1;
@@ -192,10 +189,7 @@ pub fn run(args: &[String]) -> Result<()> {
 }
 
 enum IncomingHttp {
-    WebSocket {
-        path: String,
-        key: String,
-    },
+    WebSocket { path: String, key: String },
     Rest(control::Request),
     InvalidJson(String),
     Eof,
@@ -1752,7 +1746,10 @@ mod tests {
             body: Value::Null,
         };
         let version = handle_cdp_discovery(&version_req, &state).expect("version");
-        assert_eq!(version["webSocketDebuggerUrl"], "ws://127.0.0.1:49123/devtools/browser/wisp");
+        assert_eq!(
+            version["webSocketDebuggerUrl"],
+            "ws://127.0.0.1:49123/devtools/browser/wisp"
+        );
 
         let list_req = control::Request {
             method: "GET".into(),
@@ -1762,7 +1759,10 @@ mod tests {
         let list = handle_cdp_discovery(&list_req, &state).expect("list");
         let arr = list.as_array().expect("array");
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["webSocketDebuggerUrl"], "ws://127.0.0.1:49123/devtools/page/wisp-1");
+        assert_eq!(
+            arr[0]["webSocketDebuggerUrl"],
+            "ws://127.0.0.1:49123/devtools/page/wisp-1"
+        );
     }
 
     #[test]

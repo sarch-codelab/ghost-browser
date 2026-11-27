@@ -72,11 +72,8 @@ fn fetch(args: &[String]) -> Result<()> {
             }
             "--proxy" => {
                 index += 1;
-                options.proxy_url = Some(
-                    args.get(index)
-                        .context("`--proxy` needs a URL")?
-                        .to_owned(),
-                );
+                options.proxy_url =
+                    Some(args.get(index).context("`--proxy` needs a URL")?.to_owned());
             }
             flag if flag.starts_with("--") => bail!("unknown flag `{flag}`"),
             value => {
@@ -157,11 +154,8 @@ fn screenshot(args: &[String]) -> Result<()> {
             }
             "--proxy" => {
                 index += 1;
-                options.proxy_url = Some(
-                    args.get(index)
-                        .context("`--proxy` needs a URL")?
-                        .to_owned(),
-                );
+                options.proxy_url =
+                    Some(args.get(index).context("`--proxy` needs a URL")?.to_owned());
             }
             flag if flag.starts_with("--") => bail!("unknown flag `{flag}`"),
             value => ensure_single_url(&mut url, value)?,

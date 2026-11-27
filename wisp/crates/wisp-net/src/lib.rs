@@ -300,42 +300,10 @@ impl StealthProfile {
 }
 
 const MULTI_LABEL_PUBLIC_SUFFIXES: &[&str] = &[
-    "co.uk",
-    "org.uk",
-    "gov.uk",
-    "ac.uk",
-    "net.uk",
-    "com.au",
-    "net.au",
-    "org.au",
-    "edu.au",
-    "co.jp",
-    "ne.jp",
-    "or.jp",
-    "ac.jp",
-    "com.br",
-    "org.br",
-    "net.br",
-    "com.mx",
-    "org.mx",
-    "com.ar",
-    "com.hn",
-    "gob.hn",
-    "co.in",
-    "net.in",
-    "org.in",
-    "com.cn",
-    "net.cn",
-    "org.cn",
-    "com.tw",
-    "co.nz",
-    "co.za",
-    "com.sg",
-    "com.tr",
-    "co.kr",
-    "com.es",
-    "com.co",
-    "com.pe",
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "net.uk", "com.au", "net.au", "org.au", "edu.au",
+    "co.jp", "ne.jp", "or.jp", "ac.jp", "com.br", "org.br", "net.br", "com.mx", "org.mx", "com.ar",
+    "com.hn", "gob.hn", "co.in", "net.in", "org.in", "com.cn", "net.cn", "org.cn", "com.tw",
+    "co.nz", "co.za", "com.sg", "com.tr", "co.kr", "com.es", "com.co", "com.pe",
 ];
 
 /// Devuelve el dominio registrable (eTLD+1) para un host normalizado.
@@ -713,7 +681,9 @@ mod tests {
 
     #[test]
     fn tracker_blocker_matches_exact_and_subdomains() {
-        assert!(is_tracker_url("https://www.google-analytics.com/analytics.js"));
+        assert!(is_tracker_url(
+            "https://www.google-analytics.com/analytics.js"
+        ));
         assert!(is_tracker_url("https://doubleclick.net/pixel"));
         assert!(!is_tracker_url("https://example.com/?ref=doubleclick.net"));
     }

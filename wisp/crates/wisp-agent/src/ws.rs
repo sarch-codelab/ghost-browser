@@ -257,7 +257,10 @@ mod tests {
 
         let (mut server, _) = listener.accept().unwrap();
         let msg = read_ws_message(&mut server).unwrap().unwrap();
-        assert_eq!(msg, WsMessage::Text(r#"{"id":1,"method":"Runtime.enable"}"#.to_owned()));
+        assert_eq!(
+            msg,
+            WsMessage::Text(r#"{"id":1,"method":"Runtime.enable"}"#.to_owned())
+        );
         write_ws_text(&mut server, r#"{"id":1,"result":{}}"#).unwrap();
         handle.join().unwrap();
     }
