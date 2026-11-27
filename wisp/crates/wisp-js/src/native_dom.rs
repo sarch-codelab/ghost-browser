@@ -1631,9 +1631,8 @@ impl HostBridge for NativeDomHost<'_> {
                             if let JsVal::Array(items) = arg {
                                 let mut buf = vec![0u8; items.len()];
                                 fill_random_bytes(&mut buf);
-                                return Ok(JsVal::Array(
-                                    buf.into_iter().map(|b| JsVal::Number(b as f64)).collect(),
-                                ));
+                                let nums = buf.into_iter().map(|b| JsVal::Number(b as f64)).collect();
+                                return Ok(JsVal::Array(nums));
                             }
                         }
                         Ok(JsVal::Undefined)
@@ -1643,26 +1642,12 @@ impl HostBridge for NativeDomHost<'_> {
                         fill_random_bytes(&mut b);
                         b[6] = (b[6] & 0x0f) | 0x40;
                         b[8] = (b[8] & 0x3f) | 0x80;
-                        let uuid = format!(
-                            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}\
-                             -{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                            b[0],
-                            b[1],
-                            b[2],
-                            b[3],
-                            b[4],
-                            b[5],
-                            b[6],
-                            b[7],
-                            b[8],
-                            b[9],
-                            b[10],
-                            b[11],
-                            b[12],
-                            b[13],
-                            b[14],
-                            b[15]
-                        );
+                        let p1 = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+                        let p2 = u16::from_be_bytes([b[4], b[5]]);
+                        let p3 = u16::from_be_bytes([b[6], b[7]]);
+                        let p4 = u16::from_be_bytes([b[8], b[9]]);
+                        let p5 = u64::from_be_bytes([0, 0, b[10], b[11], b[12], b[13], b[14], b[15]]);
+                        let uuid = format!("{p1:08x}-{p2:04x}-{p3:04x}-{p4:04x}-{p5:012x}");
                         Ok(JsVal::Str(uuid))
                     }
                     _ => Ok(JsVal::Undefined),

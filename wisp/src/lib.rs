@@ -9293,15 +9293,12 @@ fetch("http://{data_address}/data.json").then(function () {{
             HashMap::new(),
             vec![],
         );
-        let res = page
-            .eval_js(
-                r#"(() => {
-                    const a = document.getElementById("a").getBoundingClientRect();
-                    const b = document.getElementById("b").getBoundingClientRect();
-                    return [a.x, a.width, b.x, b.width];
-                })()"#,
-            )
-            .expect("eval ok");
+        let js = r#"(() => {
+            const a = document.getElementById("a").getBoundingClientRect();
+            const b = document.getElementById("b").getBoundingClientRect();
+            return [a.x, a.width, b.x, b.width];
+        })()"#;
+        let res = page.eval_js(js).expect("eval ok");
         assert_eq!(res.value, Some(serde_json::json!([0.0, 100.0, 100.0, 120.0])));
     }
 }

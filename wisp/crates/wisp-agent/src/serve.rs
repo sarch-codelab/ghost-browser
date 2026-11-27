@@ -1457,8 +1457,8 @@ fn handle_cdp_discovery(request: &control::Request, state: &Arc<Mutex<State>>) -
     match (request.method.as_str(), path) {
         ("GET", "/json/version") => {
             let s = lock(state);
-            let ua = wisp_engine::wisp_net::StealthProfile::for_policy(&s.options.policy)
-                .user_agent;
+            let profile = wisp_engine::wisp_net::StealthProfile::for_policy(&s.options.policy);
+            let ua = profile.user_agent;
             Some(json!({
                 "Browser": format!("Wisp/{}", env!("CARGO_PKG_VERSION")),
                 "Protocol-Version": "1.3",
@@ -1521,11 +1521,7 @@ fn handle_cdp_discovery(request: &control::Request, state: &Arc<Mutex<State>>) -
                 .split_once('?')
                 .map(|(_, q)| q)
                 .filter(|q| !q.is_empty())
-                .map(|q| {
-                    q.strip_prefix("url=")
-                        .unwrap_or(q)
-                        .to_owned()
-                })
+                .map(|q| q.strip_prefix("url=").unwrap_or(q).to_owned())
                 .unwrap_or_else(|| "about:blank".to_owned());
             let mut s = lock(state);
             let options = s.options.clone();
@@ -1824,7 +1820,7 @@ mod tests {
             "Upgrade: websocket\r\n",
             "Connection: Upgrade\r\n",
             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
-            "Sec-WebSocket-Version: 13\r\n\r\n",
+            "Sec-WebSocket-Version: 13\r\n\r\n"
         )
         .as_bytes();
         client.write_all(req_bytes).unwrap();

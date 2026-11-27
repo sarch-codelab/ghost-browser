@@ -270,34 +270,35 @@ enum Tok {
 }
 
 fn can_start_regex(prev: Option<&Tok>) -> bool {
+    let Some(tok) = prev else {
+        return true;
+    };
     matches!(
-        prev,
-        None | Some(
-            Tok::Eq
-                | Tok::LParen
-                | Tok::LBracket
-                | Tok::LBrace
-                | Tok::Comma
-                | Tok::Semi
-                | Tok::Colon
-                | Tok::Question
-                | Tok::KwReturn
-                | Tok::KwThrow
-                | Tok::KwCase
-                | Tok::Bang
-                | Tok::AndAnd
-                | Tok::OrOr
-                | Tok::NullishCoalesce
-                | Tok::Arrow
-                | Tok::Plus
-                | Tok::Minus
-                | Tok::Star
-                | Tok::Slash
-                | Tok::EqEq
-                | Tok::EqEqEq
-                | Tok::BangEq
-                | Tok::BangEqEq
-        )
+        tok,
+        Tok::Eq
+            | Tok::LParen
+            | Tok::LBracket
+            | Tok::LBrace
+            | Tok::Comma
+            | Tok::Semi
+            | Tok::Colon
+            | Tok::Question
+            | Tok::KwReturn
+            | Tok::KwThrow
+            | Tok::KwCase
+            | Tok::Bang
+            | Tok::AndAnd
+            | Tok::OrOr
+            | Tok::NullishCoalesce
+            | Tok::Arrow
+            | Tok::Plus
+            | Tok::Minus
+            | Tok::Star
+            | Tok::Slash
+            | Tok::EqEq
+            | Tok::EqEqEq
+            | Tok::BangEq
+            | Tok::BangEqEq
     )
 }
 
@@ -2535,10 +2536,9 @@ impl VmRuntime {
                         if matches!(op, BinOp::In) {
                             let key = lhs.to_string();
                             let found = match rhs {
-                                JsVal::Object(id) => self
-                                    .objects
-                                    .get(id)
-                                    .is_some_and(|m| m.contains_key(&key)),
+                                JsVal::Object(id) => {
+                                    self.objects.get(id).is_some_and(|m| m.contains_key(&key))
+                                }
                                 JsVal::Array(items) => {
                                     key.parse::<usize>().is_ok_and(|i| i < items.len())
                                 }
@@ -3518,13 +3518,11 @@ impl VmRuntime {
                                     }
                                     "exec" => {
                                         let found = regex_find_all(&text, &pat, ci, false);
-                                        return Ok(if found.is_empty() {
-                                            JsVal::Null
-                                        } else {
-                                            JsVal::Array(
-                                                found.into_iter().map(JsVal::Str).collect(),
-                                            )
-                                        });
+                                        if found.is_empty() {
+                                            return Ok(JsVal::Null);
+                                        }
+                                        let items = found.into_iter().map(JsVal::Str).collect();
+                                        return Ok(JsVal::Array(items));
                                     }
                                     _ => {}
                                 }
@@ -3588,11 +3586,9 @@ impl VmRuntime {
                                         .map(|e| {
                                             e.iter()
                                                 .map(|(k, v)| {
-                                                    format!(
-                                                        "{}={}",
-                                                        pct_encode(k),
-                                                        pct_encode(&v.to_string())
-                                                    )
+                                                    let ek = pct_encode(k);
+                                                    let ev = pct_encode(&v.to_string());
+                                                    format!("{ek}={ev}")
                                                 })
                                                 .collect::<Vec<_>>()
                                                 .join("&")
