@@ -1712,9 +1712,10 @@ impl HostBridge for NativeDomHost<'_> {
                     "isArray" => Ok(JsVal::Bool(matches!(args.first(), Some(JsVal::Array(_))))),
                     "from" => match args.first() {
                         Some(JsVal::Array(items)) => Ok(JsVal::Array(items.clone())),
-                        Some(JsVal::Str(s)) => Ok(JsVal::Array(
-                            s.chars().map(|c| JsVal::Str(c.to_string())).collect(),
-                        )),
+                        Some(JsVal::Str(s)) => {
+                            let items = s.chars().map(|c| JsVal::Str(c.to_string())).collect();
+                            Ok(JsVal::Array(items))
+                        }
                         Some(other) => {
                             if let Some(buf) = vm.read_uint8_array(other) {
                                 let items = buf.iter().map(|&b| JsVal::Number(b as f64)).collect();

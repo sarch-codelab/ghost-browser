@@ -2768,10 +2768,11 @@ impl VmRuntime {
                     }
                 }
                 self.maps.push(entries);
-                Some(Ok(self.alloc_object(HashMap::from([
+                let obj = self.alloc_object(HashMap::from([
                     ("__wispType".to_owned(), JsVal::Str("Map".to_owned())),
                     ("__wispIdx".to_owned(), JsVal::Number(idx as f64)),
-                ]))))
+                ]));
+                Some(Ok(obj))
             }
             "Set" => {
                 let idx = self.sets.len();
@@ -2784,10 +2785,11 @@ impl VmRuntime {
                     }
                 }
                 self.sets.push(items);
-                Some(Ok(self.alloc_object(HashMap::from([
+                let obj = self.alloc_object(HashMap::from([
                     ("__wispType".to_owned(), JsVal::Str("Set".to_owned())),
                     ("__wispIdx".to_owned(), JsVal::Number(idx as f64)),
-                ]))))
+                ]));
+                Some(Ok(obj))
             }
             "RegExp" => {
                 let pat = args.first().map(ToString::to_string).unwrap_or_default();
@@ -2804,10 +2806,11 @@ impl VmRuntime {
                 }
                 let idx = self.maps.len();
                 self.maps.push(pairs);
-                Some(Ok(self.alloc_object(HashMap::from([
+                let obj = self.alloc_object(HashMap::from([
                     ("__wispType".to_owned(), JsVal::Str("URLSearchParams".to_owned())),
                     ("__wispIdx".to_owned(), JsVal::Number(idx as f64)),
-                ]))))
+                ]));
+                Some(Ok(obj))
             }
             "Uint8Array" => {
                 let data = match args.first() {
@@ -2825,10 +2828,11 @@ impl VmRuntime {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as f64)
                     .unwrap_or(0.0);
-                Some(Ok(self.alloc_object(HashMap::from([
+                let obj = self.alloc_object(HashMap::from([
                     ("__wispType".to_owned(), JsVal::Str("Date".to_owned())),
                     ("__wispTime".to_owned(), JsVal::Number(ms)),
-                ]))))
+                ]));
+                Some(Ok(obj))
             }
             _ => None,
         }
@@ -3053,9 +3057,8 @@ impl VmRuntime {
                         let mut pairs: Vec<(&String, &JsVal)> =
                             m.iter().filter(|(k, _)| !k.starts_with("__wisp")).collect();
                         pairs.sort_by_key(|(k, _)| *k);
-                        return Ok(JsVal::Array(
-                            pairs.into_iter().map(|(_, v)| v.clone()).collect(),
-                        ));
+                        let vals = pairs.into_iter().map(|(_, v)| v.clone()).collect();
+                        return Ok(JsVal::Array(vals));
                     }
                     return Ok(JsVal::Array(Vec::new()));
                 }
@@ -3069,12 +3072,11 @@ impl VmRuntime {
                             .map(|(k, v)| (k.clone(), v.clone()))
                             .collect();
                         pairs.sort_by(|a, b| a.0.cmp(&b.0));
-                        return Ok(JsVal::Array(
-                            pairs
-                                .into_iter()
-                                .map(|(k, v)| JsVal::Array(vec![JsVal::Str(k), v]))
-                                .collect(),
-                        ));
+                        let vals = pairs
+                            .into_iter()
+                            .map(|(k, v)| JsVal::Array(vec![JsVal::Str(k), v]))
+                            .collect();
+                        return Ok(JsVal::Array(vals));
                     }
                     return Ok(JsVal::Array(Vec::new()));
                 }
@@ -3130,14 +3132,10 @@ impl VmRuntime {
                 }
                 "slice" => {
                     let len = items.len() as isize;
-                    let start = norm_slice_idx(
-                        args.first().map_or(0, |v| v.to_number() as isize),
-                        len,
-                    );
-                    let end = norm_slice_idx(
-                        args.get(1).map_or(len, |v| v.to_number() as isize),
-                        len,
-                    );
+                    let s_idx = args.first().map_or(0, |v| v.to_number() as isize);
+                    let e_idx = args.get(1).map_or(len, |v| v.to_number() as isize);
+                    let start = norm_slice_idx(s_idx, len);
+                    let end = norm_slice_idx(e_idx, len);
                     let sliced = if start < end {
                         items[start..end].to_vec()
                     } else {
@@ -3322,14 +3320,10 @@ impl VmRuntime {
                 "slice" | "substring" => {
                     let chars: Vec<char> = s.chars().collect();
                     let len = chars.len() as isize;
-                    let start = norm_slice_idx(
-                        args.first().map_or(0, |v| v.to_number() as isize),
-                        len,
-                    );
-                    let end = norm_slice_idx(
-                        args.get(1).map_or(len, |v| v.to_number() as isize),
-                        len,
-                    );
+                    let s_idx = args.first().map_or(0, |v| v.to_number() as isize);
+                    let e_idx = args.get(1).map_or(len, |v| v.to_number() as isize);
+                    let start = norm_slice_idx(s_idx, len);
+                    let end = norm_slice_idx(e_idx, len);
                     let out: String = if start < end {
                         chars[start..end].iter().collect()
                     } else {
@@ -3339,9 +3333,8 @@ impl VmRuntime {
                 }
                 "charAt" => {
                     let idx = args.first().map_or(0, |v| v.to_number().max(0.0) as usize);
-                    return Ok(JsVal::Str(
-                        s.chars().nth(idx).map(|c| c.to_string()).unwrap_or_default(),
-                    ));
+                    let ch = s.chars().nth(idx).map(|c| c.to_string());
+                    return Ok(JsVal::Str(ch.unwrap_or_default()));
                 }
                 "split" => {
                     let sep = args.first().map(ToString::to_string).unwrap_or_default();
@@ -3380,19 +3373,19 @@ impl VmRuntime {
                         let ci = rmap.get("ignoreCase") == Some(&JsVal::Bool(true));
                         let global = rmap.get("global") == Some(&JsVal::Bool(true));
                         let matches = regex_find_all(s, &pat, ci, global);
-                        return Ok(if matches.is_empty() {
-                            JsVal::Null
-                        } else {
-                            JsVal::Array(matches.into_iter().map(JsVal::Str).collect())
-                        });
+                        if matches.is_empty() {
+                            return Ok(JsVal::Null);
+                        }
+                        let vals = matches.into_iter().map(JsVal::Str).collect();
+                        return Ok(JsVal::Array(vals));
                     }
                     let pat = args.first().map(ToString::to_string).unwrap_or_default();
                     let matches = regex_find_all(s, &pat, false, false);
-                    return Ok(if matches.is_empty() {
-                        JsVal::Null
-                    } else {
-                        JsVal::Array(matches.into_iter().map(JsVal::Str).collect())
-                    });
+                    if matches.is_empty() {
+                        return Ok(JsVal::Null);
+                    }
+                    let vals = matches.into_iter().map(JsVal::Str).collect();
+                    return Ok(JsVal::Array(vals));
                 }
                 _ => {}
             },
