@@ -3505,9 +3505,8 @@ impl VmRuntime {
                                     args.first().map(ToString::to_string).unwrap_or_default();
                                 match method {
                                     "test" => {
-                                        return Ok(JsVal::Bool(
-                                            !regex_find_all(&text, &pat, ci, false).is_empty(),
-                                        ));
+                                        let hit = !regex_find_all(&text, &pat, ci, false).is_empty();
+                                        return Ok(JsVal::Bool(hit));
                                     }
                                     "exec" => {
                                         let found = regex_find_all(&text, &pat, ci, false);
@@ -3544,9 +3543,9 @@ impl VmRuntime {
                                 "set" => {
                                     let k =
                                         args.first().map(ToString::to_string).unwrap_or_default();
-                                    let v = JsVal::Str(
-                                        args.get(1).map(ToString::to_string).unwrap_or_default(),
-                                    );
+                                    let raw =
+                                        args.get(1).map(ToString::to_string).unwrap_or_default();
+                                    let v = JsVal::Str(raw);
                                     if let Some(entries) = self.maps.get_mut(idx) {
                                         entries.retain(|(ek, _)| ek != &k);
                                         entries.push((k, v));
@@ -3556,9 +3555,9 @@ impl VmRuntime {
                                 "append" => {
                                     let k =
                                         args.first().map(ToString::to_string).unwrap_or_default();
-                                    let v = JsVal::Str(
-                                        args.get(1).map(ToString::to_string).unwrap_or_default(),
-                                    );
+                                    let raw =
+                                        args.get(1).map(ToString::to_string).unwrap_or_default();
+                                    let v = JsVal::Str(raw);
                                     if let Some(entries) = self.maps.get_mut(idx) {
                                         entries.push((k, v));
                                     }
@@ -3795,17 +3794,18 @@ fn parse_re_branch(pat: &str) -> Vec<RePiece> {
     out
 }
 
+fn eq_char(a: char, b: char, ci: bool) -> bool {
+    if ci {
+        a.eq_ignore_ascii_case(&b)
+    } else {
+        a == b
+    }
+}
+
 fn atom_matches(atom: &ReAtom, ch: char, ci: bool) -> bool {
-    let eq = |a: char, b: char| {
-        if ci {
-            a.eq_ignore_ascii_case(&b)
-        } else {
-            a == b
-        }
-    };
     match atom {
         ReAtom::Any => ch != '\n',
-        ReAtom::Lit(c) => eq(*c, ch),
+        ReAtom::Lit(c) => eq_char(*c, ch, ci),
         ReAtom::Digit => ch.is_ascii_digit(),
         ReAtom::Word => ch.is_ascii_alphanumeric() || ch == '_',
         ReAtom::Space => ch.is_whitespace(),

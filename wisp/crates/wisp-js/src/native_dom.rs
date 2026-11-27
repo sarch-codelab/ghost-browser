@@ -1062,11 +1062,11 @@ impl HostBridge for NativeDomHost<'_> {
                             ),
                             None => ("localhost".to_owned(), "/".to_owned(), false),
                         };
-                        Ok(JsVal::Str(
-                            self.cookie_jar
-                                .cookie_header_for(&host, &path, is_https, true)
-                                .unwrap_or_default(),
-                        ))
+                        let cookie = self
+                            .cookie_jar
+                            .cookie_header_for(&host, &path, is_https, true)
+                            .unwrap_or_default();
+                        Ok(JsVal::Str(cookie))
                     }
                     "images" => Ok(JsVal::Array(
                         self.get_elements_by_tag_name("img")
@@ -1114,28 +1114,24 @@ impl HostBridge for NativeDomHost<'_> {
                 },
                 "navigator" => {
                     let profile = wisp_net::StealthProfile::for_policy(&self.policy);
-                    Ok(match prop {
+                    let langs = vec![JsVal::Str("en-US".to_owned()), JsVal::Str("en".to_owned())];
+                    let (platform, plugins) = if self.policy.stealth {
+                        ("Win32", vec![JsVal::Str("PDF Viewer".to_owned())])
+                    } else {
+                        ("Wisp", Vec::new())
+                    };
+                    let val = match prop {
                         "userAgent" => JsVal::Str(profile.user_agent.to_owned()),
                         "language" => JsVal::Str("en-US".to_owned()),
-                        "languages" => JsVal::Array(vec![
-                            JsVal::Str("en-US".to_owned()),
-                            JsVal::Str("en".to_owned()),
-                        ]),
+                        "languages" => JsVal::Array(langs),
                         "webdriver" => JsVal::Bool(false),
                         "cookieEnabled" => JsVal::Bool(true),
-                        "platform" => JsVal::Str(if self.policy.stealth {
-                            "Win32".to_owned()
-                        } else {
-                            "Wisp".to_owned()
-                        }),
+                        "platform" => JsVal::Str(platform.to_owned()),
                         "hardwareConcurrency" => JsVal::Number(8.0),
-                        "plugins" => JsVal::Array(if self.policy.stealth {
-                            vec![JsVal::Str("PDF Viewer".to_owned())]
-                        } else {
-                            Vec::new()
-                        }),
+                        "plugins" => JsVal::Array(plugins),
                         _ => JsVal::Undefined,
-                    })
+                    };
+                    Ok(val)
                 }
                 "location" => Ok(JsVal::Str(location_part(self.page_url.as_deref(), prop))),
                 _ if handle.starts_with("url:") => {
@@ -1617,7 +1613,10 @@ impl HostBridge for NativeDomHost<'_> {
                     _ => Ok(JsVal::Undefined),
                 },
                 "performance" => match method {
-                    "now" => Ok(JsVal::Number(self.started_at.elapsed().as_secs_f64() * 1000.0)),
+                    "now" => {
+                        let ms = self.started_at.elapsed().as_secs_f64() * 1000.0;
+                        Ok(JsVal::Number(ms))
+                    }
                     _ => Ok(JsVal::Undefined),
                 },
                 "crypto" => match method {
@@ -3224,47 +3223,41 @@ mod tests {
     #[test]
     fn geometry_computed_style_and_element_from_point() {
         let html = r#"<html><body><div id="box" style="width: 240px; height: 80px; color: red;">Hola</div></body></html>"#;
-        let res = crate::evaluate_expression(
-            html,
-            Some("https://example.com/"),
-            1280.0,
-            r#"(() => {
-                const el = document.getElementById("box");
-                const r = el.getBoundingClientRect();
-                const cs = window.getComputedStyle(el);
-                const hit = document.elementFromPoint(10, 10);
-                return [r.width, r.height, el.offsetWidth, cs.color, hit && hit.id];
-            })()"#,
-        )
-        .expect("eval ok");
-        assert_eq!(res.value, Some(serde_json::json!([240.0, 80.0, 240.0, "red", "box"])));
+        let url = Some("https://example.com/");
+        let js = r#"(() => {
+            const el = document.getElementById("box");
+            const r = el.getBoundingClientRect();
+            const cs = window.getComputedStyle(el);
+            const hit = document.elementFromPoint(10, 10);
+            return [r.width, r.height, el.offsetWidth, cs.color, hit && hit.id];
+        })()"#;
+        let res = crate::evaluate_expression(html, url, 1280.0, js).expect("eval ok");
+        let expected = serde_json::json!([240.0, 80.0, 240.0, "red", "box"]);
+        assert_eq!(res.value, Some(expected));
     }
 
     #[test]
     fn mutation_observer_custom_event_performance_and_crypto() {
         let html = r#"<html><body><div id="root"></div></body></html>"#;
-        let res = crate::evaluate_expression(
-            html,
-            Some("https://example.com/"),
-            1280.0,
-            r#"(() => {
-                const root = document.getElementById("root");
-                let observed = 0;
-                const obs = new MutationObserver((recs) => { observed += recs.length; });
-                obs.observe(root, { childList: true, attributes: true });
-                root.setAttribute("data-ok", "1");
-                const recs = obs.takeRecords();
-                let gotDetail = null;
-                root.addEventListener("ping", (e) => { gotDetail = e.detail.n; });
-                root.dispatchEvent(new CustomEvent("ping", { detail: { n: 42 }, bubbles: true }));
-                const uuid = crypto.randomUUID();
-                const arr = crypto.getRandomValues(new Uint8Array(4));
-                const t = performance.now();
-                return [recs.length, gotDetail, uuid.length, arr.length, t >= 0];
-            })()"#,
-        )
-        .expect("eval ok");
-        assert_eq!(res.value, Some(serde_json::json!([1, 42, 36, 4, true])));
+        let url = Some("https://example.com/");
+        let js = r#"(() => {
+            const root = document.getElementById("root");
+            let observed = 0;
+            const obs = new MutationObserver((recs) => { observed += recs.length; });
+            obs.observe(root, { childList: true, attributes: true });
+            root.setAttribute("data-ok", "1");
+            const recs = obs.takeRecords();
+            let gotDetail = null;
+            root.addEventListener("ping", (e) => { gotDetail = e.detail.n; });
+            root.dispatchEvent(new CustomEvent("ping", { detail: { n: 42 }, bubbles: true }));
+            const uuid = crypto.randomUUID();
+            const arr = crypto.getRandomValues(new Uint8Array(4));
+            const t = performance.now();
+            return [recs.length, gotDetail, uuid.length, arr.length, t >= 0];
+        })()"#;
+        let res = crate::evaluate_expression(html, url, 1280.0, js).expect("eval ok");
+        let expected = serde_json::json!([1, 42, 36, 4, true]);
+        assert_eq!(res.value, Some(expected));
     }
 
     #[test]
@@ -3273,17 +3266,15 @@ mod tests {
             stealth: true,
             ..Default::default()
         };
-        let res = crate::evaluate_expression_with_policy(
-            "<html><body></body></html>",
-            Some("https://example.com/"),
-            1280.0,
-            r#"(() => {
-                document.cookie = "sid=abc123; Path=/";
-                return [navigator.webdriver, navigator.userAgent.includes("Chrome/"), !!window.chrome, document.cookie];
-            })()"#,
-            &policy,
-        )
-        .expect("eval ok");
-        assert_eq!(res.value, Some(serde_json::json!([false, true, true, "sid=abc123"])));
+        let html = "<html><body></body></html>";
+        let url = Some("https://example.com/");
+        let js = r#"(() => {
+            document.cookie = "sid=abc123; Path=/";
+            return [navigator.webdriver, navigator.userAgent.includes("Chrome/"), !!window.chrome, document.cookie];
+        })()"#;
+        let res = crate::evaluate_expression_with_policy(html, url, 1280.0, js, &policy);
+        let res = res.expect("eval ok");
+        let expected = serde_json::json!([false, true, true, "sid=abc123"]);
+        assert_eq!(res.value, Some(expected));
     }
 }

@@ -4699,6 +4699,11 @@ fn layout_block(
         && let Some(preorder_idx) = node.preorder_index
         && let Some(out) = ctx.geometry_out.as_deref_mut()
     {
+        let (r, g, b) = (style.color.r, style.color.g, style.color.b);
+        let background_color = match style.background {
+            Some(bg) => format!("rgba({}, {}, {}, {})", bg.r, bg.g, bg.b, bg.a),
+            None => "rgba(0, 0, 0, 0)".to_owned(),
+        };
         out.insert(
             preorder_idx,
             wisp_js::ElementGeometry {
@@ -4725,11 +4730,8 @@ fn layout_block(
                     PositionKind::Absolute => "absolute",
                 }
                 .to_owned(),
-                color: format!("rgb({}, {}, {})", style.color.r, style.color.g, style.color.b),
-                background_color: match style.background {
-                    Some(bg) => format!("rgba({}, {}, {}, {})", bg.r, bg.g, bg.b, bg.a),
-                    None => "rgba(0, 0, 0, 0)".to_owned(),
-                },
+                color: format!("rgb({r}, {g}, {b})"),
+                background_color,
                 font_size: format!("{}px", style.font_size),
             },
         );
@@ -9299,6 +9301,7 @@ fetch("http://{data_address}/data.json").then(function () {{
             return [a.x, a.width, b.x, b.width];
         })()"#;
         let res = page.eval_js(js).expect("eval ok");
-        assert_eq!(res.value, Some(serde_json::json!([0.0, 100.0, 100.0, 120.0])));
+        let expected = serde_json::json!([0.0, 100.0, 100.0, 120.0]);
+        assert_eq!(res.value, Some(expected));
     }
 }

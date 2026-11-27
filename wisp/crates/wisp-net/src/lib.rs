@@ -400,9 +400,10 @@ const TRACKER_HOSTS: &[&str] = &[
 
 pub fn is_tracker_host(host: &str) -> bool {
     let clean = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    TRACKER_HOSTS
-        .iter()
-        .any(|tracker| clean == *tracker || clean.ends_with(&format!(".{tracker}")))
+    TRACKER_HOSTS.iter().any(|tracker| {
+        let suffix = format!(".{tracker}");
+        clean == *tracker || clean.ends_with(&suffix)
+    })
 }
 
 pub fn is_tracker_url(url: &str) -> bool {
@@ -704,8 +705,10 @@ mod tests {
         assert!(ok);
         let hdr = jar.cookie_header_for("sub.example.com", "/v1/page", true, true);
         assert_eq!(hdr.as_deref(), Some("sid=ok123"));
-        assert_eq!(jar.cookie_header_for("sub.example.com", "/v1/page", false, true), None);
-        assert_eq!(jar.cookie_header_for("sub.example.com", "/v1/page", true, false), None);
+        let missing_http = jar.cookie_header_for("sub.example.com", "/v1/page", false, true);
+        assert_eq!(missing_http, None);
+        let missing_script = jar.cookie_header_for("sub.example.com", "/v1/page", true, false);
+        assert_eq!(missing_script, None);
     }
 
     #[test]
