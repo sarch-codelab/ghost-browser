@@ -464,6 +464,15 @@ pub fn create_webview<W: HasWindowHandle>(
     tx: Sender<TabEvent>,
     download_dir: Arc<RwLock<PathBuf>>,
 ) -> Result<WebView> {
+    // wry crea el webview con WebKitGTK en Linux y `build_as_child` sólo admite
+    // X11: sin DISPLAY el handle no sirve. Devolver error deja que la pestaña
+    // caiga al motor propio en vez de quedarse en blanco.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("DISPLAY").is_none() {
+        anyhow::bail!(
+            "el webview del sistema necesita X11 (Wayland no está soportado por build_as_child)"
+        );
+    }
     let dark = settings.dark_mode;
     let script = if std::env::var_os("GHOST_NO_INIT_SCRIPT").is_some() {
         String::new()

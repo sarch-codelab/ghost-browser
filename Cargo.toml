@@ -32,6 +32,10 @@ wisp-cdp = { path = "wisp/crates/wisp-cdp" }
 wisp-engine = { path = "wisp" }
 wisp-mcp = { path = "wisp/crates/wisp-mcp" }
 
+# WebKitGTK (wry) necesita GTK inicializado y su bucle avanzado junto a winit.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
 windows = { version = "0.62", features = [

@@ -368,6 +368,33 @@ impl App {
     }
 
     /// Crea los webviews pendientes (pestañas nuevas y pestañas suspendidas).
+    /// Añade una pestaña servida por el motor propio y empieza a cargarla.
+    /// Se usa también cuando el webview del sistema no se puede crear.
+    fn add_wisp_tab(&mut self, id: u64, url: String) {
+        let zoom = self.browser.store.settings.default_zoom.clamp(0.25, 5.0);
+        self.browser.add_tab(browser::Tab {
+            id,
+            engine: BrowserEngine::Wisp,
+            webview: None,
+            wisp_html: None,
+            wisp_layout: None,
+            wisp_layout_width: None,
+            wisp_error: None,
+            wisp_reader: None,
+            engine_manual: false,
+            title: String::new(),
+            url: url.clone(),
+            loading: true,
+            zoom,
+            navigation_history: vec![url.clone()],
+            history_index: 0,
+            last_active: Instant::now(),
+            pending_url: None,
+            ephemeral: false,
+        });
+        self.browser.start_wisp_load(id, url);
+    }
+
     fn materialize_webviews(&mut self) {
         let Some(window) = self.window.clone() else {
             return;
@@ -417,27 +444,7 @@ impl App {
                 continue;
             }
             if engine == BrowserEngine::Wisp {
-                self.browser.add_tab(browser::Tab {
-                    id,
-                    engine,
-                    webview: None,
-                    wisp_html: None,
-                    wisp_layout: None,
-                    wisp_layout_width: None,
-                    wisp_error: None,
-                    wisp_reader: None,
-                    engine_manual: false,
-                    title: String::new(),
-                    url: url.clone(),
-                    loading: true,
-                    zoom: self.browser.store.settings.default_zoom.clamp(0.25, 5.0),
-                    navigation_history: vec![url.clone()],
-                    history_index: 0,
-                    last_active: Instant::now(),
-                    pending_url: None,
-                    ephemeral: false,
-                });
-                self.browser.start_wisp_load(id, url);
+                self.add_wisp_tab(id, url);
                 continue;
             }
             match create_webview(
@@ -471,7 +478,10 @@ impl App {
                     pending_url: None,
                     ephemeral: false,
                 }),
-                Err(e) => log::error!("No se pudo crear el webview: {e}"),
+                Err(e) => {
+                    log::error!("No se pudo crear el webview: {e}; la pestaña usa el motor Wisp");
+                    self.add_wisp_tab(id, url);
+                }
             }
         }
 
@@ -536,8 +546,9 @@ impl App {
                     self.browser.needs_bounds_sync = true;
                 }
                 Err(e) => {
-                    log::error!("No se pudo restaurar la pestaña {id}: {e}");
+                    log::error!("No se pudo restaurar la pestaña {id}: {e}; usa el motor Wisp");
                     self.browser.fail_restore(id);
+                    self.add_wisp_tab(id, target);
                 }
             }
         }
@@ -1184,6 +1195,11 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // WebKitGTK corre su propio bucle: hay que avanzarlo junto al de winit.
+        #[cfg(target_os = "linux")]
+        while gtk::events_pending() {
+            gtk::main_iteration_do(false);
+        }
         // Comandos de la API remota (localhost): navegación, eval, etc.
         if let Some(rx) = &self.remote_rx {
             while let Ok(command) = rx.try_recv() {
@@ -1457,8 +1473,21 @@ fn register_wisp_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// En Linux el webview de wry usa WebKitGTK, que necesita `gtk::init()` antes de
+/// crear la primera vista. Si falla, las pestañas caen al motor propio.
+#[cfg(target_os = "linux")]
+fn init_platform_webview() {
+    if let Err(err) = gtk::init() {
+        log::error!("GTK no se pudo inicializar: {err}");
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn init_platform_webview() {}
+
 fn main() -> Result<()> {
     env_logger::init();
+    init_platform_webview();
     perf::start();
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
