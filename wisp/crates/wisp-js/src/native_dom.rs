@@ -3298,4 +3298,3 @@ mod tests {
         assert_eq!(res.value, Some(serde_json::json!([false, true, true, "sid=abc123"])));
     }
 }
-
