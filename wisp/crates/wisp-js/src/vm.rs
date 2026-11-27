@@ -2671,12 +2671,7 @@ impl VmRuntime {
                         };
                         stack.push(obj);
                     }
-                    Op::RegisterClass {
-                        name,
-                        parent,
-                        ctor,
-                        methods,
-                    } => {
+                    Op::RegisterClass { name, parent, ctor, methods } => {
                         let mut mmap = HashMap::new();
                         if let Some(p) = parent
                             && let Some(pdef) = self.classes.get(p)
