@@ -666,41 +666,36 @@ fn render_victory_table(report: &Value) -> String {
         _ => " RSS: no medido.".to_owned(),
     };
 
+    // Solo cifras propias: mezclar estos tracks con los informes de otros motores
+    // (que miden WPT y corpus reales) haría parecer una victoria lo que no lo es.
     let table = format!(
-        "# WISP_RESULTS.md — Tabla de victoria diaria
-
-         Comparativa continua de Wisp frente a Ladybird y Obscura.
-         Generada por `wisp-benchmark --track all --victory-table WISP_RESULTS.md`.
-         Las cifras de la columna «Wisp (medido)» son de esta máquina; las de Ladybird y
-         Obscura provienen de sus informes públicos y miden otras suites (ver nota).
-
-         | Métrica | Ladybird | Obscura | Objetivo Wisp | Wisp (medido) |
-         |---|---|---|---|---|
-         | WPT Core (muestra embebida propia) | wpt.fyi | **83,3 %** | **> 83,3 %** | {wpt_core} |
-         | WPT Full (muestra embebida propia) | motor completo | 67,6 % | **> 67,6 %** | {wpt_full} |
-         | React — script propio, frío | — | 81 ms / 30 MB | **< 81 ms / < 30 MB** | {} |
-         | Preact — script propio | — | 45 ms / 30 MB | **< 45 ms / < 30 MB** | {} |
-         | Vue — script propio | — | 86 ms / 31 MB | **< 86 ms / < 31 MB** | {} |
-         | 33 fixtures modern-web | — | 33/33, mediana 44 ms | **33/33, mediana < 44 ms** | {obstacle} |
-         | 4 workers (layout) | — | 40 pg/s, 112 MB | **> 40 pg/s, < 112 MB** | {workers} |
-         | Corpus real (98 páginas embebidas) | — | 94/98, 5,2 s | **> 94/98, < 5,2 s** | {corpus} |
-         | 1.500 URLs (corpus repetido) | — | 0 crashes, 0 panics | **0 crashes, 0 panics** | {rel} |
-         | Motor propio | Sí | No (usa V8) | **Sí (sin V8 ni Boa)** | Sí (`wisp-js::vm` nativo en Rust puro) |
-
-         > Nota metodológica: estos tracks son suites y fixtures sintéticos embebidos en
-         > `wisp-benchmark`; no ejecutan el repositorio completo de WPT ni el corpus vivo de
-         > red de Obscura. Las filas «WPT» cuentan casos escritos a mano (301 y 1001), no
-         > subtests de WPT, y las de React/Preact/Vue miden un script propio que crea unos
-         > pocos nodos, no los frameworks. Por eso las cifras de Wisp y las de los rivales
-         > no son la misma medición: sirven para seguir la evolución de Wisp, no para
-         > declarar victoria.{rss}
-",
+        "# WISP_RESULTS.md — Resultados medidos de Wisp\n\n\
+         Mediciones de `wisp-benchmark --track all` en {}. El motor es propio (`wisp-js::vm`\n\
+         en Rust puro, sin V8 ni Boa).\n\n\
+         | Métrica | Wisp (medido) |\n\
+         |---|---|\n\
+         | WPT Core — muestra embebida propia (301 casos escritos a mano) | {wpt_core} |\n\
+         | WPT Full — muestra embebida propia (1.001 casos escritos a mano) | {wpt_full} |\n\
+         | React — script propio, en frío | {} |\n\
+         | Preact — script propio | {} |\n\
+         | Vue — script propio | {} |\n\
+         | 33 fixtures modern-web | {obstacle} |\n\
+         | 4 workers (layout) | {workers} |\n\
+         | Corpus sintético (98 páginas embebidas) | {corpus} |\n\
+         | 1.500 URLs (corpus repetido) | {rel} |\n\n\
+         > Nota metodológica: estos tracks son suites y fixtures sintéticos embebidos en\n\
+         > `wisp-benchmark`; no ejecutan el repositorio completo de WPT ni el corpus vivo de\n\
+         > ningún otro motor. Las filas «WPT» cuentan casos escritos a mano, no subtests de\n\
+         > WPT, y las de React/Preact/Vue miden un script propio que crea unos pocos nodos,\n\
+         > no los frameworks. Estas cifras sirven para seguir la evolución de Wisp.{rss}\n",
+        format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
         sample_str("react"),
         sample_str("preact"),
         sample_str("vue"),
     );
-    // Las líneas del `format!` heredan la indentación del código: se
-    // quitan para que el Markdown no salga sangrado.
+
+    // Las líneas del `format!` heredan la indentación del código: se quitan para
+    // que el Markdown no salga sangrado.
     let mut text = String::with_capacity(table.len());
     for line in table.lines() {
         text.push_str(line.trim_start());
@@ -790,6 +785,23 @@ mod tests {
             let sample = sample_memory_mb().expect("memory measurement should succeed");
             assert!(sample.working_set_mb > 0.0);
         }
+    }
+
+    #[test]
+    fn victory_table_only_reports_measured_wisp_figures() {
+        let md = render_victory_table(&json!({
+            "memory_measured": true,
+            "rss_mb": 10.5,
+            "tracks": []
+        }));
+        assert!(md.contains("| Métrica | Wisp (medido) |"), "{md}");
+        // Sin columnas de rivales: mezclar sus cifras con estos tracks haría
+        // parecer una victoria lo que no es.
+        for rival in ["Ladybird", "Obscura", "Objetivo"] {
+            assert!(!md.contains(rival), "{rival} no debería aparecer: {md}");
+        }
+        assert!(md.contains("no medido"), "{md}");
+        assert!(md.contains("RSS del proceso: 10.5 MB"), "{md}");
     }
 
     #[test]

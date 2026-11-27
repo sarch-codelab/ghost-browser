@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# El job de Linux commitea la tabla generada; el token necesita escritura.
+permissions:
+  contents: write
+
 env:
   RUSTFLAGS: "-D warnings"
   CARGO_INCREMENTAL: 0
@@ -313,6 +317,20 @@ jobs:
           assert data["memory_measured"] is True, data
           assert data["rss_mb"] is not None and data["rss_mb"] > 0, data
           PY
+
+      - name: Publish WISP_RESULTS.md
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip ci]')
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add WISP_RESULTS.md
+          if git diff --cached --quiet; then
+            echo "WISP_RESULTS.md sin cambios"
+            exit 0
+          fi
+          git commit -m "chore: publica la medición de CI en WISP_RESULTS.md [skip ci]"
+          # `HEAD:main` funciona aunque el checkout quede en HEAD separado.
+          git push origin HEAD:main
 
       - name: Upload Wisp benchmark & wisp-agent artifacts
         uses: actions/upload-artifact@v4
