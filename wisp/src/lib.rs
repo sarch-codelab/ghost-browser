@@ -1969,10 +1969,10 @@ pub fn compute_dom_geometry(
     collect_preorder_node_ids(document.tree.root(), &mut next_idx, &mut preorder_map);
     let node_styles = collect_node_styles(&document, stylesheets, viewport_width);
     let mut roots = Vec::new();
+    let map = Some(&preorder_map);
     for child in document.tree.root().children() {
-        if let Ok(Some(node)) =
-            convert_node_with_preorder(child, 0, &node_styles, page_url, Some(&preorder_map))
-        {
+        let res = convert_node_with_preorder(child, 0, &node_styles, page_url, map);
+        if let Ok(Some(node)) = res {
             roots.push(node);
         }
     }
@@ -4211,14 +4211,12 @@ fn convert_node_with_preorder(
             };
             let background_image = node_background_image(&inline_style, page_url);
             let mut children = Vec::new();
+            let d = depth + 1;
+            let s = node_styles;
+            let u = page_url;
+            let m = preorder_map;
             for child in element.children() {
-                if let Some(child) = convert_node_with_preorder(
-                    child,
-                    depth + 1,
-                    node_styles,
-                    page_url,
-                    preorder_map,
-                )? {
+                if let Some(child) = convert_node_with_preorder(child, d, s, u, m)? {
                     children.push(child);
                 }
             }
@@ -4236,14 +4234,12 @@ fn convert_node_with_preorder(
         }
         Node::Document | Node::Fragment => {
             let mut children = Vec::new();
+            let d = depth + 1;
+            let s = node_styles;
+            let u = page_url;
+            let m = preorder_map;
             for child in node.children() {
-                if let Some(child) = convert_node_with_preorder(
-                    child,
-                    depth + 1,
-                    node_styles,
-                    page_url,
-                    preorder_map,
-                )? {
+                if let Some(child) = convert_node_with_preorder(child, d, s, u, m)? {
                     children.push(child);
                 }
             }

@@ -3505,8 +3505,8 @@ impl VmRuntime {
                                     args.first().map(ToString::to_string).unwrap_or_default();
                                 match method {
                                     "test" => {
-                                        let hit = !regex_find_all(&text, &pat, ci, false).is_empty();
-                                        return Ok(JsVal::Bool(hit));
+                                        let found = regex_find_all(&text, &pat, ci, false);
+                                        return Ok(JsVal::Bool(!found.is_empty()));
                                     }
                                     "exec" => {
                                         let found = regex_find_all(&text, &pat, ci, false);
