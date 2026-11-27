@@ -2287,9 +2287,12 @@ impl HostBridge for NativeDomHost<'_> {
                         }
                         cur = self.nodes.get(c).and_then(|n| n.parent);
                     }
-                    if bubbles && let Some(fns) = self.doc_listeners.get(&ev_type).cloned() {
-                        for fn_id in fns {
-                            let _ = vm.invoke_fn(fn_id, vec![ev.clone()], self);
+                    if bubbles {
+                        let listeners = self.doc_listeners.get(&ev_type).cloned();
+                        if let Some(fns) = listeners {
+                            for fn_id in fns {
+                                let _ = vm.invoke_fn(fn_id, vec![ev.clone()], self);
+                            }
                         }
                     }
                     Ok(JsVal::Bool(true))
