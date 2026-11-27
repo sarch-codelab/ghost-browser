@@ -411,14 +411,7 @@ pub fn evaluate_expression_with_policy(
     source: &str,
     policy: &wisp_net::NetworkPolicy,
 ) -> Result<EvalResult> {
-    evaluate_expression_with_geometry(
-        html,
-        page_url,
-        viewport_width,
-        source,
-        policy,
-        None,
-    )
+    evaluate_expression_with_geometry(html, page_url, viewport_width, source, policy, None)
 }
 
 pub fn evaluate_expression_with_geometry(
