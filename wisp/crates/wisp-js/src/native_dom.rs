@@ -1631,7 +1631,7 @@ impl HostBridge for NativeDomHost<'_> {
                             if let JsVal::Array(items) = arg {
                                 let mut buf = vec![0u8; items.len()];
                                 fill_random_bytes(&mut buf);
-                                let nums = buf.into_iter().map(|b| JsVal::Number(b as f64)).collect();
+                                let nums = buf.iter().map(|&b| JsVal::Number(b as f64)).collect();
                                 return Ok(JsVal::Array(nums));
                             }
                         }
@@ -1646,7 +1646,8 @@ impl HostBridge for NativeDomHost<'_> {
                         let p2 = u16::from_be_bytes([b[4], b[5]]);
                         let p3 = u16::from_be_bytes([b[6], b[7]]);
                         let p4 = u16::from_be_bytes([b[8], b[9]]);
-                        let p5 = u64::from_be_bytes([0, 0, b[10], b[11], b[12], b[13], b[14], b[15]]);
+                        let tail = [0, 0, b[10], b[11], b[12], b[13], b[14], b[15]];
+                        let p5 = u64::from_be_bytes(tail);
                         let uuid = format!("{p1:08x}-{p2:04x}-{p3:04x}-{p4:04x}-{p5:012x}");
                         Ok(JsVal::Str(uuid))
                     }

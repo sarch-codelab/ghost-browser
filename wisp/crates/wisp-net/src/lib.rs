@@ -494,7 +494,8 @@ impl CookieJar {
             return false;
         }
 
-        self.entries.retain(|c| c.name != name || c.domain != domain || c.path != path);
+        let same_key = |c: &CookieEntry| c.name == name && c.domain == domain && c.path == path;
+        self.entries.retain(|c| !same_key(c));
         if max_age_zero {
             return true;
         }
