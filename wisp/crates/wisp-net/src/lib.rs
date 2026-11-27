@@ -661,23 +661,17 @@ mod tests {
         let mut jar = CookieJar::new();
         assert!(!jar.set_from_header("a.co.uk", "/", true, "sid=bad; Domain=co.uk"));
         assert!(!jar.set_from_header("a.example.com", "/", true, "sid=bad; Domain=com"));
-        assert!(!jar.set_from_header(
-            "a.example.com",
-            "/",
-            true,
-            "sid=bad; Domain=other.com"
-        ));
-        assert!(jar.set_from_header(
+        let other = jar.set_from_header("a.example.com", "/", true, "sid=bad; Domain=other.com");
+        assert!(!other);
+        let ok = jar.set_from_header(
             "app.example.com",
             "/v1/home",
             true,
-            "sid=ok123; Domain=example.com; Path=/; Secure; HttpOnly; SameSite=Lax"
-        ));
-        assert_eq!(
-            jar.cookie_header_for("sub.example.com", "/v1/page", true, true)
-                .as_deref(),
-            Some("sid=ok123")
+            "sid=ok123; Domain=example.com; Path=/; Secure; HttpOnly; SameSite=Lax",
         );
+        assert!(ok);
+        let hdr = jar.cookie_header_for("sub.example.com", "/v1/page", true, true);
+        assert_eq!(hdr.as_deref(), Some("sid=ok123"));
         assert_eq!(jar.cookie_header_for("sub.example.com", "/v1/page", false, true), None);
         assert_eq!(jar.cookie_header_for("sub.example.com", "/v1/page", true, false), None);
     }

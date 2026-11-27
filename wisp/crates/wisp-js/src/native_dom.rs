@@ -1731,9 +1731,8 @@ impl HostBridge for NativeDomHost<'_> {
                         )),
                         Some(other) => {
                             if let Some(buf) = vm.read_uint8_array(other) {
-                                Ok(JsVal::Array(
-                                    buf.into_iter().map(|b| JsVal::Number(b as f64)).collect(),
-                                ))
+                                let items = buf.iter().map(|&b| JsVal::Number(b as f64)).collect();
+                                Ok(JsVal::Array(items))
                             } else {
                                 Ok(JsVal::Array(Vec::new()))
                             }

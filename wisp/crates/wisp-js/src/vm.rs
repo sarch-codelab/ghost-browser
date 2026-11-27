@@ -2840,9 +2840,10 @@ impl VmRuntime {
 
     fn call_builtin_global(&self, name: &str, args: &[JsVal]) -> Option<JsVal> {
         match name {
-            "String" => Some(JsVal::Str(
-                args.first().map(ToString::to_string).unwrap_or_default(),
-            )),
+            "String" => {
+                let s = args.first().map(ToString::to_string).unwrap_or_default();
+                Some(JsVal::Str(s))
+            }
             "Number" => Some(JsVal::Number(args.first().map_or(0.0, JsVal::to_number))),
             "Boolean" => Some(JsVal::Bool(args.first().is_some_and(JsVal::is_truthy))),
             "parseInt" => {
@@ -2860,16 +2861,16 @@ impl VmRuntime {
             }
             "parseFloat" => {
                 let s = args.first().map(ToString::to_string).unwrap_or_default();
-                Some(JsVal::Number(
-                    s.trim().parse::<f64>().unwrap_or(f64::NAN),
-                ))
+                Some(JsVal::Number(s.trim().parse::<f64>().unwrap_or(f64::NAN)))
             }
-            "isNaN" => Some(JsVal::Bool(
-                args.first().is_none_or(|v| v.to_number().is_nan()),
-            )),
-            "isFinite" => Some(JsVal::Bool(
-                args.first().is_some_and(|v| v.to_number().is_finite()),
-            )),
+            "isNaN" => {
+                let is_nan = args.first().is_none_or(|v| v.to_number().is_nan());
+                Some(JsVal::Bool(is_nan))
+            }
+            "isFinite" => {
+                let is_fin = args.first().is_some_and(|v| v.to_number().is_finite());
+                Some(JsVal::Bool(is_fin))
+            }
             "encodeURIComponent" => {
                 let s = args.first().map(ToString::to_string).unwrap_or_default();
                 Some(JsVal::Str(pct_encode(&s)))
@@ -2900,7 +2901,8 @@ impl VmRuntime {
         match target {
             JsVal::Array(items) if prop == "length" => Ok(JsVal::Number(items.len() as f64)),
             JsVal::Str(s) if prop == "length" => {
-                Ok(JsVal::Number(s.encode_utf16().count() as f64))
+                let len = s.encode_utf16().count() as f64;
+                Ok(JsVal::Number(len))
             }
             JsVal::NativeHandle(h) if h == "Math" => Ok(match prop {
                 "PI" => JsVal::Number(std::f64::consts::PI),
@@ -3605,10 +3607,8 @@ impl VmRuntime {
                                 _ => {}
                             },
                             "Date" if method == "getTime" => {
-                                return Ok(m
-                                    .get("__wispTime")
-                                    .cloned()
-                                    .unwrap_or(JsVal::Number(0.0)));
+                                let ts = m.get("__wispTime").cloned();
+                                return Ok(ts.unwrap_or(JsVal::Number(0.0)));
                             }
                             _ => {}
                         }
