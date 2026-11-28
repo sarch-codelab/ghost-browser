@@ -12,6 +12,50 @@ use wry::{NewWindowResponse, PageLoadEvent, Rect, WebView, WebViewBuilder};
 const HOME_BACKGROUND: &[u8] = include_bytes!("../black.webp");
 pub const RESIZE_GUTTER: f64 = 6.0;
 
+// Ventanas GTK que alojan los webviews cuando la sesión es Wayland puro.
+// Wayland no permite incrustar un widget GTK dentro de la superficie de winit,
+// así que el contenido se muestra en su propia ventana nativa (`build_gtk_host`).
+#[cfg(target_os = "linux")]
+thread_local! {
+    static GTK_HOSTS: std::cell::RefCell<std::collections::HashMap<u64, gtk::Window>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Muestra u oculta la ventana GTK de una pestaña creada con `build_gtk`.
+/// Fuera de Linux, o con X11, no hace nada.
+pub fn set_gtk_host_visible(tab: u64, visible: bool) {
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::*;
+        GTK_HOSTS.with(|hosts| {
+            if let Some(host) = hosts.borrow().get(&tab) {
+                if visible {
+                    host.show_all();
+                    host.present();
+                } else {
+                    host.hide();
+                }
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (tab, visible);
+}
+
+/// Cierra la ventana GTK de una pestaña cerrada (sólo existe en Wayland puro).
+pub fn close_gtk_host(tab: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::*;
+        let host = GTK_HOSTS.with(|hosts| hosts.borrow_mut().remove(&tab));
+        if let Some(host) = host {
+            host.close();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = tab;
+}
+
 /// Eventos que los webviews envían al hilo principal de la aplicación.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -464,15 +508,6 @@ pub fn create_webview<W: HasWindowHandle>(
     tx: Sender<TabEvent>,
     download_dir: Arc<RwLock<PathBuf>>,
 ) -> Result<WebView> {
-    // wry crea el webview con WebKitGTK en Linux y `build_as_child` sólo admite
-    // X11: sin DISPLAY el handle no sirve. Devolver error deja que la pestaña
-    // caiga al motor propio en vez de quedarse en blanco.
-    #[cfg(target_os = "linux")]
-    if std::env::var_os("DISPLAY").is_none() {
-        anyhow::bail!(
-            "el webview del sistema necesita X11 (Wayland no está soportado por build_as_child)"
-        );
-    }
     let dark = settings.dark_mode;
     let script = if std::env::var_os("GHOST_NO_INIT_SCRIPT").is_some() {
         String::new()
@@ -486,7 +521,7 @@ pub fn create_webview<W: HasWindowHandle>(
     let tx_dl_done = tx.clone();
     let block_popups = settings.block_popups;
 
-    let webview = WebViewBuilder::new()
+    let builder = WebViewBuilder::new()
         .with_bounds(bounds)
         .with_url(url)
         .with_visible(visible)
@@ -568,12 +603,62 @@ pub fn create_webview<W: HasWindowHandle>(
                 .header("Content-Type", "text/html; charset=utf-8")
                 .body(Cow::Owned(NEWTAB_HTML.as_bytes().to_vec()))
                 .expect("respuesta válida")
-        })
-        .build_as_child(window)?;
+        });
+
+    // wry crea el webview con WebKitGTK en Linux. `build_as_child` sólo admite
+    // X11; en Wayland puro se aloja en una ventana GTK propia con `build_gtk`.
+    #[cfg(target_os = "linux")]
+    let webview = if std::env::var_os("DISPLAY").is_none() {
+        build_gtk_host(builder, bounds, tab_id, visible)?
+    } else {
+        builder.build_as_child(window)?
+    };
+    #[cfg(not(target_os = "linux"))]
+    let webview = builder.build_as_child(window)?;
 
     set_low_memory(&webview, !visible);
     set_dark_theme(&webview, dark);
     disable_tracking_prevention(&webview);
+    Ok(webview)
+}
+
+/// Crea la vista WebKitGTK dentro de una ventana GTK nativa, para sesiones
+/// Wayland sin XWayland (donde `build_as_child` no puede usarse).
+///
+/// Wayland no permite incrustar un widget GTK en la superficie que crea winit,
+/// así que la página se muestra en una ventana propia que ocupa el área de
+/// contenido; el contenedor `gtk::Box` hace que la vista llene la ventana y
+/// convierte en inocuos los `set_bounds` medidos respecto a la ventana de egui
+/// (wry sólo aplica bounds dentro de un `gtk::Fixed`).
+#[cfg(target_os = "linux")]
+fn build_gtk_host(
+    builder: WebViewBuilder<'_>,
+    bounds: Rect,
+    tab_id: u64,
+    visible: bool,
+) -> Result<WebView> {
+    use gtk::prelude::*;
+    use wry::WebViewBuilderExtUnix;
+
+    if !gtk::is_initialized() {
+        anyhow::bail!("GTK no está inicializado: no se puede alojar el webview en Wayland");
+    }
+    let host = gtk::Window::new(gtk::WindowType::Toplevel);
+    host.set_title("Ghost");
+    // Los bounds llegan en píxeles físicos y GTK trabaja en píxeles lógicos.
+    let scale = f64::from(host.scale_factor().max(1));
+    let size = bounds.size.to_logical::<i32>(scale);
+    host.set_default_size(size.width.max(360), size.height.max(240));
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    host.add(&container);
+    let webview = builder.build_gtk(&container)?;
+    host.show_all();
+    if !visible {
+        host.hide();
+    }
+    GTK_HOSTS.with(|hosts| {
+        let _ = hosts.borrow_mut().insert(tab_id, host);
+    });
     Ok(webview)
 }
 

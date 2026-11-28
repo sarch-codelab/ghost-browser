@@ -570,12 +570,14 @@ impl App {
                 continue;
             };
             let _ = webview.set_bounds(rect);
-            let _ = webview.set_visible(
-                i == active
-                    && !panel_open
-                    && !self.browser.splash
-                    && !self.browser.is_restoring(tab.id),
-            );
+            let visible = i == active
+                && !panel_open
+                && !self.browser.splash
+                && !self.browser.is_restoring(tab.id);
+            let _ = webview.set_visible(visible);
+            // En Wayland puro la vista vive en una ventana GTK propia; en el
+            // resto de plataformas esta llamada no hace nada.
+            webview::set_gtk_host_visible(tab.id, visible);
             // La pestaña activa SIEMPRE queda en memoria normal: WebView2 en
             // nivel Low estrangula timers/rAF y páginas con lazy-load (YouTube,
             // SPAs) se quedan "cargando" para siempre. El ahorro real está en

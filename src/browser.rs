@@ -2523,6 +2523,8 @@ impl Browser {
         self.restore_started.remove(&t.id);
         self.restoring_tabs.remove(&t.id);
         self.pending_restore.retain(|tab_id| *tab_id != t.id);
+        // En Wayland puro la vista vive en una ventana GTK propia: cerrarla.
+        webview::close_gtk_host(t.id);
         // Limpiar texturas Wisp de la pestaña cerrada
         self.cleanup_wisp_textures_for_tab(t.id);
         // Guardar en la pila de pestañas cerradas (para Ctrl+Shift+T).
